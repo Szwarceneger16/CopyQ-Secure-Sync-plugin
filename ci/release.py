@@ -178,7 +178,7 @@ def assemble(source, root, out, proof, copyq, zlib):
                     'prerelease': '-rc.' in value, 'ci': proof, 'qualification': qualification,
                     'assets': {p.name: sha256(p.read_bytes()) for p in sorted(out.iterdir())}}
         (out / 'RELEASE-MANIFEST.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
-        (out / 'SHA256SUMS').write_text(checksums({p.name: p.read_bytes() for p in out.iterdir()}), encoding='utf-8')
+        (out / 'SHA256SUMS').write_bytes(checksums({p.name: p.read_bytes() for p in out.iterdir()}).encode('utf-8'))
     except Exception:
         # This dedicated output was empty on entry; never leave a partial candidate.
         for item in out.iterdir():
