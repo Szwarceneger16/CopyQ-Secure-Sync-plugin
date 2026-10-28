@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def commit(folder):
-    subprocess.run(['git', 'init', '--quiet', str(folder)], check=True)
+    subprocess.run(['git', 'init', '--quiet', '--initial-branch=main', str(folder)], check=True)
     subprocess.run(['git', '-C', str(folder), 'config', 'core.autocrlf', 'false'], check=True)
     subprocess.run(['git', '-C', str(folder), 'add', '.'], check=True)
     subprocess.run(['git', '-C', str(folder), '-c', 'user.name=Release test', '-c', 'user.email=release@example.invalid',
@@ -195,8 +195,12 @@ class DistributionTests(unittest.TestCase):
             tar.extractall(self.base / 'extracted', filter='data')
         extracted = self.base / 'extracted' / ('CopyQ-Secure-Sync-' + d.version(self.source))
         for name, expected in (('plugin', self.commit), ('copyq', self.copyq_commit), ('zlib', self.zlib_commit)):
-            self.assertEqual(r.git(extracted / name, 'rev-parse', 'HEAD'), expected)
-            self.assertEqual(r.git(extracted / name, 'remote'), '')
+            repo = extracted / name
+            self.assertEqual(r.git(repo, 'rev-parse', 'HEAD'), expected)
+            self.assertEqual(r.git(repo, 'remote'), '')
+            self.assertEqual(r.git(repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes'), '')
+            self.assertFalse(any(p.is_file() for p in (repo / '.git/refs/remotes').rglob('*')))
+            subprocess.run(['git', '-C', str(repo), 'fsck', '--full', '--strict'], check=True, capture_output=True)
         (out / 'RELEASE-NOTES.md').write_text('tampered')
         with self.assertRaises(ValueError): r.verify_bundle(out, self.source, self.proof)
 

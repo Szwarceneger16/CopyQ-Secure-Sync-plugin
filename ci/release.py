@@ -109,11 +109,13 @@ def source_archive(source, copyq, zlib, target, value, commit, lock):
             subprocess.run(['git', '-c', 'core.autocrlf=false', 'clone', '--no-local', '--depth=1',
                             '--no-checkout', '--quiet', str(original.resolve()), str(clone)], check=True)
             subprocess.run(['git', '-C', str(clone), '-c', 'core.autocrlf=false', 'checkout', '--quiet', '--detach', expected], check=True)
+            subprocess.run(['git', '-C', str(clone), 'update-ref', '--no-deref', '-d', 'refs/remotes/origin/HEAD'], check=True)
             subprocess.run(['git', '-C', str(clone), 'remote', 'remove', 'origin'], check=True)
             shutil.rmtree(clone / '.git/logs', ignore_errors=True)
             shutil.rmtree(clone / '.git/hooks', ignore_errors=True)
             if git(clone, 'rev-parse', 'HEAD') != expected or (clone / '.git/objects/info/alternates').exists():
                 raise ValueError('Source checkout is not self-contained')
+            subprocess.run(['git', '-C', str(clone), 'fsck', '--full', '--strict'], check=True, capture_output=True)
         (base / 'BUILD-SOURCES.txt').write_text(
             f'CopyQ Secure Sync {value}\nPlugin commit: {commit}\n'
             'plugin/, copyq/, zlib/ contain exact committed sources and their original licenses.\n'
