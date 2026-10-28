@@ -1,0 +1,15 @@
+/build/
+/build-*/
+/CMakeUserPresets.json
+ksync.key
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cqs
+*.cqr
+/work/
+__pycache__/

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "copyq": "17.0.0",
+  "architecture": "x86_64",
+  "restart_required": true,
+  "host_patch_required": false,
+  "targets": {
+    "windows-x86_64": {"qt_minor": 10, "compiler": ["MSVC"], "installation": "Official portable ZIP and setup.exe; Windows NTFS; Qt supplied by CopyQ"},
+    "linux-ubuntu24.04-x86_64": {"qt_minor": 10, "compiler": ["GNU"], "installation": "Ubuntu 24.04-compatible native/AppImage CopyQ; system OpenSSL 3 and zlib"},
+    "linux-system-qt6.4-x86_64": {"qt_minor": 4, "compiler": ["GNU"], "installation": "System-Qt 6.4 source/DEB installations and the tested strict core24 Snap fixture; Store packages require revision-specific verification"},
+    "linux-flatpak-kde6.10-x86_64": {"qt_minor": 10, "compiler": ["GNU"], "installation": "Installed com.github.hluk.copyq with org.kde.Platform/x86_64/6.10; module built inside matching SDK"}
+  }
+}

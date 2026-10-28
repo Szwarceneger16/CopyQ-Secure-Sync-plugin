@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "qt": "6.10.3",
+  "aqtinstall": "3.3.0",
+  "copyq_commit": "d0c179f75c04974bfe801289ea6e58a1a49535fc",
+  "zlib_commit": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf",
+  "qca_commit": "df5171e3c4baf346581f15af5a040e61b166a332",
+  "openssl_commit": "45e844fa2a14ec92d146bd8f5778ac130b6625fb"
+}

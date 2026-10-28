@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "gates": {
+    "physical-two-device-nextcloud": {"status": "pending", "evidence": null},
+    "fault-and-historical-upgrade-acceptance": {"status": "pending", "evidence": null},
+    "target-limit-performance": {"status": "pending", "evidence": null}
+  }
+}

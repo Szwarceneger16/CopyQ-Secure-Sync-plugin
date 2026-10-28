@@ -1,0 +1,5 @@
+# Keep source/scripts portable and encrypted fixture bytes exact on Windows.
+* text=auto eol=lf
+*.cqs -text
+*.cqr -text
+*.zip -text

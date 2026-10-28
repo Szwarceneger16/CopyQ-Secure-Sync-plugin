@@ -1,0 +1,351 @@
+diff --git a/src/gui/clipboardbrowser.cpp b/src/gui/clipboardbrowser.cpp
+index ebc527dc..91626814 100644
+--- a/src/gui/clipboardbrowser.cpp
++++ b/src/gui/clipboardbrowser.cpp
+@@ -16,6 +16,7 @@
+ #include "item/itemeditorwidget.h"
+ #include "item/itemfactory.h"
+ #include "item/itemstore.h"
++#include "item/tab_persistence.h"
+ #include "item/itemwidget.h"
+ #include "item/persistentdisplayitem.h"
+ #include "item/serialize.h"
+@@ -211,6 +212,7 @@ ClipboardBrowser::ClipboardBrowser(
+ {
+     setObjectName("ClipboardBrowser");
+ 
++
+     setLayoutMode(QListView::Batched);
+     setBatchSize(1);
+     setFrameShape(QFrame::NoFrame);
+@@ -246,6 +248,7 @@ ClipboardBrowser::ClipboardBrowser(
+ 
+ ClipboardBrowser::~ClipboardBrowser()
+ {
++    invalidatePersistence();
+     delete m_editor.data();
+     saveUnsavedItems();
+ }
+@@ -1714,6 +1717,20 @@ bool ClipboardBrowser::loadItems(const QByteArray &itemData)
+ 
+     m_timerSave.stop();
+ 
++    copyq::sync::Access persistenceAccess;
++    persistenceAccess.readable = [this] {
++        return m_persistence && m_tabName == m_persistence->tabId() && isLoaded()
++            && m_storeItems && m_sharedData->tabsEncrypted
++            && m_sharedData->encryptionKey.isValid();
++    };
++    persistenceAccess.writable = [this] {
++        return !isInternalEditorOpen() && !isExternalEditorOpen();
++    };
++    persistenceAccess.saver = [this] { return m_itemSaver; };
++    persistenceAccess.fileName = [this] { return itemFilePathForPersistence(m_tabName); };
++    m_persistence = new copyq::sync::PersistentTab(m_tabName, &m, m_maxItemCount,
++                                                std::move(persistenceAccess), this);
++
+     m.blockSignals(true);
+     m_itemSaver = ::loadItems(m_tabName, m, m_sharedData->itemFactory, m_maxItemCount);
+     m.blockSignals(false);
+@@ -1734,6 +1751,12 @@ bool ClipboardBrowser::loadItems(const QByteArray &itemData)
+     return true;
+ }
+ 
++void ClipboardBrowser::invalidatePersistence()
++{
++    if (m_persistence)
++        m_persistence->invalidate();
++}
++
+ bool ClipboardBrowser::saveItems()
+ {
+     m_timerSave.stop();
+@@ -1812,6 +1835,9 @@ const QString ClipboardBrowser::selectedText() const
+ 
+ bool ClipboardBrowser::setTabName(const QString &tabName)
+ {
++    if (m_persistence && tabName != m_tabName)
++        m_persistence->invalidate();
++
+     const QString oldTabName = m_tabName;
+ 
+     m_tabName = tabName;
+@@ -1824,6 +1850,8 @@ bool ClipboardBrowser::setTabName(const QString &tabName)
+ 
+ void ClipboardBrowser::setMaxItemCount(int count)
+ {
++    if (m_persistence && count != m_maxItemCount)
++        m_persistence->invalidate();
+     m_maxItemCount = count;
+ }
+ 
+diff --git a/src/gui/clipboardbrowser.h b/src/gui/clipboardbrowser.h
+index 6563d41c..00fe2f87 100644
+--- a/src/gui/clipboardbrowser.h
++++ b/src/gui/clipboardbrowser.h
+@@ -16,6 +16,8 @@
+ #include <QVariantMap>
+ #include <QVector>
+ 
++namespace copyq::sync { class PersistentTab; }
++
+ class ItemEditorWidget;
+ class ItemFactory;
+ class QPersistentModelIndex;
+@@ -155,6 +157,7 @@ class ClipboardBrowser final : public QListView
+          * Save items to configuration if needed.
+          */
+         void saveUnsavedItems();
++        void invalidatePersistence();
+ 
+         /**
+          * Create and edit new item.
+@@ -374,6 +377,7 @@ class ClipboardBrowser final : public QListView
+         void filterBatch(int filterId, const QPersistentModelIndex &lastIndex);
+ 
+         ItemSaverPtr m_itemSaver;
++        copyq::sync::PersistentTab *m_persistence = nullptr;
+ 
+         QString m_tabName;
+         int m_maxItemCount = 200;
+diff --git a/src/gui/clipboardbrowserplaceholder.cpp b/src/gui/clipboardbrowserplaceholder.cpp
+index 26b3ee78..12fef3bc 100644
+--- a/src/gui/clipboardbrowserplaceholder.cpp
++++ b/src/gui/clipboardbrowserplaceholder.cpp
+@@ -295,6 +295,7 @@ void ClipboardBrowserPlaceholder::unloadBrowser()
+         return;
+ 
+     qCDebug(logCategory) << "Unloading tab:" << m_tabName;
++    m_browser->invalidatePersistence();
+ 
+     // Keep unsaved items in memory until expiration.
+     m_data.clear();
+diff --git a/src/item/itemfactory.cpp b/src/item/itemfactory.cpp
+index b2f7739f..cddc1db2 100644
+--- a/src/item/itemfactory.cpp
++++ b/src/item/itemfactory.cpp
+@@ -16,6 +16,7 @@
+ #include "item/indexes.h"
+ #include "item/itemfilter.h"
+ #include "item/itemstore.h"
++#include "item/tab_persistence.h"
+ #include "item/itemwidget.h"
+ #include "item/serialize.h"
+ #include "platform/platformnativeinterface.h"
+@@ -188,24 +189,7 @@ private:
+     bool m_preview;
+ };
+ 
+-class DummySaver final : public ItemSaverInterface
+-{
+-public:
+-    explicit DummySaver(int itemDataThreshold, const ClipboardBrowserSharedPtr &sharedData)
+-        : m_itemDataThreshold(itemDataThreshold)
+-        , m_sharedData(sharedData)
+-    {}
+-
+-    bool saveItems(const QString & /* tabName */, const QAbstractItemModel &model, QIODevice *file) override
+-    {
+-        const Encryption::EncryptionKey &encKey = m_sharedData->encryptionKey;
+-        return serializeData(model, file, m_itemDataThreshold, &encKey);
+-    }
+-
+-private:
+-    int m_itemDataThreshold = -1;
+-    ClipboardBrowserSharedPtr m_sharedData;
+-};
++using DummySaver = copyq::sync::NativeTabSaver;
+ 
+ class DummyLoader final : public ItemLoaderInterface
+ {
+diff --git a/src/item/itemstore.cpp b/src/item/itemstore.cpp
+index 97eb3ae3..61a497cd 100644
+--- a/src/item/itemstore.cpp
++++ b/src/item/itemstore.cpp
+@@ -159,6 +159,11 @@ ItemSaverPtr loadItems(const QString &tabName, QAbstractItemModel &model, ItemFa
+     return nullptr;
+ }
+ 
++QString itemFilePathForPersistence(const QString &tabName)
++{
++    return itemFileName(tabName);
++}
++
+ bool saveItems(const QString &tabName, const QAbstractItemModel &model, const ItemSaverPtr &saver)
+ {
+     const QString tabFileName = itemFileName(tabName);
+diff --git a/src/item/itemstore.h b/src/item/itemstore.h
+index 51660bdd..635a3c23 100644
+--- a/src/item/itemstore.h
++++ b/src/item/itemstore.h
+@@ -18,6 +18,9 @@ namespace Encryption {
+ ItemSaverPtr loadItems(const QString &tabName, QAbstractItemModel &model //!< Model for items.
+         , ItemFactory *itemFactory, int maxItems);
+ 
++// Authoritative path for the host persistence barrier; never exported to plugins.
++QString itemFilePathForPersistence(const QString &tabName);
++
+ /** Save items to configuration file. */
+ bool saveItems(const QString &tabName, const QAbstractItemModel &model //!< Model containing items to save.
+         , const ItemSaverPtr &saver);
+diff --git a/src/item/serialize.cpp b/src/item/serialize.cpp
+index 4b42c8b8..db73ce0f 100644
+--- a/src/item/serialize.cpp
++++ b/src/item/serialize.cpp
+@@ -6,6 +6,7 @@
+ #include "common/contenttype.h"
+ #include "common/encryption.h"
+ #include "common/mimetypes.h"
++#include "item/verified_save_file.h"
+ 
+ #include <QAbstractItemModel>
+ #include <QCoreApplication>
+@@ -23,6 +24,17 @@
+ #include <QStringList>
+ 
+ #include <unordered_map>
++#include <optional>
++#ifdef Q_OS_WIN
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <io.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ 
+ constexpr const int MAX_ITEMS = 100'000;
+ 
+@@ -34,6 +46,8 @@ namespace {
+ Q_DECLARE_LOGGING_CATEGORY(serializeCategory)
+ Q_LOGGING_CATEGORY(serializeCategory, "copyq.serialize")
+ 
++QString dataFilePath(const QByteArray &bytes, bool create);
++
+ } // namespace
+ 
+ class DataFile {
+@@ -94,6 +108,61 @@ public:
+         return data;
+     }
+ 
++    std::optional<QByteArray> readBounded(qint64 limit, bool confirmPersistence) const
++    {
++        if (limit < 0 || limit > 32 * 1024 * 1024)
++            return std::nullopt;
++        QFile file(m_path);
++        // AES envelopes add a small fixed overhead. Never read an unbounded blob.
++        const auto storedLimit = limit + 256;
++        if (!file.open(confirmPersistence ? QIODevice::ReadWrite : QIODevice::ReadOnly) || file.size() < 0 || file.size() > storedLimit)
++            return std::nullopt;
++        auto bytes = file.read(storedLimit + 1);
++        if (file.error() != QFileDevice::NoError || !file.atEnd() || bytes.size() > storedLimit
++            || dataFilePath(bytes, false) != m_path)
++            return std::nullopt;
++#ifdef Q_OS_WIN
++        if (confirmPersistence) {
++            const auto handle = _get_osfhandle(file.handle());
++            if (handle == -1 || !FlushFileBuffers(reinterpret_cast<HANDLE>(handle)))
++                return std::nullopt;
++        }
++#else
++        if (confirmPersistence) {
++        int synced;
++        do { synced = ::fsync(file.handle()); } while (synced == -1 && errno == EINTR);
++        if (synced != 0)
++            return std::nullopt;
++        QDir directory(QFileInfo(m_path).absoluteDir());
++        const auto root = QDir(itemDataPath()).absolutePath();
++        for (;;) {
++            const auto encoded = QFile::encodeName(directory.absolutePath());
++            const int fd = ::open(encoded.constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++            if (fd == -1)
++                return std::nullopt;
++            do { synced = ::fsync(fd); } while (synced == -1 && errno == EINTR);
++            ::close(fd);
++            if (synced != 0)
++                return std::nullopt;
++            if (directory.absolutePath() == root)
++                break;
++            if (!directory.cdUp())
++                return std::nullopt;
++        }
++        }
++#endif
++#ifdef WITH_QCA_ENCRYPTION
++        if (m_encryptionKey.isValid()) {
++            bytes = Encryption::decrypt(bytes, m_encryptionKey);
++            if (bytes.isEmpty())
++                return std::nullopt;
++        }
++#endif
++        if (bytes.size() > limit)
++            return std::nullopt;
++        return bytes;
++    }
++
+     bool operator==(const DataFile &other) const {
+         return m_path == other.m_path;
+     }
+@@ -401,11 +470,11 @@ void serializeDataItems(QDataStream *stream, const QVariantMap &data, int itemDa
+                 }
+ 
+                 if ( !QFile::exists(path) ) {
+-                    QSaveFile f(path);
+-                    f.setDirectWriteFallback(false);
+-                    if ( !f.open(QIODevice::WriteOnly) || !f.write(bytes) || !f.commit() ) {
++                    copyq::sync::VerifiedSaveFile f(path);
++                    if ( !f.open() || f.device().write(bytes) != bytes.size()
++                         || !copyq::sync::flushFileToDisk(f.device()) || !f.commit() ) {
+                         qCCritical(serializeCategory) << "Failed to create data file" << path << ":"
+-                            << f.errorString();
++                            << f.device().errorString();
+                         stream->setStatus(QDataStream::WriteFailed);
+                         f.cancelWriting();
+                         return false;
+@@ -470,6 +539,30 @@ void serializeDataItems(QDataStream *stream, const QVariantMap &data, int itemDa
+ 
+ } // namespace
+ 
++bool materializeDataForReadback(QVariantMap *data, qint64 limit, bool confirmPersistence)
++{
++    if (!data || limit < 0 || limit > 32 * 1024 * 1024)
++        return false;
++    qint64 remaining = limit;
++    for (auto it = data->begin(); it != data->end(); ++it) {
++        if (it.value().metaType().id() == QMetaType::QByteArray) {
++            const auto size = it.value().toByteArray().size();
++            if (size > remaining)
++                return false;
++            remaining -= size;
++        } else if (it.value().metaType() == QMetaType::fromType<DataFile>()) {
++            const auto bytes = it.value().value<DataFile>().readBounded(remaining, confirmPersistence);
++            if (!bytes)
++                return false;
++            remaining -= bytes->size();
++            it.value() = *bytes;
++        } else {
++            return false;
++        }
++    }
++    return true;
++}
++
+ void registerDataFileConverter()
+ {
+     QMetaType::registerConverter(&DataFile::readAll);
+diff --git a/src/item/serialize.h b/src/item/serialize.h
+index d07a2108..7818eb56 100644
+--- a/src/item/serialize.h
++++ b/src/item/serialize.h
+@@ -17,6 +17,8 @@ class DataFile;
+ QDataStream &operator<<(QDataStream &out, DataFile value);
+ QDataStream &operator>>(QDataStream &in, DataFile &value);
+ void registerDataFileConverter();
++// Quiet host readback only: bounded byte materialization, never generic converters.
++bool materializeDataForReadback(QVariantMap *data, qint64 limit, bool confirmPersistence = false);
+ 
+ void serializeData(QDataStream *stream, const QVariantMap &data, int itemDataThreshold = -1, const Encryption::EncryptionKey *encryptionKey = nullptr);
+ bool deserializeData(QDataStream *stream, QVariantMap *data, const Encryption::EncryptionKey *encryptionKey = nullptr);
