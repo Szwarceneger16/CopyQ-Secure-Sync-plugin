@@ -1,0 +1,298 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Native build and tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    name: Linux / Ubuntu 24.04 container / Qt 6.10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - name: Validate CI result gate
+        run: python3 -m unittest discover -s ci -p 'test_*.py' -v
+      - name: Build SDK container
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/linux/reports
+          docker build --pull --tag cqs-native-ci:local --file ci/Containerfile ci 2>&1 | tee out/linux/reports/container-build.log
+          docker image inspect cqs-native-ci:local > out/linux/reports/container-image.json
+      - name: Build and test the native module offline and unprivileged
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 6g --cpus 2 \
+            --ulimit nofile=4096:4096 --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/.ci-deps/copyq,dst=/copyq,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/out/linux,dst=/out" \
+            cqs-native-ci:local bash /source/ci/build-linux.sh /copyq /out
+      - name: Verify actual Nextcloud desktop delivery in official CopyQ 17
+        shell: bash
+        run: bash ci/test-nextcloud.sh out/linux
+      - name: Upload Linux diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-native-reports
+          path: |
+            out/linux/reports/
+            out/linux/build/Testing/Temporary/*.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload tested Linux module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-native-plugin
+          path: |
+            out/linux/securesync-*.zip
+            out/linux/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload standalone storage experiment
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-standalone-storage-lab-experimental
+          include-hidden-files: true # The explicitly listed upstream license is under .ci-deps.
+          path: |
+            out/linux/stage/copyq/plugins/libsecuresynclab.so
+            docs/STANDALONE-PROTOTYPE.md
+            LICENSE
+            .ci-deps/copyq/LICENSE
+          if-no-files-found: error
+          retention-days: 14
+  windows:
+    name: Windows / real NTFS / MSVC 2022 / Qt 6.10
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: madler/zlib
+          ref: 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf # v1.3.1
+          path: .ci-deps/zlib
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KDE/qca
+          ref: df5171e3c4baf346581f15af5a040e61b166a332 # v2.3.10
+          path: .ci-deps/qca
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: openssl/openssl
+          ref: 45e844fa2a14ec92d146bd8f5778ac130b6625fb # openssl-3.5.9, host encryption tests only
+          path: .ci-deps/openssl
+          persist-credentials: false
+      - name: Validate CI result gate
+        run: python -m unittest discover -s ci -p 'test_*.py' -v
+      - name: Build native DLL and run real Windows/NTFS tests
+        shell: pwsh
+        run: |
+          ./ci/build-windows.ps1 -CopyQSource "$env:GITHUB_WORKSPACE/.ci-deps/copyq" -ZlibSource "$env:GITHUB_WORKSPACE/.ci-deps/zlib" -QcaSource "$env:GITHUB_WORKSPACE/.ci-deps/qca" -OpenSSLSource "$env:GITHUB_WORKSPACE/.ci-deps/openssl" -Out "$env:GITHUB_WORKSPACE/out/windows"
+      - name: Load module in official portable CopyQ 17 and test visible GUI synchronization
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "$env:GITHUB_WORKSPACE/out/copyq-17.0.0.zip"
+          Invoke-WebRequest 'https://github.com/hluk/CopyQ/releases/download/v17.0.0/copyq-17.0.0.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '1601e47339d4eda19b6f4890a00cbbe7fd00a7e5d5c3b613b9b2c8d3eeb04d19') { throw 'Official CopyQ archive checksum mismatch' }
+          Expand-Archive $archive "$env:GITHUB_WORKSPACE/out/official-copyq"
+          $executables = @(Get-ChildItem "$env:GITHUB_WORKSPACE/out/official-copyq" -Filter copyq.exe -Recurse)
+          if ($executables.Count -ne 1) { throw 'Expected one official portable CopyQ executable' }
+          $env:PATH = "$env:GITHUB_WORKSPACE/out/windows/Qt/6.10.3/msvc2022_64/bin;$env:PATH"
+          $packages = @(Get-ChildItem "$env:GITHUB_WORKSPACE/out/windows" -Filter 'securesync-*.zip')
+          if ($packages.Count -ne 1) { throw 'Expected one generated plugin package' }
+          python tests/run-copyq-gui-platform.py --copyq $executables[0].FullName --plugin out/windows/stage/copyq/plugins/securesync.dll --fixture-tool out/windows/build/cqs-unified-state-test.exe --ui-driver out/windows/build/cqs-ui-driver.dll --bundled-renderers --installation-kind windows --package $packages[0].FullName --out out/windows/reports/official-gui
+          if ($LASTEXITCODE -ne 0) { throw 'Official Windows GUI test failed' }
+      - name: Install official setup.exe and test independently from the portable copy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = "$env:GITHUB_WORKSPACE/out/copyq-17.0.0-setup.exe"
+          Invoke-WebRequest 'https://github.com/hluk/CopyQ/releases/download/v17.0.0/copyq-17.0.0-setup.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne '33585174067273b391df13c0332adb60a3797ec47bfff9c26ff7c26e7dcd85d8') { throw 'Official setup checksum mismatch' }
+          $destination = "$env:GITHUB_WORKSPACE/out/installed-copyq"
+          $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$destination`"") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Official CopyQ installer failed' }
+          $executable = "$destination/copyq.exe"
+          if (-not (Test-Path $executable)) { throw 'Installer did not create the selected executable' }
+          $packages = @(Get-ChildItem "$env:GITHUB_WORKSPACE/out/windows" -Filter 'securesync-*.zip')
+          if ($packages.Count -ne 1) { throw 'Expected one generated plugin package' }
+          $env:PATH = "$env:GITHUB_WORKSPACE/out/windows/Qt/6.10.3/msvc2022_64/bin;$env:PATH"
+          python tests/run-copyq-gui-platform.py --copyq $executable --plugin out/windows/stage/copyq/plugins/securesync.dll --fixture-tool out/windows/build/cqs-unified-state-test.exe --ui-driver out/windows/build/cqs-ui-driver.dll --bundled-renderers --installation-kind windows --package $packages[0].FullName --out out/windows/reports/installed-gui
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Windows GUI test failed' }
+      - name: Upload Windows diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-native-reports
+          path: |
+            out/windows/reports/
+            out/windows/build/Testing/Temporary/*.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload tested Windows module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-native-plugin
+          path: |
+            out/windows/securesync-*.zip
+            out/windows/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload standalone storage experiment
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-standalone-storage-lab-experimental
+          include-hidden-files: true # The explicitly listed upstream license is under .ci-deps.
+          path: |
+            out/windows/stage/copyq/plugins/securesynclab.dll
+            docs/STANDALONE-PROTOTYPE.md
+            LICENSE
+            .ci-deps/copyq/LICENSE
+          if-no-files-found: error
+          retention-days: 14
+  flatpak:
+    name: Flatpak / installed CopyQ 17 / matching KDE SDK 6.10
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - name: Install disposable GUI test environment
+        run: sudo apt-get update && sudo apt-get install -y flatpak xvfb dbus-x11 ripgrep
+      - name: Build standalone module inside matching SDK and load it in installed Flatpak
+        run: bash ci/test-flatpak.sh
+      - name: Upload Flatpak diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flatpak-gui-reports
+          path: out/flatpak/reports/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload tested matching Flatpak module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flatpak-native-plugin
+          path: |
+            out/flatpak/securesync-*.zip
+            out/flatpak/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+  installations:
+    name: Linux / source + DEB + strict Snap / system Qt 6.4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - name: Install distribution SDK and sandbox test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ pkg-config libssl-dev zlib1g-dev qt6-base-dev qt6-base-private-dev qt6-declarative-dev qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools libqt6svg6-dev qt6-wayland qt6-wayland-dev qt6-wayland-dev-tools libqca-qt6-dev libqca-qt6-plugins extra-cmake-modules libxfixes-dev libxtst-dev xvfb openbox dbus-x11 snapd squashfs-tools
+      - name: Compile separate system-Qt module and clean stock CopyQ test hosts
+        run: bash ci/build-installation-fixtures.sh
+      - name: Test installed unmodified source build
+        run: bash ci/test-installation.sh source
+      - name: Install DEB with dpkg and test independently
+        run: |
+          # Only this disposable fixture prefix is removed, never a user install.
+          sudo rm -rf /opt/cqs-copyq17-fixture
+          sudo dpkg -i out/installations/copyq17-fixture.deb
+          dpkg-query -W cqs-copyq17-fixture > out/installations/reports/deb-package.txt
+          bash ci/test-installation.sh deb
+      - name: Package and install strict Snap test host
+        run: |
+          sudo systemctl start snapd.socket
+          sudo snap wait system seed.loaded
+          sudo snap install core24
+          python3 ci/make-snap-fixture.py
+          sudo snap install --dangerous out/installations/copyq17-fixture.snap
+          sudo snap connect cqs-cq:x11
+          sudo snap connect cqs-cq:desktop
+          sudo snap connect cqs-cq:home
+          sudo snap connect cqs-cq:network-bind
+      - name: Test separate strict Snap processes and application-owned paths
+        run: bash ci/test-installation.sh snap
+      - name: Upload separate installation reports even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-installation-reports
+          path: out/installations/reports/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload only the tested system-Qt plugin, never the CopyQ fixtures
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-system-qt-native-plugin
+          path: |
+            out/installations/securesync-*.zip
+            out/installations/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+  native-ci:
+    name: Native CI gate
+    needs: [linux, windows, flatpak, installations]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require both actual platform builds
+        env:
+          LINUX_RESULT: ${{ needs.linux.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          FLATPAK_RESULT: ${{ needs.flatpak.result }}
+          INSTALLATIONS_RESULT: ${{ needs.installations.result }}
+        run: |
+          test "$LINUX_RESULT" = success
+          test "$WINDOWS_RESULT" = success
+          test "$FLATPAK_RESULT" = success
+          test "$INSTALLATIONS_RESULT" = success
