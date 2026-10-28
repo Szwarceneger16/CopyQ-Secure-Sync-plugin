@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Prepare or publish native release
+on:
+  workflow_dispatch:
+    inputs:
+      native_run_id:
+        description: Successful Native build and tests run for the current main commit
+        required: true
+        type: string
+      publish:
+        description: Publish the verified candidate as a GitHub Release (otherwise prepare only)
+        default: false
+        required: true
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: native-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+    steps:
+      - name: Require manual invocation from main
+        env:
+          SELECTED_REF: ${{ github.ref }}
+        run: test "$SELECTED_REF" = refs/heads/main
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate successful CI identity and complete job/artifact matrix
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CQS_NATIVE_RUN: ${{ inputs.native_run_id }}
+        run: |
+          set -euo pipefail
+          python3 ci/release.py inspect --repository "$GITHUB_REPOSITORY" --run-id "$CQS_NATIVE_RUN" > run-proof.json
+          python3 - <<'PY'
+          import json, os
+          with open('run-proof.json') as f:
+              proof = json.load(f)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('commit=' + proof['commit'] + '\n')
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.identity.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: madler/zlib
+          ref: 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf # v1.3.1
+          path: .ci-deps/zlib
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.native_run_id }}
+          pattern: '*-native-plugin'
+          path: tested-artifacts
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.native_run_id }}
+          pattern: '*reports'
+          path: tested-artifacts
+      - name: Verify tested packages/reports and assemble sources, notes and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CQS_NATIVE_RUN: ${{ inputs.native_run_id }}
+        run: |
+          python3 ci/release.py assemble --repository "$GITHUB_REPOSITORY" --run-id "$CQS_NATIVE_RUN" \
+            --artifacts tested-artifacts --source . --copyq .ci-deps/copyq --zlib .ci-deps/zlib --out release-assets
+          python3 ci/release.py verify --repository "$GITHUB_REPOSITORY" --run-id "$CQS_NATIVE_RUN" --source . --out release-assets
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: securesync-release-candidate
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    if: ${{ inputs.publish }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: securesync-release-candidate
+          path: release-assets
+      - name: Revalidate CI, current main and all assets, then publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CQS_NATIVE_RUN: ${{ inputs.native_run_id }}
+        run: |
+          python3 ci/release.py publish --repository "$GITHUB_REPOSITORY" --run-id "$CQS_NATIVE_RUN" --source . --out release-assets

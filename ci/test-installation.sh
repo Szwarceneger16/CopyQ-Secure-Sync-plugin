@@ -8,6 +8,7 @@ cqs_packages=("$cqs_out"/securesync-*.zip)
 test "${#cqs_packages[@]}" = 1
 cqs_options=()
 cqs_bus=(dbus-run-session --)
+cqs_display=()
 case "$cqs_kind" in
   source|deb) cqs_copyq=/opt/cqs-copyq17-fixture/bin/copyq ;;
   snap)
@@ -18,6 +19,7 @@ case "$cqs_kind" in
     export CQS_SNAP_HOST_RUNTIME="${XDG_RUNTIME_DIR:?real user runtime required}"
     test -d "$CQS_SNAP_HOST_RUNTIME" && test -w "$CQS_SNAP_HOST_RUNTIME"
     cqs_bus=()
+    cqs_display=(bash "$cqs_source/ci/prepare-snap-display.sh")
     # Ask snapd's application environment, never infer ~/snap or a revision.
     cqs_common="$(snap run --shell cqs-cq.copyq -c 'printf %s "$SNAP_USER_COMMON"')"
     test -d "$cqs_common"
@@ -33,7 +35,7 @@ case "$cqs_kind" in
   *) exit 2 ;;
 esac
 unset APPDIR APPIMAGE
-xvfb-run -a "${cqs_bus[@]}" python3 "$cqs_source/tests/run-copyq-gui-platform.py" \
+xvfb-run -a "${cqs_bus[@]}" "${cqs_display[@]}" python3 "$cqs_source/tests/run-copyq-gui-platform.py" \
   --copyq "$cqs_copyq" --plugin "$cqs_out/stage/copyq/plugins/libsecuresync.so" \
   --fixture-tool "$cqs_out/build/cqs-unified-state-test" --ui-driver "$cqs_out/build/libcqs-ui-driver.so" \
   --bundled-renderers --package "${cqs_packages[0]}" --installation-kind "$cqs_kind" \
