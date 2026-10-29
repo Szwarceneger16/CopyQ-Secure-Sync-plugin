@@ -24,6 +24,16 @@ preserving post-crash edits, durable history witnesses and safe capacity limits.
 The [native settings panel](docs/NATIVE-SETTINGS.md) integrates device/recovery
 actions, live status with local-save evidence and explicitly copied redacted diagnostics.
 
+## Guided setup design (not implemented)
+
+The [stage-1 device trust design](docs/DEVICE-TRUST-DESIGN.md) specifies future
+peer-verified pairing, two-device approval after one-time bootstrap, equal device
+authority and explicit recovery. The [installer and wizard contract](docs/GUIDED-SETUP-DELIVERY.md)
+preserves existing CopyQ encryption and normal advanced settings. The
+[acceptance matrix](docs/DEVICE-TRUST-ACCEPTANCE.md) records implementation gates
+and planned tests; it is not evidence that these features already work. Current
+RC installation and manual key transfer remain unchanged.
+
 ## Build and test pipeline
 
 **Native build and tests** uses GitHub-hosted runners: an Ubuntu 24.04 SDK
