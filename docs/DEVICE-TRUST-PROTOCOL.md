@@ -1,0 +1,263 @@
+# Device trust protocol decisions: stage 2
+
+Status: engineering baseline for the isolated policy model, not a deployed wire
+protocol or audited cryptographic implementation. The [stage-1 requirements](DEVICE-TRUST-DESIGN.md)
+remain authoritative. The [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates)
+are not all closed by this change. Nothing here activates new device trust in
+the current CopyQ plugin or handles real clipboard keys.
+
+## Implemented boundary
+
+`src/device_trust.h` and `src/device_trust.cpp` implement bounded, deterministic
+membership policy, canonical model encodings, complete-intent digests, independent
+approval identities, retained ancestor witnesses and local signing reservations.
+`SignatureVerifier` is an explicit injected boundary: the model asks it to verify
+each signature against exact bytes and the parent's signing public key.
+
+The model neither supplies a production verifier nor signs, stores private keys,
+publishes files, commits a durable journal, grants permissions or releases K-SYNC.
+Its test verifier is public deterministic test machinery, not encryption. Copying
+a model object simulates an unchanged snapshot; it is not crash-durability proof.
+A future coordinator must validate and persist authenticated state before any
+effect that could disclose a key or change a user's tab.
+
+## Cryptographic suite selected for integration
+
+The proposed new control protocol uses libsodium single-part **Ed25519 detached
+signatures**, independently generated **X25519 encryption keys**, and
+`crypto_box_seal()` / `crypto_box_seal_open()` for per-recipient key envelopes.
+Generate signing and encryption keypairs separately; do not convert an Ed25519
+key or derive both roles from an ordinary unlock password. Group and request
+identifiers, nonce fields and recovery credentials use a cryptographic RNG.
+
+This is an explicit alternative to the earlier HPKE candidate, not HPKE or MLS
+conformance. The sealed-box construction is library-provided; do not reproduce
+its internals or create a custom X25519/AEAD composition. Sealed boxes do not
+authenticate the sender, so sender authority comes from the separate verified
+membership certificate and a signed envelope context. Signing does not conceal
+the signed public metadata.
+
+Select a specific maintained libsodium source release, verify its publisher
+provenance, pin it and qualify its Windows/MSVC and Flatpak builds before adding
+the adapter. Use the documented library validation functions and fail closed on
+errors. A nonzero 32-byte token passing this model's structural checks is not
+proof that it is an admissible Ed25519/X25519 key. No new runtime dependency is
+introduced by the policy model alone.
+
+The existing AES-GCM clipboard-event and private-vault backends are unchanged.
+Adding control-plane signatures does not upgrade old shared-key events into
+individual sender authentication. A versioned signed-event format, mixed-writer
+rejection and explicit archive migration remain prerequisites for production.
+
+## Exact model bytes
+
+Names ending in `model-v1` deliberately prevent accidental use as a final release
+protocol. Model version is the integer 1. Tokens, keys and digests are exactly
+32 bytes; signatures are exactly 64 bytes. Unsigned integers use big-endian
+fixed widths. Domains below include one final zero byte; there is no implicit
+text encoding, JSON normalization, optional field or algorithm negotiation.
+
+`Member96` is `id32 || signingKey32 || encryptionKey32`. An intent contains:
+
+| Order | Field / representation |
+| --- | --- |
+| 1 | `CopyQ-Secure-Sync-membership-intent-model-v1` plus NUL |
+| 2 | `version` as u32 |
+| 3 | `group32 || root32 || parent32` |
+| 4 | `parentEpoch` as u64, then target `keyGeneration` as u64 |
+| 5 | target `keyCommitment` as 32 bytes |
+| 6 | operation u8: Add = 1, Remove = 2 |
+| 7 | subject `Member96` |
+| 8 | `request32 || nonce32` |
+| 9 | `created` and `expires`, each u64 |
+
+`encodeProposal()` produces those exact bytes, denoted `P`. A model certificate
+is `certificate-domain || P || approvalCount-u32 || approvals`; its domain is
+`CopyQ-Secure-Sync-membership-certificate-model-v1` plus NUL. Each approval is
+`signer32 || signature64`, ordered by signer ID. Decoders reject unknown version
+or operation, malformed intrinsic values, duplicate approvals, noncanonical order,
+truncation, trailing bytes and bounds violations before unbounded allocation.
+
+For parent member `A`, `verificationDigest(P,A)` is SHA-256 of:
+
+```text
+"CopyQ-Secure-Sync-membership-verification-model-v1" || NUL || P || Member96(A)
+```
+
+The exact message passed to `SignatureVerifier` is `approvalBytes(P,A)`:
+
+```text
+"CopyQ-Secure-Sync-membership-approval-model-v1" || NUL || P || Member96(A) || verificationDigest(P,A)
+```
+
+An implementation must not substitute `SHA256(P)` or a library's multipart
+Ed25519ph mode for that single-part message. Each vote binds its approver and the
+same proposed operation; votes on another parent or different applicant cannot
+be combined. The successor state also commits to the intent, so changing a
+request does not produce the same operation merely because member lists match.
+
+Genesis, state and proposal digests use the model's separate domains. The source
+and independent fixtures define their exact encodings. Production formats need
+their own reviewed version assignment and complete frozen cross-platform vectors;
+renaming these domains in a release without updating vectors is not migration.
+
+## Peer verification without a custom short code
+
+Use the **entire 256-bit verification digest**, rendered as 64 hex digits grouped
+for comparison, or a QR representation of the same reviewed public context.
+Do not compare only a suffix, truncate to six digits or claim a short-code security
+level without a separately reviewed authenticated pairing construction.
+
+For each required approver, both the applicant and that approver compute the
+digest locally using their own intended keys, the exact proposed request and the
+existing group's pinned root. Compare on the actual trusted device screens or
+over an independent authenticated channel. The applicant verifies each approver
+and root, not only the other way around. A QR file obtained through the same
+untrusted Nextcloud folder, a self-signature, or a familiar label is insufficient.
+
+Fresh request and nonce fields are part of `P`; the verified request must be the
+one later reserved and signed. The selected approver's full member keys are also
+bound. A changed parent, recipient key, request, lifetime or local intended group
+invalidates verification and requires a new comparison. Never build the displayed
+digest exclusively from attacker-supplied keys while ignoring the local identity.
+
+Record the local confirmation for this exact digest and then reserve the signing
+intent. In production, commit the reservation durably before signing; only after
+that commit may the signer adapter receive the exact approval bytes. The UI
+confirmation is a local trusted action, not a boolean supplied by a transport
+file. Two cloned signing identities count once. Separate keys enrolled on one
+physical host do not prove independent computers or protect against that OS's
+compromise; explain this boundary when presenting two-device protection.
+
+## Membership and time behavior
+
+The model admits at most 32 active members and retains at most 256 states; limits
+cause refusal, never silent pruning of trust witnesses. Signing keys and IDs must
+be unique, including retired identities, and the applicant cannot vote. The sole
+genesis member may add the second device once. Thereafter two distinct current
+identities approve additions. Removal needs two survivors, excludes the target,
+and increases future-key generation with a new nonzero key commitment. Additions
+retain the parent's generation and commitment. There is no permanent founder privilege.
+
+Proposal validity is `created <= now < expires`, with a positive lifetime of at
+most 86,400 seconds. The model receives `now` from its caller; it is not a trusted
+clock service. Production must supply a qualified time source and preserve the
+last trusted clock/state watermark. Clock rollback, implausible future dates or
+uncertain restored time pause signing and fresh admission rather than expanding
+the validity window. Correcting the clock does not erase a signing reservation.
+
+Already accepted exact intents remain idempotent after their deadline. A delayed
+cryptographically valid conflicting certificate is still fork evidence, even
+after expiry: a deadline is not proof that signatures or a remote acceptance
+were withdrawn. Retain earlier accepted ancestors to detect deep conflicts.
+
+Fixed two-of-N approval is not global consensus. Disjoint pairs, or an equivocating
+member, can certify competing branches before either side observes the other.
+On observing a valid conflict, halt membership, key delivery and automatic sync;
+continue protected local saves. Honest split partial votes can also block a
+parent without completing a certificate. Keep reservations and show the blocked
+state; do not unlock them on timeout, cancel, restart or retry. Deliberate new-group
+recovery is the baseline escape path, not automatic selection of a winner.
+
+## Key delivery and acknowledgement contract
+
+This is the future adapter contract; no delivery implementation is supplied here.
+Before collecting rotation votes, a coordinator creates and privately journals
+the fresh random 32-byte group key. The proposed public commitment is SHA-256 of
+the domain `CopyQ-Secure-Sync-data-key-commitment-control-v1` including NUL,
+followed by `group32 || keyGeneration-u64BE || key32`. The group ID is generated
+before its initial key commitment and genesis root, avoiding a circular root
+definition. No raw key enters the proposal. Production version/encoding must
+freeze this construction with independent vectors before any real key is used.
+
+The model requires a nonzero initial commitment, exact retention on Add, and a
+different nonzero commitment with incremented generation on Remove. It cannot
+prove that a supplied commitment represents a fresh/random secret. The real
+coordinator must validate the journaled secret against it; the receiver must
+recompute it from the delivered key before accepting the generation. This binds
+all distributors to the key approved by the same certificate, rather than merely
+a shared numeric generation. Losing that prepared secret requires explicit
+recovery, not substitution of a different key under existing approvals.
+Because the generation is part of the commitment, its inequality alone also
+cannot detect reuse of the same raw key. Require fresh RNG output, refuse known
+raw-key reuse, and fail closed on generator failure in the actual key adapter.
+
+First validate the full certificate against pinned history and check the current
+membership/fork state. Then construct a recipient-specific, versioned envelope
+context containing group/root, accepted successor digest, proposal digest,
+recipient `Member96`, sender member ID, key generation, commitment and scope of
+history access.
+
+Seal the key payload to the verified recipient's X25519 public key, and sign the
+exact public context and ciphertext with a current authorized sender's Ed25519
+identity. Include that same context inside the sealed payload and compare it after
+decryption. The receiver checks sender authority, signatures, certificate and all
+bindings before accepting the decrypted key; a sealed box alone is not admission.
+The final envelope domains/serialization and independent vectors are mandatory
+adapter work and are not inferred from the membership model encoding.
+
+Recheck the currently known membership and recipient's authority immediately
+before release; a historically valid admission is not permission to send a later
+generation to a now-removed device. A locally hidden revocation remains the stated
+transport limitation. Persist full authenticated certificate bytes in the future
+archive: this model's two fork-evidence digests are witnesses, not that archive.
+
+Persist the exact prepared envelope before immutable publication; retry its bytes
+rather than resealing under the same operation unexpectedly. After validated local
+initialization and authenticated Join, the recipient signs a stage-specific
+acknowledgement bound to the group, successor, request and received package digest.
+Do not display complete onboarding from a file write or a generic online status.
+Removal distributes a fresh future-data key only to survivors; encrypting it
+solely under the old shared key would also give it to the removed member.
+
+## Independent recovery credential
+
+The proposed first recovery format uses a generated 256-bit random recovery
+secret, separate from ordinary local passwords and device signing keys. Its
+public group binding is a domain-separated digest; the secret is exported only
+through an explicit offline backup flow, never retained as founder authority,
+automatically copied to the system clipboard, or stored beside the cloud archive.
+
+Encrypt the recovery package with a library-provided AEAD and authenticate its
+complete versioned metadata: original group/root, membership checkpoint, included
+key generations, snapshot/archive digests and creation time. XChaCha20-Poly1305
+with a fresh random 24-byte nonce is the selected libsodium candidate for this
+new package, independent of existing vault formats. Exact header/domain, key
+separation, renewal, rotation and restore semantics require adapter vectors and
+failure tests before this format can be used. An optional passphrase wrapper
+would require separately specified Argon2id parameters and resource bounds;
+an ordinary unlock password is not a substitute recovery credential.
+
+A recovery import must prove the package's declared coverage and credential
+binding, then create a new independently verified group with new keys. It never
+fabricates two approvals or resets bootstrap in the old group. Preserve old data,
+identify omitted historical generations and unsent local edits, and require old
+peers to verify/rejoin explicitly. Missing keys are not recoverable by an empty
+replacement. A fresh-machine restore drill is a release requirement.
+
+## User control and remaining work
+
+Before effectful actions show the affected group/device/tab, full-history access,
+approval count and consequences of removal or recovery. Require user confirmation
+for verification, granting access, changing launch/permissions, migration and
+destructive actions. Automatic discovery, validation and safe retry need no repeated
+prompt; they must not silently weaken the trust policy or CopyQ encryption.
+
+G1-G4 now have explicit candidate choices and a tested policy foundation, not
+completed production proof. Remaining work includes the reviewed crypto adapter,
+actual identity-key validation, authenticated file formats, durable restore/signing
+coordination, envelope/acknowledgement vectors, recovery-package qualification and
+independent review. G5's signed event migration and G6-G7's installer/platform
+qualification still gate distribution. Advanced settings remain ordinary UI.
+
+## Primary references
+
+- [Libsodium signatures](https://doc.libsodium.org/public-key_cryptography/public-key_signatures):
+  detached verification and the distinction between Ed25519 and multipart Ed25519ph.
+- [Libsodium sealed boxes](https://doc.libsodium.org/public-key_cryptography/sealed_boxes):
+  recipient encryption without sender identity; no homemade implementation.
+- [Distinct signing and encryption keys](https://doc.libsodium.org/advanced/ed25519-curve25519):
+  upstream guidance supporting separate key roles.
+- [XChaCha20-Poly1305](https://doc.libsodium.org/secret-key_cryptography/aead/chacha20-poly1305/xchacha20-poly1305_construction)
+  and [password key derivation](https://doc.libsodium.org/password_hashing/default_phf):
+  candidate recovery primitives, not qualification of our package format.

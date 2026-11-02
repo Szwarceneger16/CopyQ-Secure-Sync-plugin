@@ -34,6 +34,12 @@ preserves existing CopyQ encryption and normal advanced settings. The
 and planned tests; it is not evidence that these features already work. Current
 RC installation and manual key transfer remain unchanged.
 
+The [stage-2 policy laboratory](docs/DEVICE-TRUST-MODEL.md) implements isolated,
+bounded membership validation and adversarial tests. Its
+[pairing protocol design](docs/DEVICE-TRUST-PROTOCOL.md) records concrete security
+decisions and remaining integration gates. It is not active in the plugin and
+does not yet provide a working pairing wizard or installer.
+
 ## Build and test pipeline
 
 **Native build and tests** uses GitHub-hosted runners: an Ubuntu 24.04 SDK

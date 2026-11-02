@@ -40,6 +40,14 @@ else()
 endif()
 
 if(BUILD_TESTING)
+  # Stage-2 policy laboratory: not linked into the shipping plugin. Real signing,
+  # durable approval journals and peer verification are later integration gates.
+  add_library(cqs-device-trust STATIC src/device_trust.cpp)
+  target_link_libraries(cqs-device-trust PUBLIC cqs-core)
+  add_executable(cqs-device-trust-test tests/device_trust_test.cpp)
+  target_link_libraries(cqs-device-trust-test PRIVATE cqs-device-trust)
+  add_test(NAME device-trust COMMAND cqs-device-trust-test)
+  set_tests_properties(device-trust PROPERTIES TIMEOUT 60)
   foreach(kind crypto history events interop transaction)
     add_executable(cqs-${kind}-test tests/${kind}_test.cpp)
     target_link_libraries(cqs-${kind}-test PRIVATE cqs-core)
