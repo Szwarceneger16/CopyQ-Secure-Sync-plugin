@@ -2,6 +2,10 @@
 
 Native, GPL-3.0-or-later CopyQ plugin for encrypted synchronization of a selected tab through a local synchronization folder.
 
+**Security:** read [the security policy and threat model](SECURITY.md) before using
+the plugin with private data. It covers current guarantees, shared-key limitations,
+safe operation and private vulnerability reporting.
+
 The native module runs without a Python agent, system service or dependency on the CopyQ Synchronize plugin. Qt and the CopyQ plugin ABI remain required.
 
 **Installation requirement:** users must be able to add the module to an existing
