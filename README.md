@@ -40,6 +40,13 @@ bounded membership validation and adversarial tests. Its
 decisions and remaining integration gates. It is not active in the plugin and
 does not yet provide a working pairing wizard or installer.
 
+An [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) now adds
+real Ed25519 signatures, independent device encryption keys and an encrypted
+approval journal that commits a verified intent before signing. It requires
+libsodium 1.0.22 or newer and is built only with `CQS_TEST_DEVICE_CRYPTO=ON`.
+The shipping module has no new dependency; key delivery, vault integration and
+the guided setup flow remain separate implementation gates.
+
 ## Build and test pipeline
 
 **Native build and tests** uses GitHub-hosted runners: an Ubuntu 24.04 SDK

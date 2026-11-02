@@ -14,18 +14,20 @@ approval identities, retained ancestor witnesses and local signing reservations.
 `SignatureVerifier` is an explicit injected boundary: the model asks it to verify
 each signature against exact bytes and the parent's signing public key.
 
-The model neither supplies a production verifier nor signs, stores private keys,
-publishes files, commits a durable journal, grants permissions or releases K-SYNC.
-Its test verifier is public deterministic test machinery, not encryption. Copying
-a model object simulates an unchanged snapshot; it is not crash-durability proof.
-A future coordinator must validate and persist authenticated state before any
-effect that could disclose a key or change a user's tab.
+The base model's test verifier is public deterministic test machinery, not
+encryption. The optional [control-plane laboratory](DEVICE-TRUST-COORDINATOR.md)
+adds a real libsodium verifier/signer and an encrypted durable approval journal.
+It validates pinned history and commits reservations before signing. It does not
+publish transport files, integrate a private identity vault, grant operating-system
+permissions, release K-SYNC or change a user's tab. Copying a base model object
+still provides no crash-durability evidence.
 
 ## Cryptographic suite selected for integration
 
-The proposed new control protocol uses libsodium single-part **Ed25519 detached
-signatures**, independently generated **X25519 encryption keys**, and
-`crypto_box_seal()` / `crypto_box_seal_open()` for per-recipient key envelopes.
+The implemented opt-in adapter uses libsodium single-part **Ed25519 detached
+signatures** and independently generated **X25519 encryption keys**. The proposed
+key-delivery adapter will use `crypto_box_seal()` / `crypto_box_seal_open()` for
+per-recipient envelopes; envelope creation and opening are not implemented yet.
 Generate signing and encryption keypairs separately; do not convert an Ed25519
 key or derive both roles from an ordinary unlock password. Group and request
 identifiers, nonce fields and recovery credentials use a cryptographic RNG.
@@ -37,12 +39,15 @@ authenticate the sender, so sender authority comes from the separate verified
 membership certificate and a signed envelope context. Signing does not conceal
 the signed public metadata.
 
-Select a specific maintained libsodium source release, verify its publisher
-provenance, pin it and qualify its Windows/MSVC and Flatpak builds before adding
-the adapter. Use the documented library validation functions and fail closed on
-errors. A nonzero 32-byte token passing this model's structural checks is not
-proof that it is an admissible Ed25519/X25519 key. No new runtime dependency is
-introduced by the policy model alone.
+The laboratory requires libsodium **1.0.22 or newer** at configure time and
+runtime. Its local validation baseline is the pinned 1.0.22 release documented in
+[dependency qualification](DEVICE-TRUST-COORDINATOR.md#dependency-qualification).
+The adapter validates Ed25519 point encodings and rejects noncanonical/low-order
+X25519 public inputs before they enter the journal. A nonzero 32-byte token passing
+only the base model's structural checks remains insufficient. Independent
+publisher-key verification and Windows/MSVC/Flatpak qualification still gate
+distribution. Neither the base policy model nor the shipping plugin gains a
+libsodium runtime dependency by default.
 
 The existing AES-GCM clipboard-event and private-vault backends are unchanged.
 Adding control-plane signatures does not upgrade old shared-key events into
@@ -122,8 +127,10 @@ invalidates verification and requires a new comparison. Never build the displaye
 digest exclusively from attacker-supplied keys while ignoring the local identity.
 
 Record the local confirmation for this exact digest and then reserve the signing
-intent. In production, commit the reservation durably before signing; only after
-that commit may the signer adapter receive the exact approval bytes. The UI
+intent. `TrustJournal::approve()` enforces this order in the optional laboratory:
+only after a durable Store commit may the signer receive the exact approval bytes.
+Its confirmed-digest parameter is a trusted local caller boundary, not a finished
+human-verification interface. The UI
 confirmation is a local trusted action, not a boolean supplied by a transport
 file. Two cloned signing identities count once. Separate keys enrolled on one
 physical host do not prove independent computers or protect against that OS's
@@ -141,10 +148,11 @@ retain the parent's generation and commitment. There is no permanent founder pri
 
 Proposal validity is `created <= now < expires`, with a positive lifetime of at
 most 86,400 seconds. The model receives `now` from its caller; it is not a trusted
-clock service. Production must supply a qualified time source and preserve the
-last trusted clock/state watermark. Clock rollback, implausible future dates or
-uncertain restored time pause signing and fresh admission rather than expanding
-the validity window. Correcting the clock does not erase a signing reservation.
+clock service. The optional journal persists a monotonic watermark and refuses
+backwards time for fresh signatures or admissions while allowing authenticated
+historical fork evidence. Production still needs a qualified clock source and a
+policy for implausible future dates or uncertain restored time. Correcting the
+clock does not erase a signing reservation.
 
 Already accepted exact intents remain idempotent after their deadline. A delayed
 cryptographically valid conflicting certificate is still fork evidence, even
@@ -199,8 +207,10 @@ adapter work and are not inferred from the membership model encoding.
 Recheck the currently known membership and recipient's authority immediately
 before release; a historically valid admission is not permission to send a later
 generation to a now-removed device. A locally hidden revocation remains the stated
-transport limitation. Persist full authenticated certificate bytes in the future
-archive: this model's two fork-evidence digests are witnesses, not that archive.
+transport limitation. The optional journal already persists full authenticated
+membership certificate bytes, including observed fork branches. A production
+key-delivery archive must retain that proof; the base model's two fork-evidence
+digests alone are insufficient.
 
 Persist the exact prepared envelope before immutable publication; retry its bytes
 rather than resealing under the same operation unexpectedly. After validated local
@@ -243,11 +253,13 @@ for verification, granting access, changing launch/permissions, migration and
 destructive actions. Automatic discovery, validation and safe retry need no repeated
 prompt; they must not silently weaken the trust policy or CopyQ encryption.
 
-G1-G4 now have explicit candidate choices and a tested policy foundation, not
-completed production proof. Remaining work includes the reviewed crypto adapter,
-actual identity-key validation, authenticated file formats, durable restore/signing
-coordination, envelope/acknowledgement vectors, recovery-package qualification and
-independent review. G5's signed event migration and G6-G7's installer/platform
+G1-G4 now have explicit candidate choices, a tested policy foundation, and opt-in
+real identity/signing and durable approval coordination. These are isolated
+components, not completed production proof. Remaining work includes qualified
+identity-vault storage, trusted-screen peer verification, production transport
+formats, envelope/acknowledgement vectors, recovery-package qualification and
+independent review. Full disk/key rollback across restarts requires an external
+monotonic anchor or explicit recovery policy. G5's signed event migration and G6-G7's installer/platform
 qualification still gate distribution. Advanced settings remain ordinary UI.
 
 ## Primary references

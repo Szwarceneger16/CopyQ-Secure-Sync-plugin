@@ -12,16 +12,19 @@ the concrete pairing direction and remaining integration requirements.
 The model validates typed membership proposals and certificates with fixed-width,
 domain-separated encodings. It derives state/intent digests using the existing
 platform SHA-256 backend and delegates approval signature verification to an
-explicit `SignatureVerifier` implementation. No permissive production verifier,
-private-key signer or key-release function is supplied.
+explicit `SignatureVerifier` implementation. The optional
+[control-plane laboratory](DEVICE-TRUST-COORDINATOR.md) supplies a real libsodium
+verifier, private-key signer and durable approval coordinator. The base model
+keeps its dependency-free verifier boundary; neither component releases a group
+key or runs in the shipping plugin.
 
 Membership starts from a locally pinned, explicitly supplied genesis. Constructing
-a new `Membership` from arbitrary remote data is not a trust decision. Future
-integration must reconstruct and validate a pinned chain and protected local
-approval witnesses; missing/corrupt saved state cannot create a replacement group.
-The in-memory fork latch records conflicting child-state digests. The future
-archive/journal adapter must additionally preserve the exact authenticated
-certificate bytes for both branches; digests alone are not durable proof storage.
+a new `Membership` from arbitrary remote data is not a trust decision. The
+optional `TrustJournal` reconstructs the chain and local approval witnesses from
+an encrypted dedicated record, validates externally supplied genesis/local pins,
+and retains complete authenticated accepted and conflicting certificates.
+Missing/corrupt saved state cannot create a replacement group. The base model's
+in-memory fork digests alone remain insufficient durable proof storage.
 
 The model covers:
 
@@ -45,12 +48,14 @@ certification.
 
 ## Persistence and user verification are not simulated security
 
-`reserve()` is an **in-memory** policy operation. Before a real client signs, the
-vault-backed coordinator must durably commit the exact reservation, then use the
-matching human-verification receipt. Copying a model object in a test demonstrates
-state-machine behavior, not disk durability, protection from backup rollback,
-process exclusion or power-loss guarantees. There is deliberately no production
-key delivery until that adapter and the versioned signed event path are qualified.
+`reserve()` is an **in-memory** policy operation. `TrustJournal::approve()` now
+holds a Store lease, replays authenticated history, checks the exact confirmed
+digest, durably commits the reservation, and only then calls the real signer.
+Its tests separately exercise failed/ambiguous commits and disk reopening.
+Copying the base model still demonstrates only state-machine behavior. Complete
+disk/key backup rollback across restart, platform power-loss behavior, private-key
+vault integration and the versioned signed event path remain qualification gates.
+There is deliberately no production key delivery.
 
 Similarly, computing `verificationDigest()` is not proof that a user compared it.
 Only a trusted-screen/out-of-band comparison in the reviewed pairing flow may
@@ -75,11 +80,13 @@ cmake --build build-model --parallel 2
 ctest --test-dir build-model --output-on-failure
 ```
 
-These commands never start CopyQ or inspect a user profile. The focused test
+These commands never start CopyQ or inspect a user profile. The base policy test
 uses a clearly marked deterministic public **test verifier**, not real signatures.
-Its positive policy cases cannot establish the correctness of a future Ed25519
-adapter. Real cryptographic vectors, invalid-key checks and end-to-end peer
-verification remain independent requirements.
+Its positive policy cases cannot establish cryptographic adapter correctness.
+The separate opt-in identity/journal tests use real signatures, RFC 8032 vectors,
+invalid-key checks and fault injection; see the
+[build and validation instructions](DEVICE-TRUST-COORDINATOR.md#build-and-validation).
+An actual trusted-screen peer-verification flow is still unimplemented.
 
 `tests/fixtures/device_trust_vectors.h` freezes independent canonical bytes and
 SHA-256 values produced by Python `struct`/`hashlib`. Signature-shaped fixture
@@ -91,6 +98,7 @@ diff -u tests/fixtures/device_trust_vectors.h /tmp/cqs-device-trust-vectors.h
 ```
 
 The [acceptance matrix](DEVICE-TRUST-ACCEPTANCE.md) remains the product-level gate
-register. Do not mark physical-device delivery, durable recovery, real signing,
-CopyQ encryption coexistence or an automatic installer as passed by these tests.
+register. Real signing and durable approval reservations now have isolated test
+coverage. Do not mark physical-device delivery, durable recovery, CopyQ encryption
+coexistence or an automatic installer as passed by these tests.
 Exact test counts/results belong to the implementing PR and its current CI run.
