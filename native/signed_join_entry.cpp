@@ -88,7 +88,8 @@ struct Key {
 
 void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Profile &legacy,
                          const std::function<bool()> &stillCurrent,
-                         const std::function<bool(const SignedTabConfiguration &, const std::string &)> &activate) {
+                         const ActivateSignedTab &activate,
+                         const PrepareSignedReplica &prepareReplica) {
     const QPointer<QWidget> owner(parent);
     const QPointer<QDialog> dialog(new QDialog(parent));
     const auto close = qScopeGuard([dialog] { delete dialog.data(); });
@@ -178,7 +179,9 @@ void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Pro
         crypto::wipe(publisherCredential.bytes);
         if (owner && stillCurrent()) runSignedJoinWizard(owner, journal, *identity, transport, checkpoint, binding,
             groupKey.get(), path(staging), stillCurrent, [&](const trust::JoinActivation &expected) {
-                return activate({checkpointPath, checkpointKey, expected}, journalBinding);
+                return activate({checkpointPath, checkpointKey, expected}, journalBinding, {transportPath, journalPath});
+            }, transportPath, [&] {
+                return prepareReplica(checkpointPath, checkpointKey, journalBinding, {transportPath, journalPath});
             });
     } catch (const std::exception &) {
         if (owner) QMessageBox::warning(owner, QString::fromLatin1(Caption),

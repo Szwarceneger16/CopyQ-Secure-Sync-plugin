@@ -9,6 +9,7 @@
 #include <QApplication>
 #include <QFileDialog>
 #include <QFileDevice>
+#include <QFileInfo>
 #include <QDir>
 #include <QCoreApplication>
 #include <future>
@@ -1132,31 +1133,67 @@ void SecureSyncPlugin::loadSettings(const QSettings &s) {
 }
 #ifdef CQS_BUILD_SIGNED_JOIN
 bool SecureSyncPlugin::activateSignedTab(const cqs::native::SignedTabConfiguration &configuration,
-                                        const std::string &journalBinding) {
+                                        const std::string &journalBinding, const cqs::native::SignedReplicaSource &source) {
     using namespace cqs::native;
     if (signedTab_.hasModel() || !signedTabHostReady(settingsFile_)) return false;
     const auto encoded = encodeSignedTab(configuration, journalBinding);
     auto validated = decodeSignedTab(settingsFile_, encoded);
-    if (!validated) return false;
+    const auto pin = signedReplicaSourcePin(configuration.expected.profileBinding, source);
+    if (!validated || pin.isEmpty()) return false;
     QSettings settings(settingsFile_, QSettings::IniFormat);
     settings.beginGroup("Plugins/securesync");
+    if (settings.contains(SignedReplicaSourceSetting) && settings.value(SignedReplicaSourceSetting).toByteArray() != pin)
+        return false;
     if (settings.contains(SignedTabSetting)) {
         if (settings.value(SignedTabSetting).toByteArray() != encoded) return false;
     } else {
         if (!signedTabDestinationFree(settingsFile_)) return false;
         settings.setValue(SignedTabSetting, encoded);
-        settings.sync();
     }
+    settings.setValue(SignedReplicaSourceSetting, pin);
+    settings.sync();
     if (settings.status() != QSettings::NoError) return false;
     QSettings confirmed(settingsFile_, QSettings::IniFormat);
     confirmed.sync();
     confirmed.beginGroup("Plugins/securesync");
     if (confirmed.value(SignedTabSetting).toByteArray() != encoded ||
+        confirmed.value(SignedReplicaSourceSetting).toByteArray() != pin ||
         confirmed.status() != QSettings::NoError) return false;
     signedTabClaimed_ = true;
     signedTabSetting_ = encoded;
     signedTab_.setConfiguration(std::move(validated));
     return true;
+}
+
+std::optional<cqs::native::SignedReplicaRequest> SecureSyncPlugin::prepareSignedReplica(
+    const QString &directory, const QString &keyFile, const std::string &journalBinding, const cqs::native::SignedReplicaSource &source) {
+    using namespace cqs::native;
+    QString inventory;
+    if (signedTab_.hasModel() || !signedTabHostReady(settingsFile_, &inventory)) return {};
+    const auto maximum = signedTabReplicaLimit(settingsFile_);
+    if (maximum <= 0) return {};
+    QSettings settings(settingsFile_, QSettings::IniFormat);
+    settings.beginGroup("Plugins/securesync");
+    const auto encoded = settings.value(SignedTabSetting).toByteArray();
+    const auto current = decodeSignedTab(settingsFile_, encoded);
+    if (!current || encoded != signedTabSetting_ || current->checkpointDirectory != directory ||
+        current->keyFile != keyFile || current->expected.profileBinding !=
+            signedTabBinding(QFileInfo(settingsFile_).canonicalFilePath(), directory, journalBinding)) return {};
+    const auto pin = signedReplicaSourcePin(current->expected.profileBinding, source);
+    if (pin.isEmpty() || settings.status() != QSettings::NoError) return {};
+    const bool pinned = settings.contains(SignedReplicaSourceSetting);
+    if (pinned && settings.value(SignedReplicaSourceSetting).toByteArray() != pin) return {};
+    return SignedReplicaRequest{current->expected, maximum, pinned,
+        [settingsFile = settingsFile_, encoded, pin, pinned] {
+            return confirmSignedReplicaSource(settingsFile, encoded, pin, !pinned);
+        }, [settingsFile = settingsFile_, inventory](const auto &before, const auto &after) {
+            try {
+                rowProtection(settingsFile, inventory).validate(before, after);
+                return true;
+            } catch (const ModelError &) {
+                return false;
+            }
+        }};
 }
 #endif
 void SecureSyncPlugin::applySettings(QSettings &s) {
@@ -1212,8 +1249,13 @@ QWidget *SecureSyncPlugin::createSettingsWidget(QWidget *parent) {
         signedJoinOpen_ = true;
         const auto reset = qScopeGuard([owner] { if (owner) owner->signedJoinOpen_ = false; });
         cqs::native::openSignedJoinSetup(widget, settings, profile, stillCurrent,
-            [&](const cqs::native::SignedTabConfiguration &configuration, const std::string &journalBinding) {
-                return stillCurrent() && activateSignedTab(configuration, journalBinding);
+            [&](const cqs::native::SignedTabConfiguration &configuration, const std::string &journalBinding,
+                const cqs::native::SignedReplicaSource &source) {
+                return stillCurrent() && activateSignedTab(configuration, journalBinding, source);
+            }, [&](const QString &directory, const QString &keyFile, const std::string &journalBinding,
+                   const cqs::native::SignedReplicaSource &source) -> std::optional<cqs::native::SignedReplicaRequest> {
+                if (!stillCurrent()) return {};
+                return prepareSignedReplica(directory, keyFile, journalBinding, source);
             });
     });
 #endif

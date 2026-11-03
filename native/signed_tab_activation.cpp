@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "signed_tab_activation.h"
+#include "common/appconfig.h"
 #include "plugin_inventory.h"
 #include "storage.h"
 #include <QCoreApplication>
@@ -41,6 +42,36 @@ std::string signedTabBinding(const QString &settingsFile, const QString &directo
     return "signed-native-" + QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().toStdString();
 }
 
+QByteArray signedReplicaSourcePin(const std::string &profileBinding, const SignedReplicaSource &source) {
+    if (!canonicalPath(source.transport, true) || !canonicalPath(source.journal, true)) return {};
+    QByteArray bytes("CopyQ-Secure-Sync-native-replica-source-v1");
+    bytes.append('\0').append(QByteArray::fromStdString(profileBinding)).append('\0').append(source.transport.toUtf8())
+        .append('\0').append(source.journal.toUtf8());
+    return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
+}
+
+bool confirmSignedReplicaSource(const QString &settingsFile, const QByteArray &activation,
+                                const QByteArray &pin, bool allowFirstPin) {
+    if (activation.isEmpty() || pin.size() != 32) return false;
+    QSettings settings(settingsFile, QSettings::IniFormat);
+    settings.sync();
+    settings.beginGroup("Plugins/securesync");
+    if (settings.value(SignedTabSetting).toByteArray() != activation || settings.status() != QSettings::NoError)
+        return false;
+    if (settings.contains(SignedReplicaSourceSetting))
+        return settings.value(SignedReplicaSourceSetting).toByteArray() == pin;
+    if (!allowFirstPin) return false;
+    settings.setValue(SignedReplicaSourceSetting, pin);
+    settings.sync();
+    if (settings.status() != QSettings::NoError) return false;
+    QSettings confirmed(settingsFile, QSettings::IniFormat);
+    confirmed.sync();
+    confirmed.beginGroup("Plugins/securesync");
+    return confirmed.value(SignedTabSetting).toByteArray() == activation &&
+           confirmed.value(SignedReplicaSourceSetting).toByteArray() == pin &&
+           confirmed.status() == QSettings::NoError;
+}
+
 QByteArray encodeSignedTab(const SignedTabConfiguration &configuration, const std::string &journalBinding) {
     const auto &a = configuration.expected;
     return QJsonDocument(QJsonObject{
@@ -77,7 +108,7 @@ std::optional<SignedTabConfiguration> decodeSignedTab(const QString &settingsFil
     return configuration;
 }
 
-bool signedTabHostReady(const QString &settingsFile) {
+bool signedTabHostReady(const QString &settingsFile, QString *enabledInventory) {
     if (settingsFile.isEmpty() || !qApp) return false;
     QSettings settings(settingsFile, QSettings::IniFormat);
     if (!settings.value("Options/encrypt_tabs", false).toBool() || settings.status() != QSettings::NoError) return false;
@@ -95,8 +126,30 @@ bool signedTabHostReady(const QString &settingsFile) {
         inventory = stats.toStringList();
         if (inventory.isEmpty()) return false;
     }
-    return !inventory.isEmpty() && inventory.front() == QStringLiteral("PLUGIN securesync: enabled") &&
-           incompatiblePlugin(inventory.join('\n')).isEmpty();
+    if (inventory.isEmpty() || inventory.front() != QStringLiteral("PLUGIN securesync: enabled")) return false;
+    const auto report = inventory.join('\n');
+    if (!incompatiblePlugin(report).isEmpty()) return false;
+    if (enabledInventory) *enabledInventory = report;
+    return true;
+}
+
+int signedTabReplicaLimit(const QString &settingsFile) {
+    QSettings settings(settingsFile, QSettings::IniFormat);
+    bool ok = false;
+    auto limit = settings.value("Options/maxitems", Config::maxitems::defaultValue()).toInt(&ok);
+    if (!ok) return 0;
+    // Match CopyQ 17's per-tab override. A non-persistent signed tab cannot
+    // safely receive a new local snapshot.
+    const auto tabs = settings.beginReadArray("Tabs");
+    if (tabs < 0 || tabs > 10000) return 0;
+    for (int i = 0; i < tabs; ++i) {
+        settings.setArrayIndex(i);
+        if (settings.value("name").toString() != QLatin1String(SignedTabName)) continue;
+        if (!settings.value("store_items", true).toBool()) return 0;
+        const auto overrideLimit = settings.value("max_item_count").toInt();
+        if (overrideLimit > 0) limit = overrideLimit;
+    }
+    return settings.status() == QSettings::NoError ? Config::maxitems::value(limit) : 0;
 }
 
 bool signedTabDestinationFree(const QString &settingsFile) {

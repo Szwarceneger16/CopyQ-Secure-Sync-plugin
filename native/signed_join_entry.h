@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "device_trust_journal.h"
 #include "profile.h"
+#include "signed_join_wizard.h"
 #include <functional>
+#include <optional>
 #include <string>
 
 class QWidget;
 
 namespace cqs::native {
 struct SignedTabConfiguration;
+struct SignedReplicaSource;
+using ActivateSignedTab = std::function<bool(const SignedTabConfiguration &, const std::string &, const SignedReplicaSource &)>;
+using PrepareSignedReplica = std::function<std::optional<SignedReplicaRequest>(
+    const QString &, const QString &, const std::string &, const SignedReplicaSource &)>;
 void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Profile &legacy,
                          const std::function<bool()> &stillCurrent,
-                         const std::function<bool(const SignedTabConfiguration &, const std::string &)> &activate);
+                         const ActivateSignedTab &activate,
+                         const PrepareSignedReplica &prepareReplica);
 }

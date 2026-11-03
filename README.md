@@ -64,11 +64,14 @@ adds a Preferences workflow for provisioned devices. With
 `CQS_BUILD_SIGNED_JOIN=ON`, a separate confirmation after the verified checkpoint
 write can enable an editable local `signed_sync` tab in CopyQ 17. The workflow
 requires Encrypt Tabs and a compatible plugin configuration. The tab keeps
-local edits in its private encrypted checkpoint. It does not publish or
-replicate them, and it leaves legacy tabs and synchronization unchanged.
+local edits in its private encrypted checkpoint. With the tab unloaded, the
+wizard's explicit [Synchronize signed_sync](docs/DEVICE-TRUST-COORDINATOR.md#manual-signed-tab-synchronization)
+action can download verified history into a clean checkpoint or publish local
+edits as an encrypted signed packet. Divergent history is preserved for
+review. Legacy tabs and synchronization remain separate.
 Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
-Signed synchronization in a regular CopyQ profile still requires guided
-provisioning, runtime integration and platform qualification.
+Guided provisioning, background signed synchronization, signed conflict
+resolution and platform qualification remain outside this experiment.
 
 ## Build and test pipeline
 

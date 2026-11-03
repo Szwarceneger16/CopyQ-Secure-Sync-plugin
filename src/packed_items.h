@@ -9,6 +9,8 @@ public:
 };
 void validateLimits(transaction::Limits limits);
 void validateSnapshot(const transaction::Snapshot &snapshot, transaction::Limits limits);
+// Deterministic CopyQ 17 v2 pack() items, with uncompressed inline MIME values.
+std::vector<std::string> encode(const transaction::Snapshot &snapshot, transaction::Limits limits = {});
 // CopyQ 17 pack(): base64 of one big-endian QDataStream per item. In-memory
 // decoding only; FILE: references and DEK-encrypted streams are never opened.
 transaction::Snapshot decode(const std::vector<std::string> &items, transaction::Limits limits = {});

@@ -67,10 +67,26 @@ struct JoinActivation {
 };
 using JoinActivationWriter = std::function<void(const JoinActivation &, const events::Event &,
                                                  const transaction::Snapshot &)>;
+struct SignedReplicaCursor {
+    std::string id;
+    Token digest{};
+};
+struct SignedReplicaIntent {
+    std::uint64_t sequence;
+    Token payload{};
+};
+struct SignedReplicaState {
+    SignedReplicaCursor cursor;
+    std::optional<SignedReplicaIntent> pending;
+};
+enum class SignedReplicaResult { UpToDate, Pulled, Published, Conflict };
+using SignedReplicaWriter = std::function<void(const SignedReplicaState &, const transaction::Snapshot &)>;
 struct SignedEventHistory {
     std::vector<events::Event> events;
     history::Graph graph;
     std::map<std::string, Token> wireDigests;
+    std::size_t wireBytes = 0;
+    std::size_t plaintextBytes = 0;
 };
 
 // Test-only coordinator. Use a dedicated encrypted FileStore outside transport
@@ -84,7 +100,7 @@ public:
     static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxJournalBytes = MaxControlBytes + MaxClipboardEventBytes +
-                                                   94 + 77 * history::MaxEvents;
+                                                   94 + 77 * history::MaxEvents + Token{}.size();
     TrustJournal(transaction::Store &store, Genesis genesis, Member local);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
@@ -122,6 +138,12 @@ public:
     void applyJoinActivation(const Identity &applicant, const storage::Directory &transport,
                              const JoinActivation &expected, std::uint64_t trustedNow,
                              const JoinActivationWriter &write);
+    // The caller holds the checkpoint session and supplies a stable local snapshot.
+    // The writer durably updates the checkpoint while this method holds the journal lease.
+    SignedReplicaResult synchronizeReplica(const Identity &identity, const storage::Directory &transport,
+        const JoinActivation &activation, SignedReplicaState replica, const transaction::Snapshot &local,
+        std::uint64_t trustedNow, const SignedReplicaWriter &write,
+        const std::filesystem::path &privateStaging = {});
     ObserveResult observe(const Certificate &certificate, std::uint64_t trustedNow);
     // Prepare one exact ciphertext for an authorized recipient at the accepted
     // head. Retry returns the stored bytes. A transport publisher must recheck
@@ -179,14 +201,17 @@ public:
     SignedEventHistory readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
                                          std::uint64_t trustedNow, events::Limits limits = {});
 private:
+    struct ReplicaPublication;
     JoinActivation verifyJoinActivation(const Identity &, const storage::Directory &, std::string,
                                         std::uint64_t, const JoinActivation *, const JoinActivationWriter &);
     PreparedClipboardEvent prepareClipboardEventLocked(const Identity &author, const SyncKey &key,
         const std::vector<SignedEventParent> &parents, const std::vector<std::string> &packedItems,
-        std::uint64_t now, events::Limits limits, const Token *migration = nullptr);
+        std::uint64_t now, events::Limits limits, const Token *migration = nullptr,
+        const Token *replicaTag = nullptr);
     std::string publishClipboardEventLocked(std::uint64_t sequence, const SyncKey &key,
         const storage::Directory &transport, std::uint64_t now, ClipboardPublication mode,
-        const std::filesystem::path &privateStaging, const Token *migration = nullptr);
+        const std::filesystem::path &privateStaging, const Token *migration = nullptr,
+        const ReplicaPublication *replica = nullptr);
     crypto::Bytes prepare(const Token &recipient, const Identity &sender, const SyncKey &key,
                          std::uint64_t now, KeyScope scope);
     std::unique_ptr<transaction::Store::Lease> lock();

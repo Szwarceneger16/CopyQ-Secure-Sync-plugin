@@ -8,8 +8,10 @@ activation preflight. Build them with
 `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. The separate
 [native experiment](#experimental-native-signed-join) can open a verified Join
-checkpoint in an editable local CopyQ tab. Guided provisioning, live signed
-synchronization, cloud delivery and recovery remain product integration work.
+checkpoint in an editable CopyQ tab and
+[synchronize it on demand](#manual-signed-tab-synchronization) while it is
+unloaded. Guided provisioning, background signed synchronization, cloud
+delivery and recovery remain product integration work.
 The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
@@ -414,8 +416,8 @@ the profile binding, group, root, membership head, member ID, generation and
 exact tip ID and digest. The profile binding is a caller-selected label. The
 preflight does not open the native profile or inspect its local tab. The
 terminal adapter is separate from CopyQ's settings UI. The native experiment
-below can mount the reviewed checkpoint locally; it does not acknowledge live
-signed synchronization to peers.
+below can mount the reviewed checkpoint locally. The key storage receipt
+still acknowledges only storage of the sealed key package.
 
 ## Experimental native Signed Join
 
@@ -490,11 +492,11 @@ lease for the lifetime of the saver. Updates to the working copy are committed
 and checked by reading the encrypted record back. CopyQ's tab file contains a
 routing marker with a binding digest and checkpoint record generation. Opening
 requires the same binding and a checkpoint at least as recent as that marker.
-A checkpoint may be ahead of the marker if CopyQ's tab file update was
-interrupted after the encrypted write. The marker contains no clipboard items
-or credential bytes. Settings remember the checkpoint and credential file
-paths and the reviewed checkpoint's binding and provenance. Keep the raw
-checkpoint credential file private and outside the shared root.
+A checkpoint may be ahead of the marker after synchronization while the tab
+is unloaded or after an interrupted tab file update. The marker contains no
+clipboard items or credential bytes. Settings remember the checkpoint and
+credential file paths and the reviewed checkpoint's binding and provenance.
+Keep the raw checkpoint credential file private and outside the shared root.
 
 An incompatible live plugin configuration, a missing or invalid checkpoint or
 credential, or a conflicting tab or cache on first activation causes refusal.
@@ -503,11 +505,60 @@ refuses legacy packets and uses the signed generation scope throughout. The
 existing legacy storage and synchronization paths remain separate.
 
 The local tab opens from the checkpoint without the signed transport or trust
-journal. It does not publish edits or replicate changes made on other devices.
-Like other CopyQ tabs, its open contents are available as plaintext to CopyQ
-commands. Copying items to the system clipboard or exporting them can put
-plaintext outside the checkpoint. Treat that data as you would data in any
-other CopyQ tab.
+journal. Opening or editing the tab does not start replication. Like other
+CopyQ tabs, its open contents are available as plaintext to CopyQ commands.
+Copying items to the system clipboard or exporting them can put plaintext
+outside the checkpoint. Treat that data as you would data in any other CopyQ
+tab.
+
+### Manual signed tab synchronization
+
+1. Activate `signed_sync` through Signed Join. Finish editing, let CopyQ save
+   normally, and resolve any save error before unloading. Close any editor and
+   switch to a different tab. If the signed tab is still loaded, close CopyQ
+   normally and reopen the profile with another tab selected. Keep
+   `signed_sync` unloaded until synchronization completes.
+2. Open the **Signed Join (experimental)** wizard again using the trusted
+   local pins, private storage and credential paths, and signed transport
+   from setup. Select **Synchronize signed_sync**. Review the displayed
+   transport folder and confirm that this device may publish local edits there
+   as an encrypted signed packet. New activations pin the canonical transport
+   and private journal paths to the local profile. An older activation binds
+   them after the user confirms the source and the journal authenticates the
+   expected history. Changing either path is refused after pinning.
+3. Reopen `signed_sync` after the operation. Repeat on a separately admitted
+   and activated device to receive the update once its synchronization client
+   has delivered the packet. Opening the tab or saving a local edit alone
+   leaves replication idle.
+
+The operation holds the exclusive checkpoint session and authenticates the
+signed history against the last locally accepted membership and installed
+key in the private trust journal. The journal retains exact packet witnesses.
+The checkpoint separately remembers its last synchronized revision and
+packet digest alongside the immutable Join proof and baseline. A clean copy
+can move to a single authenticated descendant. A dirty copy can publish only
+from its sole authenticated base tip. If local edits and the signed tip have
+both advanced, or if multiple signed tips are visible, synchronization
+reports a conflict and preserves the local copy and signed branches. Peers
+may publish concurrently, so a new branch can still appear after a device's
+last scan. An incoming snapshot that exceeds CopyQ's item limit or would
+change a pinned or locked row is deferred.
+
+Publication saves its intent before the journal reserves and seals the
+packet. If publication is interrupted, retry the same action with the same
+profile and transport. Recovery checks the reserved packet against the
+intent and can confirm an earlier write using the same ciphertext. If newer
+local edits exist when an earlier publication is confirmed, the encrypted
+checkpoint retains those edits. An unattempted reservation for content edited
+since staging is retired before evaluating the current local copy.
+
+Synchronization uses the last locally accepted trust state. Membership
+certificates and key packages are exchanged and installed through the
+separate explicit workflow. An observed membership fork, removal of the
+local device or change in key generation stops the current profile from
+synchronizing. An interrupted publication across a key rotation remains
+encrypted and requires a later recovery workflow. Conflict resolution,
+background synchronization and founder activation remain separate work.
 
 ## Clock and rollback limits
 

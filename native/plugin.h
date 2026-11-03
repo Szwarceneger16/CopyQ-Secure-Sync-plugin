@@ -14,9 +14,13 @@
 #include <QProcess>
 #include <QElapsedTimer>
 #ifdef CQS_BUILD_SIGNED_JOIN
+#include "signed_join_wizard.h"
 #include "signed_tab_storage.h"
 #endif
 struct SecureSyncJob;
+#ifdef CQS_BUILD_SIGNED_JOIN
+namespace cqs::native { struct SignedReplicaSource; }
+#endif
 
 class SecureSyncPlugin final : public QObject, public ItemLoaderInterface {
     Q_OBJECT
@@ -61,7 +65,9 @@ private:
     bool signedTabClaimed_ = false;
     QByteArray signedTabSetting_;
     cqs::native::SignedTabStorage signedTab_;
-    bool activateSignedTab(const cqs::native::SignedTabConfiguration &, const std::string &);
+    bool activateSignedTab(const cqs::native::SignedTabConfiguration &, const std::string &, const cqs::native::SignedReplicaSource &);
+    std::optional<cqs::native::SignedReplicaRequest> prepareSignedReplica(
+        const QString &directory, const QString &keyFile, const std::string &journalBinding, const cqs::native::SignedReplicaSource &);
 #endif
     QTimer supervisor_;
     QElapsedTimer heartbeat_;

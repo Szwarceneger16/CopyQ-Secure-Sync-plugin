@@ -130,6 +130,40 @@ int main(int argc, char **argv) {
     const auto copiedProfile = temp.filePath("copied-profile.ini");
     CHECK(QFile::copy(profile, copiedProfile));
     CHECK(!decodeSignedTab(copiedProfile, encoded));
+    CHECK(QDir(temp.path()).mkdir("transport") && QDir(temp.path()).mkdir("other-transport"));
+    const auto transport = QFileInfo(temp.filePath("transport")).canonicalFilePath();
+    const auto other = QFileInfo(temp.filePath("other-transport")).canonicalFilePath();
+    const auto pin = signedReplicaSourcePin(configuration.expected.profileBinding, {transport, canonicalProfile + "/.."});
+    const auto journalDirectory = QFileInfo(temp.path()).canonicalFilePath();
+    CHECK(pin.isEmpty());
+    const auto sourcePin = signedReplicaSourcePin(configuration.expected.profileBinding, {transport, journalDirectory});
+    const auto otherPin = signedReplicaSourcePin(configuration.expected.profileBinding, {other, journalDirectory});
+    const auto otherJournal = signedReplicaSourcePin(configuration.expected.profileBinding, {transport, other});
+    CHECK(sourcePin.size() == 32 && otherPin.size() == 32 && sourcePin != otherPin && sourcePin != otherJournal);
+    CHECK(signedReplicaSourcePin(configuration.expected.profileBinding, {"relative", journalDirectory}).isEmpty());
+    CHECK(!confirmSignedReplicaSource(profile, encoded, sourcePin, true));
+    settings.setValue("Plugins/securesync/active_signed_tab", encoded);
+    settings.sync();
+    CHECK(!confirmSignedReplicaSource(profile, encoded, sourcePin, false));
+    CHECK(confirmSignedReplicaSource(profile, encoded, sourcePin, true));
+    CHECK(confirmSignedReplicaSource(profile, encoded, sourcePin, false));
+    CHECK(!confirmSignedReplicaSource(profile, encoded, otherPin, true));
+    CHECK(!confirmSignedReplicaSource(profile, encoded, otherJournal, true));
+    CHECK(!confirmSignedReplicaSource(profile, encoded + 'x', sourcePin, true));
+
+    CHECK(signedTabReplicaLimit(profile) == 200);
+    settings.setValue("Options/maxitems", 12);
+    settings.beginWriteArray("Tabs", 1);
+    settings.setArrayIndex(0);
+    settings.setValue("name", "signed_sync");
+    settings.setValue("max_item_count", 30);
+    settings.endArray();
+    settings.sync();
+    CHECK(signedTabReplicaLimit(profile) == 30);
+    settings.setValue("Tabs/1/store_items", false);
+    settings.sync();
+    CHECK(signedTabReplicaLimit(profile) == 0);
+
     const auto malformed = [&](const QString &name, const QJsonValue &value) {
         auto object = QJsonDocument::fromJson(encoded).object();
         object.insert(name, value);

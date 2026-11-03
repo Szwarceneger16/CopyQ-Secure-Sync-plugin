@@ -20,11 +20,18 @@ public:
         Mounted(const Mounted &) = delete;
         Mounted &operator=(const Mounted &) = delete;
 
+        // References describe the current confirmed record. Copy a snapshot
+        // before holding it across a call that can update the checkpoint.
         const transaction::Snapshot &snapshot() const noexcept;
+        const SignedReplicaState &replica() const noexcept;
         std::uint64_t generation() const noexcept;
         // Serialize access to the handle. A save with an unconfirmed outcome
         // requires releasing the handle and reopening the checkpoint.
         void save(const transaction::Snapshot &snapshot, std::uint64_t expectedGeneration);
+        // The journal coordinator validates history and intent transitions.
+        // This update atomically stores the cursor, intent and local view.
+        void updateReplica(const SignedReplicaState &replica, const transaction::Snapshot &snapshot,
+                           std::uint64_t expectedGeneration);
 
     private:
         friend class SignedJoinCheckpoint;

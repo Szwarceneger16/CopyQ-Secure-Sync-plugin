@@ -314,10 +314,11 @@ enrollment. Activation preflight verifies the installed sealed package and the
 current signed history before producing readiness metadata. The
 [experimental native Signed Join](DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
 can open a reviewed checkpoint as an editable local `signed_sync` tab after
-separate confirmation. Its editable copy stays local. The earlier
-sealed-key storage receipt does not acknowledge that the tab opened or that
-its contents can be replicated. Product work still includes guided provisioning,
-durable originator-key preparation, cloud discovery, live signed synchronization,
+separate confirmation. The explicit synchronization action can publish local
+edits or pull a verified successor while the tab is unloaded. The earlier
+sealed-key storage receipt acknowledges only the sealed key write. Product work
+still includes guided provisioning, durable originator-key preparation, cloud
+discovery, background signed synchronization, signed conflict resolution,
 acknowledged Join, recovery and platform qualification. Full disk/key rollback
 across restarts requires an external monotonic anchor or explicit recovery policy.
 G5's signed event migration and G6-G7's installer/platform qualification still

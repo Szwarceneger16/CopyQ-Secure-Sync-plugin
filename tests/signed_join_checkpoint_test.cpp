@@ -121,6 +121,8 @@ int main() {
         SignedJoinCheckpoint reopened(temp.directory, key, profile);
         CHECK(mounted->generation() == 1);
         CHECK(mounted->snapshot() == snapshot);
+        CHECK(mounted->replica().cursor.id == proof.tipId && mounted->replica().cursor.digest == proof.tipDigest);
+        CHECK(!mounted->replica().pending);
         const auto initial = disk(temp.directory);
         rejects(st::ErrorCode::Busy, [&] { (void)reopened.mount(proof); });
         rejects(st::ErrorCode::Busy, [&] { reopened.apply(proof, tip, snapshot); });
@@ -156,6 +158,8 @@ int main() {
         mounted = reopened.mount(proof);
         CHECK(mounted->snapshot() == edit);
         CHECK(mounted->generation() == 3);
+        CHECK(mounted->replica().cursor.id == proof.tipId && mounted->replica().cursor.digest == proof.tipDigest);
+        CHECK(!mounted->replica().pending);
         const tx::Snapshot empty;
         mounted->save(empty, 3);
         CHECK(mounted->generation() == 4);
@@ -173,6 +177,47 @@ int main() {
         rejects(st::ErrorCode::Stale, [&] { mounted->save(empty, 4); });
         rejects(st::ErrorCode::Stale, [&] { mounted->save(snapshot, 4); });
         CHECK(disk(temp.directory) == saved);
+    }
+    {
+        Temp temp;
+        SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
+        checkpoint.apply(proof, tip, snapshot);
+        auto mounted = checkpoint.mount(proof);
+        auto pending = mounted->replica();
+        const tx::Snapshot edit{{{"text/plain", Bytes{'e', 'd', 'i', 't'}}}};
+        pending.pending = SignedReplicaIntent{1, token(7)};
+        mounted->updateReplica(pending, edit, 1);
+        CHECK(mounted->generation() == 2 && mounted->snapshot() == edit);
+        const auto reserved = disk(temp.directory);
+        mounted->updateReplica(pending, edit, 2);
+        CHECK(mounted->generation() == 2 && disk(temp.directory) == reserved);
+        rejects(st::ErrorCode::Stale, [&] { mounted->updateReplica(pending, snapshot, 1); });
+        for (auto invalid : {SignedReplicaState{{"wrong", proof.tipDigest}, {}},
+                             SignedReplicaState{{proof.tipId, {}}, {}},
+                             SignedReplicaState{pending.cursor, SignedReplicaIntent{0, token(7)}},
+                             SignedReplicaState{pending.cursor, SignedReplicaIntent{cqs::history::MaxSequence + 1, token(7)}},
+                             SignedReplicaState{pending.cursor, SignedReplicaIntent{1, {}}}}) {
+            rejects(st::ErrorCode::InvalidRecord, [&] { mounted->updateReplica(invalid, edit, 2); });
+        }
+        CHECK(disk(temp.directory) == reserved);
+        mounted.reset();
+        checkpoint.apply(proof, tip, snapshot);
+        mounted = checkpoint.mount(proof);
+        CHECK(mounted->generation() == 3 && mounted->snapshot() == edit);
+        CHECK(mounted->replica().pending && mounted->replica().pending->sequence == 1 &&
+              mounted->replica().pending->payload == token(7));
+
+        const tx::Snapshot later{{{"text/plain", Bytes{'l', 'a', 't', 'e', 'r'}}}};
+        mounted->save(later, 3);
+        CHECK(mounted->replica().pending && mounted->replica().pending->payload == token(7));
+        const SignedReplicaState accepted{{"daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/000000000002", token(8)}, {}};
+        mounted->updateReplica(accepted, mounted->snapshot(), 4);
+        mounted.reset();
+        CHECK(checkpoint.read(proof) == snapshot);
+        mounted = checkpoint.mount(proof);
+        CHECK(mounted->generation() == 5 && mounted->snapshot() == later);
+        CHECK(mounted->replica().cursor.id == accepted.cursor.id &&
+              mounted->replica().cursor.digest == accepted.cursor.digest && !mounted->replica().pending);
     }
     {
         Temp temp;
@@ -207,13 +252,16 @@ int main() {
         checkpoint.apply(proof, tip, snapshot);
         auto mounted = checkpoint.mount(proof);
         const tx::Snapshot edit{{{"text/plain", Bytes{'e', 'd', 'i', 't'}}}};
+        auto pending = mounted->replica();
+        pending.pending = SignedReplicaIntent{5, token(9)};
         st::testing::hook = [](st::testing::Point point) {
             if (point == st::testing::Point::Published) throw std::runtime_error("Interrupted publication");
         };
-        rejects(st::ErrorCode::CommitUnconfirmed, [&] { mounted->save(edit, 1); });
+        rejects(st::ErrorCode::CommitUnconfirmed, [&] { mounted->updateReplica(pending, edit, 1); });
         st::testing::hook = {};
         CHECK(mounted->generation() == 1);
         CHECK(mounted->snapshot() == snapshot);
+        CHECK(!mounted->replica().pending);
         const auto interrupted = disk(temp.directory);
         rejects(st::ErrorCode::CommitUnconfirmed, [&] { mounted->save(edit, 1); });
         CHECK(disk(temp.directory) == interrupted);
@@ -223,6 +271,8 @@ int main() {
         mounted = checkpoint.mount(proof);
         CHECK(mounted->generation() == 2);
         CHECK(mounted->snapshot() == edit);
+        CHECK(mounted->replica().pending && mounted->replica().pending->sequence == 5 &&
+              mounted->replica().pending->payload == token(9));
     }
     {
         Temp temp;
