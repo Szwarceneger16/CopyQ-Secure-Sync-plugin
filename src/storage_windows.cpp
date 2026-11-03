@@ -272,23 +272,23 @@ std::wstring controlName(const std::string &id) {
     validateControlPacketId(id);
     return std::wstring(id.begin(), id.end()) + L".cqc";
 }
-void checkControlSpelling(const Pinned &entry) {
+void checkPacketSpelling(const Pinned &entry) {
     // NTFS usually opens case aliases. Verify the stored leaf spelling through
     // the same handle so an alias cannot stand in for a canonical packet name.
     constexpr DWORD mode = VOLUME_NAME_NONE | FILE_NAME_NORMALIZED;
     const auto capacity = GetFinalPathNameByHandleW(entry.handle.get(), nullptr, 0, mode);
     if (!capacity) io();
-    if (capacity > 32768) fail(ErrorCode::UnsafeEntry, "Control path exceeds NTFS bounds");
+    if (capacity > 32768) fail(ErrorCode::UnsafeEntry, "Packet path exceeds NTFS bounds");
     std::wstring name(capacity, L'\0');
     const auto length = GetFinalPathNameByHandleW(entry.handle.get(), name.data(), capacity, mode);
     if (!length) io();
-    if (length >= capacity) fail(ErrorCode::Changed, "Control path changed while checking spelling");
+    if (length >= capacity) fail(ErrorCode::Changed, "Packet path changed while checking spelling");
     name.resize(length);
     const auto actualLeaf = std::wstring_view(name).substr(name.find_last_of(L'\\') + 1);
     const auto expectedLeaf = std::wstring_view(entry.path).substr(entry.path.find_last_of(L'\\') + 1);
-    if (actualLeaf != expectedLeaf) fail(ErrorCode::UnsafeEntry, "Noncanonical control entry name");
+    if (actualLeaf != expectedLeaf) fail(ErrorCode::UnsafeEntry, "Noncanonical transport packet entry name");
 }
-std::optional<Pinned> existingControlFile(const std::wstring &path) {
+std::optional<Pinned> existingPacketFile(const std::wstring &path) {
     // A failed open due to permissions, sharing, or a changed directory is
     // not evidence of absence. Only the missing leaf permits publication.
     const auto raw = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
@@ -310,38 +310,40 @@ struct Directory::Impl {
     explicit Impl(const std::filesystem::path &path) : root(path,security,false),
         events(open(child(root.folder(),L"events"),true,inspect|FILE_LIST_DIRECTORY)) { verify(); }
     void verify() const { root.verify(security); mapped(events); security.check(events.handle.get()); sameVolume(events,root.folder()); }
-    Pinned control() const {
+    Pinned packetFolder(const std::wstring &name) const {
         verify();
-        auto dir = open(child(root.folder(), L"control"), true, inspect | FILE_LIST_DIRECTORY);
-        verifyControl(dir);
+        auto dir = open(child(root.folder(), name), true, inspect | FILE_LIST_DIRECTORY);
+        verifyPacketFolder(dir);
         return dir;
     }
-    void verifyControl(const Pinned &dir) const {
+    void verifyPacketFolder(const Pinned &dir) const {
         verify();
         mapped(dir);
         sameVolume(dir, root.folder());
         security.check(dir.handle.get());
-        checkControlSpelling(dir);
+        checkPacketSpelling(dir);
     }
-    void confirmControl(const Pinned &dir, const Pinned &file, std::string_view wire) const {
-        verifyControl(dir);
+    void publishPacket(const Pinned &dir, const std::wstring &name, std::string_view wire,
+                       const std::filesystem::path &privateStaging) const;
+    void confirmPacket(const Pinned &dir, const Pinned &file, std::string_view wire) const {
+        verifyPacketFolder(dir);
         sameVolume(file, dir);
         security.check(file.handle.get());
-        checkControlSpelling(file);
+        checkPacketSpelling(file);
         if (static_cast<ULONGLONG>(file.initial.standard.EndOfFile.QuadPart) != wire.size())
-            fail(ErrorCode::Changed, "Published control packet size differs");
+            fail(ErrorCode::Changed, "Published transport packet size differs");
         LARGE_INTEGER beginning{};
         if (!SetFilePointerEx(file.handle.get(), beginning, nullptr, FILE_BEGIN)) io();
-        if (read(file) != wire) fail(ErrorCode::Changed, "Published control packet differs");
+        if (read(file) != wire) fail(ErrorCode::Changed, "Published transport packet differs");
         flush(file.handle.get());
         mapped(file, true);
         security.check(file.handle.get());
-        checkControlSpelling(file);
-        verifyControl(dir);
+        checkPacketSpelling(file);
+        verifyPacketFolder(dir);
     }
-    Root staging(const std::filesystem::path &path, const Pinned *controlDir = nullptr) const {
+    Root staging(const std::filesystem::path &path, const Pinned *packetDir = nullptr) const {
         if(path.empty())fail(ErrorCode::InvalidPath,"Windows publication requires explicit private staging outside transport");
-        if (controlDir) verifyControl(*controlDir); else verify();
+        if (packetDir) verifyPacketFolder(*packetDir); else verify();
         Root staged(path,security,true,FILE_ADD_FILE);
         if(_wcsicmp(staged.volume.c_str(),root.volume.c_str())!=0)
             fail(ErrorCode::UnsupportedFilesystem,"Transport staging must be on the same NTFS volume");
@@ -352,15 +354,15 @@ struct Directory::Impl {
         return staged;
     }
 };
-Directory::Directory(const std::filesystem::path &path) : impl_(std::make_unique<Impl>(path)) {}
+Directory::Directory(const std::filesystem::path &path) : impl_(std::make_shared<Impl>(path)) {}
 Directory::~Directory() = default;
 crypto::Bytes Directory::readControl(const std::string &packetId) const {
     const auto name = controlName(packetId);
-    const auto dir = impl_->control();
+    const auto dir = impl_->packetFolder(L"control");
     const auto file = open(child(dir, name), false, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ);
     sameVolume(file, dir);
     impl_->security.check(file.handle.get());
-    checkControlSpelling(file);
+    checkPacketSpelling(file);
     const auto size = static_cast<ULONGLONG>(file.initial.standard.EndOfFile.QuadPart);
     if (!size || size > MaxControlPacketBytes)
         fail(ErrorCode::ScanLimit, "Control packet exceeds transport byte budget");
@@ -371,39 +373,123 @@ crypto::Bytes Directory::readControl(const std::string &packetId) const {
         fail(ErrorCode::Changed, "Control packet content does not match its address");
     mapped(file, true);
     impl_->security.check(file.handle.get());
-    checkControlSpelling(file);
-    impl_->verifyControl(dir);
+    checkPacketSpelling(file);
+    impl_->verifyPacketFolder(dir);
     return packet;
 }
 void Directory::publishControl(const crypto::Bytes &packet, const std::filesystem::path &privateStaging) const {
     const auto name = controlName(controlPacketId(packet));
     const std::string wire(reinterpret_cast<const char *>(packet.data()), packet.size());
-    const auto dir = impl_->control();
-    const auto stagingRoot = impl_->staging(privateStaging, &dir);
+    const auto dir = impl_->packetFolder(L"control");
+    impl_->publishPacket(dir, name, wire, privateStaging);
+}
+
+struct Directory::SignedEvents::Impl {
+    std::shared_ptr<Directory::Impl> owner;
+    Pinned dir;
+    Impl(std::shared_ptr<Directory::Impl> directory, const std::string &folder)
+        : owner(std::move(directory)), dir(owner->packetFolder(std::wstring(folder.begin(), folder.end()))) {}
+};
+
+Directory::SignedEvents::SignedEvents(std::shared_ptr<Directory::Impl> owner, const SignedEventScope &scope)
+    : impl_(std::make_unique<Impl>(std::move(owner), signedEventFolderName(scope))) {}
+Directory::SignedEvents::~SignedEvents() = default;
+
+std::unique_ptr<Directory::SignedEvents> Directory::openSignedEvents(const SignedEventScope &scope) const {
+    return std::unique_ptr<SignedEvents>(new SignedEvents(impl_, scope));
+}
+
+void Directory::publishSignedEvent(const SignedEventScope &scope, const events::Envelope &envelope,
+                                   const std::filesystem::path &privateStaging) const {
+    openSignedEvents(scope)->publish(envelope, privateStaging);
+}
+
+std::vector<SignedEventPacket> Directory::scanSignedEvents(const SignedEventScope &scope, Limits limits) const {
+    return openSignedEvents(scope)->scan(limits);
+}
+
+void Directory::SignedEvents::publish(const events::Envelope &envelope,
+                                      const std::filesystem::path &privateStaging) const {
+    if (envelope.bytes.empty() || envelope.bytes.size() > MaxSignedEventPacketBytes)
+        fail(ErrorCode::ScanLimit, "Signed event packet exceeds transport byte budget");
+    const auto name = detail::signedEventFilename(envelope.expectedId);
+    impl_->owner->publishPacket(impl_->dir, std::wstring(name.begin(), name.end()), envelope.bytes, privateStaging);
+}
+
+std::vector<SignedEventPacket> Directory::SignedEvents::scan(Limits limits) const {
+    detail::validateSignedEventScanLimits(limits);
+    const auto &dir = impl_->dir;
+    impl_->owner->verifyPacketFolder(dir);
+    const auto initial = stamp(dir.handle.get(), true);
+    std::size_t remaining = limits.entries;
+    const auto files = names(dir, remaining);
+    if (files.size() > limits.reader.events)
+        fail(ErrorCode::ScanLimit, "Too many signed event files");
+    std::size_t totalBytes = 0;
+    std::set<std::string> devices;
+    std::vector<Pinned> pinned;
+    std::vector<SignedEventPacket> result;
+    pinned.reserve(files.size());
+    result.reserve(files.size());
+    for (const auto &name : files) {
+        auto id = detail::signedEventIdFromFilename(ascii(name));
+        devices.insert(id.substr(0, detail::SignedDeviceSize));
+        if (devices.size() > limits.devices) fail(ErrorCode::ScanLimit, "Too many signed event devices");
+        auto file = open(child(dir, name), false, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ);
+        sameVolume(file, dir);
+        impl_->owner->security.check(file.handle.get());
+        checkPacketSpelling(file);
+        const auto size = static_cast<ULONGLONG>(file.initial.standard.EndOfFile.QuadPart);
+        if (!size || size > MaxSignedEventPacketBytes || size > limits.reader.eventBytes ||
+            size > limits.reader.historyBytes - totalBytes)
+            fail(ErrorCode::ScanLimit, "Signed event transport wire byte budget exceeded");
+        totalBytes += static_cast<std::size_t>(size);
+        pinned.push_back(std::move(file));
+        result.push_back({std::move(id), {}});
+    }
+    CQS_HOOK(FilePinned);
+    for (std::size_t i = 0; i < pinned.size(); ++i) result[i].wire = read(pinned[i]);
+    CQS_HOOK(ScanRead);
+    std::size_t verifyBudget = limits.entries;
+    if (names(dir, verifyBudget) != files) fail(ErrorCode::Changed, "Signed event names changed during scan");
+    for (const auto &file : pinned) {
+        mapped(file, true);
+        impl_->owner->security.check(file.handle.get());
+        checkPacketSpelling(file);
+    }
+    if (!same(stamp(dir.handle.get(), true), initial))
+        fail(ErrorCode::Changed, "Signed event directory changed during scan");
+    impl_->owner->verifyPacketFolder(dir);
+    return result;
+}
+
+void Directory::Impl::publishPacket(const Pinned &dir, const std::wstring &name, std::string_view wire,
+                                   const std::filesystem::path &privateStaging) const {
+    const auto stagingRoot = staging(privateStaging, &dir);
     const auto destination = child(dir, name);
-    if (const auto existing = existingControlFile(destination)) {
-        impl_->confirmControl(dir, *existing, wire);
+    if (const auto existing = existingPacketFile(destination)) {
+        confirmPacket(dir, *existing, wire);
         return;
     }
 
     const auto source = child(stagingRoot.folder(), temporaryName());
     Handle raw(CreateFileW(source.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL,
-                           FILE_SHARE_READ | FILE_SHARE_DELETE, &impl_->security.attributes, CREATE_NEW,
+                           FILE_SHARE_READ | FILE_SHARE_DELETE, &security.attributes, CREATE_NEW,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr));
     const auto initial = stamp(raw.get(), false);
     Staging staged{{std::move(raw), source, initial, false}};
-    impl_->security.check(staged.file.handle.get(), true);
+    security.check(staged.file.handle.get(), true);
     write(staged.file.handle.get(), wire);
     CQS_HOOK(PublishWritten);
     flush(staged.file.handle.get());
     staged.file.initial = stamp(staged.file.handle.get(), false);
     if (static_cast<ULONGLONG>(staged.file.initial.standard.EndOfFile.QuadPart) != wire.size())
-        fail(ErrorCode::Io, "Control packet staging incomplete");
+        fail(ErrorCode::Io, "Transport packet staging incomplete");
     CQS_HOOK(PublishReady);
-    impl_->verifyControl(dir);
-    stagingRoot.verify(impl_->security, true);
+    verifyPacketFolder(dir);
+    stagingRoot.verify(security, true);
     mapped(staged.file, true);
-    impl_->security.check(staged.file.handle.get(), true);
+    security.check(staged.file.handle.get(), true);
 
     staged.cleanup = false;
     // A same-volume no-replace move exposes only complete, flushed bytes.
@@ -412,23 +498,23 @@ void Directory::publishControl(const crypto::Bytes &packet, const std::filesyste
         if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
             staged.cleanup = true;
             const auto existing = open(destination, false, GENERIC_READ | GENERIC_WRITE | READ_CONTROL, FILE_SHARE_READ);
-            impl_->confirmControl(dir, existing, wire);
+            confirmPacket(dir, existing, wire);
             return;
         }
-        fail(ErrorCode::PublishedUnconfirmed, "Control packet move unconfirmed; retry its exact address");
+        fail(ErrorCode::PublishedUnconfirmed, "Transport packet move unconfirmed; retry its exact address");
     }
     try {
         const auto current = stamp(staged.file.handle.get(), false);
         if (!identity(current, staged.file.initial) ||
             current.basic.LastWriteTime.QuadPart != staged.file.initial.basic.LastWriteTime.QuadPart)
-            fail(ErrorCode::Changed, "Control packet changed during publication");
+            fail(ErrorCode::Changed, "Transport packet changed during publication");
         staged.file.path = destination;
         staged.file.initial = current;
         CQS_HOOK(PublishLinked);
-        impl_->confirmControl(dir, staged.file, wire);
-        stagingRoot.verify(impl_->security, true);
+        confirmPacket(dir, staged.file, wire);
+        stagingRoot.verify(security, true);
     } catch (...) {
-        fail(ErrorCode::PublishedUnconfirmed, "Control packet may be published; exact readback or flush unconfirmed");
+        fail(ErrorCode::PublishedUnconfirmed, "Transport packet may be published; exact readback or flush unconfirmed");
     }
 }
 void Directory::confirm(const crypto::Bytes &key,const events::Envelope &envelope,events::Limits limits) const {

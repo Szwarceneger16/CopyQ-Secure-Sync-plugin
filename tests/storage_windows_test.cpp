@@ -197,6 +197,57 @@ int wmain(int argc, wchar_t **argv) {
             l={}; l.reader.eventBytes=1; rejects(ErrorCode::ScanLimit,[&] { d.scan(key,l); });
             l={}; l.reader.historyBytes=1; rejects(ErrorCode::ScanLimit,[&] { d.scan(key,l); });
         });
+        test("signed event publication is isolated, exact and recoverable", [] {
+            using namespace cqs::storage;
+            Temp t; t.seeded(); const Directory d(t.root);
+            SignedEventScope scope;
+            scope.group[0] = 1; scope.root[0] = 2;
+            const auto folder = t.root / signedEventFolderName(scope);
+            const auto device = "d" + std::string(31, 'a');
+            const auto signedId = device + "/000000000001";
+            const auto file = folder / (device + "-000000000001.cqe");
+            const std::string wire("\0\x80\xff\x42", 4);
+            rejects(ErrorCode::Unavailable, [&] { d.scanSignedEvents(scope); });
+            CHECK(!fs::exists(folder));
+            cqs::testing::directory(folder);
+            CHECK(d.scanSignedEvents(scope).empty());
+            rejects(ErrorCode::InvalidPath, [&] { d.publishSignedEvent(scope, {signedId, wire}); });
+            on(Point::PublishLinked, [] { throw Error(ErrorCode::Io, "Injected signed event barrier failure"); });
+            rejects(ErrorCode::PublishedUnconfirmed, [&] { d.publishSignedEvent(scope, {signedId, wire}, t.stage); });
+            CHECK(read(file) == wire);
+            d.publishSignedEvent(scope, {signedId, wire}, t.stage);
+            rejects(ErrorCode::Changed, [&] { d.publishSignedEvent(scope, {signedId, "swap"}, t.stage); });
+            const auto packets = d.scanSignedEvents(scope);
+            CHECK(packets.size() == 1 && packets[0].id == signedId && packets[0].wire == wire);
+            CHECK(fs::is_empty(t.stage) && d.scan(key).graph().tips() == std::vector<std::string>{id});
+            auto next = scope; ++next.generation;
+            const auto nextFolder = t.root / signedEventFolderName(next);
+            cqs::testing::directory(nextFolder);
+            CHECK(d.scanSignedEvents(next).empty());
+            cqs::testing::write(nextFolder / ("D" + std::string(31, 'a') + "-000000000001.cqe"), wire);
+            rejects(ErrorCode::UnsafeEntry, [&] { d.publishSignedEvent(next, {signedId, wire}, t.stage); });
+            rejects(ErrorCode::UnsafeEntry, [&] { d.scanSignedEvents(next); });
+            on(Point::ScanRead, [&] { cqs::testing::write(folder / "conflict-copy.cqe", "conflict"); });
+            rejects(ErrorCode::Changed, [&] { d.scanSignedEvents(scope); });
+            rejects(ErrorCode::UnsafeEntry, [&] { d.scanSignedEvents(scope); });
+        });
+        test("signed generation stays pinned between scan and publish", [] {
+            using namespace cqs::storage;
+            Temp t;
+            SignedEventScope scope;
+            scope.group[0] = 1; scope.root[0] = 2;
+            const auto folder = t.root / signedEventFolderName(scope);
+            cqs::testing::directory(folder);
+            const auto generation = Directory(t.root).openSignedEvents(scope);
+            CHECK(generation->scan().empty());
+            const auto moved = t.root / L"moved-generation";
+            CHECK(!MoveFileExW(folder.c_str(), moved.c_str(), 0));
+            CHECK(fs::is_directory(folder) && !fs::exists(moved));
+            const auto id = "d" + std::string(31, 'a') + "/000000000001";
+            generation->publish({id, "ciphertext"}, t.stage);
+            const auto packets = generation->scan();
+            CHECK(packets.size() == 1 && packets[0].id == id && packets[0].wire == "ciphertext");
+        });
         test("empty scan validates key and reader limits", [] {
             Temp t; Directory d(t.root); bool badKey=false,badLimits=false;
             try { d.scan({}); } catch (const cqs::events::Error&e) { badKey=e.code()==cqs::events::ErrorCode::InvalidKey; }

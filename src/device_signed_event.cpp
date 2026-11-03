@@ -17,10 +17,11 @@ using EventError = events::ErrorCode;
 // followed by SHA-256 of the exact wire prefix through ciphertext/tag.
 constexpr char WireDomain[] = "CopyQ-Secure-Sync-signed-event-lab-v1";
 constexpr char SignatureDomain[] = "CopyQ-Secure-Sync-signed-event-signature-lab-v1";
-constexpr char KeyDomain[] = "CopyQ-Secure-Sync-signed-event-aes-gcm-key-lab-v1";
+constexpr char LegacyKeyDomain[] = "CopyQ-Secure-Sync-signed-event-aes-gcm-key-lab-v1";
+constexpr char AuthorKeyDomain[] = "CopyQ-Secure-Sync-signed-event-aes-gcm-author-key-lab-v2";
 constexpr char PayloadDomain[] = "CopyQ-Secure-Sync-signed-event-payload-lab-v1";
 constexpr char Base32[] = "abcdefghijklmnopqrstuvwxyz234567";
-constexpr std::uint32_t EventVersion = 1;
+constexpr std::uint32_t LegacyVersion = 1;
 constexpr std::size_t DeviceSize = 32, IdSize = 45, MaxParents = 2;
 constexpr std::size_t NonceSize = 12, TagSize = 16, SignatureSize = Signature{}.size();
 constexpr std::size_t PayloadMinimum = sizeof(PayloadDomain) + 4;
@@ -96,13 +97,15 @@ struct WipedBytes {
     ~WipedBytes() { crypto::wipe(value); }
 };
 
-void deriveKey(WipedBytes &derived, const SyncKey &key, const SignedEventContext &context) {
+void deriveKey(WipedBytes &derived, const SyncKey &key, const SignedEventContext &context, std::uint32_t version) {
     Bytes input;
-    input.reserve(sizeof(KeyDomain) + 2 * Token{}.size() + 8);
-    domain(input, KeyDomain);
+    input.reserve(sizeof(AuthorKeyDomain) + 3 * Token{}.size() + 8);
+    if (version == LegacyVersion) domain(input, LegacyKeyDomain);
+    else domain(input, AuthorKeyDomain);
     append(input, context.group);
     append(input, context.root);
     u64(input, context.generation);
+    if (version != LegacyVersion) append(input, context.author);
     const WipedBytes raw(key.exportPrivate());
     derived.value.resize(crypto_auth_hmacsha256_BYTES);
     if (crypto_auth_hmacsha256(derived.value.data(), input.data(), input.size(), raw.value.data()) != 0)
@@ -189,9 +192,11 @@ Parsed parse(std::string_view wire, events::Limits limits) {
 
     Reader reader(wire, EventError::InvalidHeader);
     reader.expect(WireDomain);
-    if (reader.number32() != EventVersion) fail(EventError::InvalidHeader, "Unsupported signed event version");
     Parsed value;
     auto &header = value.header;
+    header.version = reader.number32();
+    if (header.version != LegacyVersion && header.version != SignedEventCodec::CurrentVersion)
+        fail(EventError::InvalidHeader, "Unsupported signed event version");
     auto &context = header.context;
     context.group = reader.token();
     context.root = reader.token();
@@ -353,7 +358,7 @@ Bytes SignedEventCodec::seal(const SignedEventContext &context, const Identity &
 
     Bytes wire;
     domain(wire, WireDomain);
-    u32(wire, EventVersion);
+    u32(wire, CurrentVersion);
     append(wire, context.group);
     append(wire, context.root);
     append(wire, context.head);
@@ -379,7 +384,7 @@ Bytes SignedEventCodec::seal(const SignedEventContext &context, const Identity &
         append(wire, nonce);
         u32(wire, static_cast<std::uint32_t>(plain.value.size() + TagSize));
         WipedBytes derived;
-        deriveKey(derived, key, context);
+        deriveKey(derived, key, context, CurrentVersion);
         cipher = crypto::aes256GcmEncrypt(derived.value, nonce, plain.value, wire);
     }
     wire.reserve(wire.size() + cipher.size() + SignatureSize);
@@ -402,7 +407,7 @@ events::Event SignedEventCodec::open(const events::Envelope &envelope, const Sig
     WipedBytes plain;
     {
         WipedBytes derived;
-        deriveKey(derived, key, expected);
+        deriveKey(derived, key, expected, parsed.header.version);
         try {
             plain.value = crypto::aes256GcmDecrypt(derived.value, copy(parsed.nonce), copy(parsed.cipher), copy(parsed.aad));
         } catch (const crypto::Error &) {

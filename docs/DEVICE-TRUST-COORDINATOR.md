@@ -2,8 +2,8 @@
 
 The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
 with real signatures, a local identity vault, durable approvals, signed key
-envelopes, durable recipient storage, file transport and clipboard event
-staging. Build them with
+envelopes, durable recipient storage, file transport and signed clipboard event
+publication. Build them with
 `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. Product integration
 requires peer verification, cloud delivery, CopyQ profile activation,
@@ -58,9 +58,9 @@ The coordinator uses a **dedicated** `state::FileStore` outside the transport.
 Its existing whole-record AEAD, strict private-directory checks, exclusive lease
 and compare-and-swap commit are reused. The record is schema 2 with exactly one
 local item and one `application/x-copyq-secure-sync-trust-journal-lab-v1` field.
-No clipboard head, pending import, publication, archive or history witness field
-is permitted. In this dedicated record, `keyIdentity` stores the public journal
-pin digest; it is not a replacement K-SYNC identity for a normal clipboard record.
+Ordinary clipboard transaction fields are prohibited. The journal keeps its own
+publication and witness state inside the dedicated MIME payload. In this record,
+`keyIdentity` stores the public journal pin digest.
 Never point this coordinator at an existing clipboard state directory.
 
 `initialize()` performs explicit create-only provisioning. Construction/opening
@@ -82,7 +82,9 @@ reserved and is deliberately avoided.
 | Journal operations | 512 |
 | Individual control entry payload | 4,096 bytes |
 | Control section | 2 MiB |
-| Reserved clipboard event packet | 2 MiB, plus 13 bytes of reservation metadata |
+| Reserved clipboard event packet | 2 MiB |
+| Encryption attempts | 65,536 per author and key generation |
+| Current-generation clipboard witnesses | 1,000, 77 bytes each |
 
 Reaching a limit refuses growth; no witness or reservation is silently pruned.
 Known certificate retries do not append duplicate evidence. Exact approval retries
@@ -205,10 +207,10 @@ private staging directory on the same fixed NTFS volume. Keep that directory
 outside the transport.
 
 The file transport exercises the control exchange in isolated directories.
-Address discovery, cloud-client delivery, profile activation and signed event
-publication remain product integration work. A file sync service can withhold packets
-or membership changes, and control headers and receipts expose public protocol
-metadata to observers of the transport.
+Address discovery, cloud-client delivery and profile activation remain product
+integration work. A file sync service can withhold packets or membership changes.
+Control headers and receipts expose public protocol metadata to observers of
+the transport.
 
 ## Signed clipboard history
 
@@ -219,34 +221,39 @@ verified before AES-GCM decryption. Packed items remain subject to CopyQ's
 semantic import checks when a runtime adapter consumes them.
 
 Batch reads verify under one journal lease and accept only the current
-generation. An earlier accepted head within that
-generation is eligible when the signer was a member at that head and is still
-active. The graph checks exact parent packet bytes, parent membership epochs,
-unique revision IDs and monotonic author sequences along every ancestor path.
-The input order is independent of graph order. Both wire and plaintext budgets
-apply to the entire batch.
-
-An empty or incomplete batch grants no authority to seed a history.
+generation. An earlier accepted head within that generation is eligible when
+the signer was a member at that head and is still active. The graph checks
+exact parent packet bytes, parent membership epochs, unique revision IDs and
+monotonic author sequences along every ancestor path. Both wire and plaintext
+budgets apply to the entire batch. The caller-supplied laboratory validator
+`readSignedHistory()` can still read version 1. Shared publication and scans
+require version 2 with its separate per-author AES-GCM keys. A staged version
+1 packet can be resumed locally or discarded. Shared publication requires a
+fresh version 2 reservation.
 
 ### Durable event reservation
 
 `prepareClipboardEvent()` checks the pinned local author, current membership,
 key commitment and reuse policy. Under one journal lease it commits the next
-author sequence with an empty reservation, seals the event, then commits the
-exact signed ciphertext before returning the sequence and packet. The journal
-stores neither clipboard plaintext nor a plaintext fingerprint. An occupied
-reservation blocks new preparation.
+author sequence and increments the generation's attempt counter with an empty
+reservation. It then seals the event and commits the exact signed ciphertext
+before returning the sequence and packet. Failed or interrupted attempts still
+count if the first commit persisted. Resume and publication reuse ciphertext.
+An occupied reservation blocks new preparation. The journal retains ciphertext
+and ciphertext digests.
 
-Existing payload versions 1–3 remain readable. The journal writes version 4
-from the first sequence allocation onward. Version 4 appends the sequence as
+Existing payload versions 1–4 remain readable. Version 4 added the sequence as
 `u64BE`, a one-byte reservation flag, and a `u32BE` packet length followed by
-the exact packet. A clear flag requires zero length. A set flag with zero
-length marks an allocated sequence without a recoverable packet. Replay
-authenticates a staged packet against the pinned author, reserved revision
-and its accepted membership head without decrypting the clipboard payload.
-The packet budget is separate from the control section budget. Use the default
-FileStore limits or provision capacity for the full journal and record framing
-so a staged packet cannot consume space needed by membership changes.
+the exact packet. A clear flag requires zero length. A set flag with zero length
+marks an allocated sequence without a recoverable packet. Version 5 keeps that
+section and appends the key generation as `u64BE`, the attempt count as
+`u32BE`, a one-byte publication attempt flag, and a `u32BE` witness count.
+Each witness is a 45-byte revision ID and its 32-byte packet digest, ordered
+lexicographically by ID. Replay authenticates a staged packet against the
+pinned author, reserved revision and its accepted membership head without
+decrypting the clipboard payload. Use default FileStore limits or provision
+capacity for the full journal and record framing so the packet and witnesses
+cannot consume space needed by membership changes.
 
 An unconfirmed commit poisons the live coordinator. After reopening,
 `inspect()` reports the allocated sequence and whether a pending packet is
@@ -254,18 +261,56 @@ ready. `resumeClipboardEvent()` takes the matching sequence and recommits
 the stored bytes before returning them. A reservation interrupted before the
 packet was stored cannot be resumed or re-encrypted. A sealing error after
 the first commit leaves the same empty reservation. Use
-`discardClipboardEvent()` with the matching sequence to retire a pending
-reservation explicitly. The sequence remains allocated.
+`discardClipboardEvent()` with the matching sequence to retire a reservation
+before a publication attempt. The sequence and any counted attempt remain
+allocated.
 
 A same-generation Add permits resume for an author still active at the
-current head. A rotation or observed fork preserves a pending reservation
-and blocks resume. The local laboratory returns packets to its caller.
-An eventual publisher must recheck authorization and hold the journal lease
-through the publication barrier. A previous local return grants no authority
-to publish after membership changes. Runtime use still requires immutable
-publication, an aggregate GCM encryption
-budget across authors, history witnesses across scans, generation-specific
-storage and explicit legacy archive migration.
+current head and preserves the attempt counter and witnesses. An authenticated
+rotation resets the counter and witness set for the new generation, keeps the
+allocated sequence, and preserves the pending packet as stale. An observed
+membership fork blocks both resume and publication.
+
+### Scoped publication and durable scans
+
+Setup explicitly provisions one `signed-<digest>` directory per group,
+genesis root and key generation. The name commits to those three values in
+`signedEventFolderName()`. Packets are flat
+`<device>-<12 decimal digits>.cqe` files. Legacy and earlier-generation
+packets have separate directories. The native backends pin and recheck the
+directory and files, enforce scan budgets and publish without replacement.
+Retry checks the exact bytes and repeats the native durability barrier.
+
+`publishClipboardEvent()` holds the journal lease through validation and all
+publication steps. It checks current authority, verifies the scoped history and
+candidate, and durably records the visible witnesses and the publication attempt
+before the native create-only write. After native confirmation it records the
+candidate's witness and clears the reservation. An ambiguous native write keeps
+the exact packet for retry and blocks discard in the current generation. An
+ambiguous final journal commit can be retried using the same sequence after
+reopening. When the staged packet is the only missing witness, an explicit
+retry of that same attempted ID may restore it if its staged digest matches.
+An ordinary scan still refuses that omission.
+
+Append requires authenticated parents. The first parentless packet in a scope
+requires an explicit `Seed` operation against an empty verified scope. An empty
+or incomplete scan grants no Seed authority. Different clients can race to
+publish the first packet, and the service can withhold an unseen root. A scan
+refuses multiple roots when they become visible together. Append can reference
+older authenticated parents and create another tip. The coordinator leaves
+those branches for explicit resolution.
+
+`scanClipboardEvents()` verifies the whole current-generation graph before
+returning a snapshot. It refuses missing or changed witnessed IDs and unknown
+local-author packets, with an exception for the exact pending packet after an
+attempt. A successful nonempty scan commits the exact wire digests before
+returning decoded items. The evidence survives restart and detects omissions
+and substitutions that contradict earlier verified scans. A service can still
+withhold events or membership changes that the client has never seen.
+
+This remains an isolated laboratory path. CopyQ profile integration, explicit
+legacy archive migration and real cloud-client delivery qualification remain
+open.
 
 ## Clock and rollback limits
 
@@ -283,8 +328,8 @@ backup process from restoring all older valid ciphertext and keys across a
 process restart. Production needs an external monotonic anchor or an explicit
 recovery policy before claiming that broader rollback guarantee. Restoring a
 prior journal or running the same identity with independent journals can reuse
-a clipboard event sequence. Cloned identities count as a single membership
-approver.
+a clipboard event sequence or exceed the per-author encryption budget. Cloned
+identities count as a single membership approver.
 
 ## Build and validation
 

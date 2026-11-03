@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "device_signed_event.h"
 #include "device_trust_journal.h"
+#include "storage.h"
 #include "test_check.h"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <string_view>
 #include <utility>
 #ifdef __linux__
+#include <sodium.h>
 #include <unistd.h>
 #endif
 
@@ -22,6 +24,7 @@ using cqs::crypto::Bytes;
 namespace ev = cqs::events;
 namespace hist = cqs::history;
 namespace st = cqs::state;
+namespace storage = cqs::storage;
 namespace tx = cqs::transaction;
 
 namespace {
@@ -54,6 +57,32 @@ Token token(std::uint32_t value)
     for (unsigned i = 0; i < 4; ++i)
         result[31 - i] = static_cast<std::uint8_t>(value >> (8 * i));
     return result;
+}
+
+constexpr std::size_t ReservationFields = 13;
+constexpr std::size_t PublicationFields = 17;
+
+void overwriteBigEndian(Bytes &bytes, std::size_t offset, std::size_t width, std::uint64_t number)
+{
+    CHECK(width <= sizeof(number) && offset <= bytes.size() && width <= bytes.size() - offset);
+    for (std::size_t index = 0; index < width; ++index)
+        bytes[offset + width - 1 - index] = static_cast<std::uint8_t>(number >> (8 * index));
+}
+
+Bytes &journalBytes(tx::Record &record)
+{
+    return record.local->front().begin()->second;
+}
+
+tx::Record legacyJournal(tx::Record record)
+{
+    constexpr char domain[] = "CopyQ-Secure-Sync-trust-journal-lab-v1";
+    auto &bytes = journalBytes(record);
+    CHECK(bytes.size() > sizeof(domain) + 4 + PublicationFields && bytes[sizeof(domain) + 3] == 5);
+    bytes[sizeof(domain) + 3] = 4;
+    // The supplied fixture has no durable transport witnesses.
+    bytes.resize(bytes.size() - PublicationFields);
+    return record;
 }
 
 std::string_view view(const Bytes &bytes)
@@ -210,6 +239,80 @@ const ev::Event &event(const std::vector<ev::Event> &events, const std::string &
     CHECK(found != events.end());
     return *found;
 }
+
+#ifdef __linux__
+storage::SignedEventScope scope(const State &state)
+{
+    return {state.group, state.root, state.keyGeneration};
+}
+
+class TransportFolder final {
+public:
+    explicit TransportFolder(const State &state)
+    {
+        char pattern[] = "/tmp/cqs-signed-transport-XXXXXX";
+        const auto *made = ::mkdtemp(pattern);
+        CHECK(made);
+        path = made;
+        CHECK(std::filesystem::create_directory(path / "events"));
+        provision(state);
+    }
+    ~TransportFolder()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+
+    void provision(const State &state) const
+    {
+        CHECK(std::filesystem::create_directory(path / storage::signedEventFolderName(scope(state))));
+    }
+
+    std::filesystem::path packet(const State &state, std::string id) const
+    {
+        CHECK(id.size() == 45 && id[32] == '/');
+        id[32] = '-';
+        return path / storage::signedEventFolderName(scope(state)) / (id + ".cqe");
+    }
+
+    std::filesystem::path path;
+};
+
+Bytes signedV1Root(const SignedEventContext &context, const Identity &identity, const SyncKey &key,
+                   const Bytes &raw, std::uint64_t sequence)
+{
+    constexpr char wireDomain[] = "CopyQ-Secure-Sync-signed-event-lab-v1";
+    constexpr char keyDomain[] = "CopyQ-Secure-Sync-signed-event-aes-gcm-key-lab-v1";
+    constexpr char payloadDomain[] = "CopyQ-Secure-Sync-signed-event-payload-lab-v1";
+    constexpr char signatureDomain[] = "CopyQ-Secure-Sync-signed-event-signature-lab-v1";
+    Bytes plaintext(payloadDomain, payloadDomain + sizeof(payloadDomain));
+    plaintext.insert(plaintext.end(), {0, 0, 0, 1, 0, 0, 0, 4, 'Y', 'Q', '=', '='});
+
+    auto wire = SignedEventCodec::seal(context, identity, key, sequence, {}, {"YQ=="});
+    wire.resize(wire.size() - Signature{}.size() - plaintext.size() - 16);
+    wire[sizeof(wireDomain) + 3] = 1;
+    const Bytes nonce(wire.end() - 16, wire.end() - 4);
+
+    Bytes keyInput(keyDomain, keyDomain + sizeof(keyDomain));
+    keyInput.insert(keyInput.end(), context.group.begin(), context.group.end());
+    keyInput.insert(keyInput.end(), context.root.begin(), context.root.end());
+    const auto generation = keyInput.size();
+    keyInput.resize(generation + 8);
+    overwriteBigEndian(keyInput, generation, 8, context.generation);
+    Bytes derived(32);
+    CHECK(crypto_auth_hmacsha256(derived.data(), keyInput.data(), keyInput.size(), raw.data()) == 0);
+    const auto ciphertext = cqs::crypto::aes256GcmEncrypt(derived, nonce, plaintext, wire);
+    cqs::crypto::wipe(derived);
+    wire.insert(wire.end(), ciphertext.begin(), ciphertext.end());
+
+    Bytes signedMessage(signatureDomain, signatureDomain + sizeof(signatureDomain));
+    const auto digest = cqs::crypto::sha256(wire);
+    signedMessage.insert(signedMessage.end(), digest.begin(), digest.end());
+    const auto signature = identity.sign(signedMessage);
+    wire.insert(wire.end(), signature.begin(), signature.end());
+    return wire;
+}
+#endif
 } // namespace
 
 int main()
@@ -583,13 +686,17 @@ int main()
     test("v4 replay refuses malformed allocation fields and extra or missing bytes", [] {
         Fixture f;
         auto &store = *f.stores[0];
-        const auto packet = f.prepare(0);
-        const auto original = store.record();
+        store.failCommit(2, MemoryStore::Fault::BeforeWrite);
+        rejects<st::Error>(st::ErrorCode::Io, [&] { f.prepare(0); });
+        const auto original = legacyJournal(store.record());
+        store.restore(original);
+        f.reopen(0);
+        CHECK(f.journal(0).inspect().pendingEvent && !f.journal(0).inspect().pendingEvent->ready);
         auto modify = [&](const std::function<void(Bytes &, std::size_t)> &change) {
             auto modified = original;
-            auto &journal = modified.local->front().begin()->second;
+            auto &journal = journalBytes(modified);
             // v4 suffix: sequence u64, pending u8, wire length u32, wire.
-            const auto start = journal.size() - packet.wire.size() - 13;
+            const auto start = journal.size() - ReservationFields;
             CHECK(start > 0 && journal[start + 7] == 1 && journal[start + 8] == 1);
             change(journal, start);
             store.restore(std::move(modified));
@@ -598,7 +705,11 @@ int main()
         modify([](Bytes &journal, std::size_t start) { journal[start + 7] = 0; });
         modify([](Bytes &journal, std::size_t start) { journal[start] = 0xff; });
         modify([](Bytes &journal, std::size_t start) { journal[start + 8] = 2; });
-        modify([](Bytes &journal, std::size_t start) { journal[start + 8] = 0; });
+        modify([](Bytes &journal, std::size_t start) {
+            journal[start + 8] = 0;
+            journal[start + 12] = 1;
+            journal.push_back(0);
+        });
         modify([](Bytes &journal, std::size_t start) { journal[start + 9] = 0xff; });
         modify([](Bytes &journal, std::size_t) { journal.pop_back(); });
         modify([](Bytes &journal, std::size_t) { journal.push_back(0); });
@@ -609,13 +720,12 @@ int main()
         auto &store = *f.stores[0];
         const auto packet = f.prepare(0);
         f.journal(0).discardClipboardEvent(packet.sequence, Now);
-        auto nearlyExhausted = store.record();
-        auto &journal = nearlyExhausted.local->front().begin()->second;
-        const auto start = journal.size() - 13;
+        auto nearlyExhausted = legacyJournal(store.record());
+        auto &journal = journalBytes(nearlyExhausted);
+        const auto start = journal.size() - ReservationFields;
         CHECK(start > 0 && journal[start + 7] == 1 && journal[start + 8] == 0);
         const auto previousSequence = hist::MaxSequence - 1;
-        for (unsigned i = 0; i < 8; ++i)
-            journal[start + 7 - i] = static_cast<std::uint8_t>(previousSequence >> (8 * i));
+        overwriteBigEndian(journal, start, 8, previousSequence);
         store.restore(std::move(nearlyExhausted));
         f.reopen(0);
         CHECK(f.journal(0).inspect().allocatedEventSequence == previousSequence);
@@ -625,6 +735,44 @@ int main()
         const auto attempts = store.attempts();
         rejects<Error>(ErrorCode::Overflow, [&] { f.prepare(0); });
         CHECK(store.attempts() == attempts && f.journal(0).inspect().allocatedEventSequence == hist::MaxSequence);
+    });
+    test("encryption budget counts burned attempts and resets only on an authenticated rotation", [] {
+        Fixture f;
+        f.admit(1);
+        f.admit(2);
+        const auto first = f.prepare(0);
+        CHECK(first.sequence == 1 && f.journal(0).inspect().eventEncryptionAttempts == 1);
+        f.journal(0).discardClipboardEvent(1, Now);
+        auto &store = *f.stores[0];
+        auto nearLimit = store.record();
+        auto &bytes = journalBytes(nearLimit);
+        const auto start = bytes.size() - PublicationFields;
+        const auto previous = SignedEventCodec::MaxAttemptsPerAuthorPerGeneration - 1;
+        overwriteBigEndian(bytes, start - ReservationFields, 8, previous);
+        overwriteBigEndian(bytes, start + 8, 4, previous);
+        store.restore(std::move(nearLimit));
+        f.reopen(0);
+        f.admit(3);
+        CHECK(f.journal(0).inspect().eventEncryptionAttempts == previous);
+        // Even a sealing error after the first barrier consumes the final slot.
+        rejects<ev::Error>(ev::ErrorCode::InvalidBase64, [&] { f.prepare(0, {}, {"invalid"}); });
+        f.reopen(0);
+        auto status = f.journal(0).inspect();
+        CHECK(status.eventEncryptionAttempts == previous + 1 && status.pendingEvent && !status.pendingEvent->ready);
+        CHECK(status.pendingEvent->sequence == previous + 1);
+        f.journal(0).discardClipboardEvent(previous + 1, Now);
+        const auto before = store.attempts();
+        rejects<JournalError>(JournalCode::EventBudget, [&] { f.prepare(0); });
+        CHECK(store.attempts() == before);
+
+        const auto next = SyncKey::generate();
+        const auto remove = f.journal(0).propose(Operation::Remove, f.member(3), token(1111), token(1112),
+                                                  Now, 1000, next->commitment(f.genesis.group, 1));
+        f.apply(f.certificate(remove, {0, 1}));
+        f.reopen(0);
+        CHECK(f.journal(0).inspect().eventEncryptionAttempts == 0);
+        const auto newPacket = f.journal(0).prepareClipboardEvent(*f.identities[0], *next, {}, {"YQ=="}, Now);
+        CHECK(newPacket.sequence == previous + 2 && f.journal(0).inspect().eventEncryptionAttempts == 1);
     });
     test("generation exhaustion leaves room to resume and retire the last reservation", [] {
         Fixture f;
@@ -649,6 +797,299 @@ int main()
         CHECK(store.record().generation == maximum && !f.journal(0).inspect().pendingEvent);
     });
 #ifdef __linux__
+    test("explicit Seed and exact parent publication converge through witnessed transport scans", [] {
+        Fixture f;
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        CHECK(f.journal(0).scanClipboardEvents(*f.key, transport, Now).graph.size() == 0);
+        const auto first = f.prepare(0);
+        const auto firstId = f.id(0, first.sequence);
+        rejects<JournalError>(JournalCode::EventPublication, [&] {
+            f.journal(0).publishClipboardEvent(first.sequence, *f.key, transport, Now);
+        });
+        CHECK(!f.journal(0).inspect().pendingEvent->publicationAttempted);
+        CHECK(!std::filesystem::exists(folder.packet(state, firstId)));
+        CHECK(f.journal(0).publishClipboardEvent(first.sequence, *f.key, transport, Now,
+                                                ClipboardPublication::Seed) == firstId);
+        CHECK(!f.journal(0).inspect().pendingEvent && f.journal(0).inspect().eventWitnesses == 1);
+        CHECK(f.journal(1).scanClipboardEvents(*f.key, transport, Now).wireDigests.at(firstId) ==
+              SignedEventCodec::digest(view(first.wire)));
+        CHECK(f.journal(1).inspect().eventWitnesses == 1);
+        const auto child = f.prepare(1, {f.parent(0, first.sequence, first.wire)});
+        const auto childId = f.id(1, child.sequence);
+        CHECK(f.journal(1).publishClipboardEvent(child.sequence, *f.key, transport, Now) == childId);
+        f.reopen(0);
+        const auto accepted = f.journal(0).scanClipboardEvents(*f.key, transport, Now);
+        CHECK(accepted.graph.tips() == std::vector<std::string>{childId});
+        CHECK(accepted.graph.isAncestor(firstId, childId));
+        CHECK(f.journal(0).inspect().eventWitnesses == 2);
+
+        const auto anotherRoot = f.prepare(0);
+        rejects<JournalError>(JournalCode::EventPublication, [&] {
+            f.journal(0).publishClipboardEvent(anotherRoot.sequence, *f.key, transport, Now,
+                                               ClipboardPublication::Seed);
+        });
+        CHECK(!f.journal(0).inspect().pendingEvent->publicationAttempted);
+    });
+    test("missing or substituted witnessed bytes are rejected after journal reopen", [] {
+        Fixture f;
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        const auto packet = f.prepare(0);
+        const auto id = f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now,
+                                                          ClipboardPublication::Seed);
+        CHECK(f.journal(1).scanClipboardEvents(*f.key, transport, Now).graph.size() == 1);
+        f.reopen(1);
+        const auto file = folder.packet(state, id);
+        CHECK(std::filesystem::remove(file));
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+            f.journal(1).scanClipboardEvents(*f.key, transport, Now);
+        });
+        const auto substitute = f.sign(0, packet.sequence, {}, {"Yg=="});
+        transport.publishSignedEvent(scope(state), {id, view(substitute)});
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+            f.journal(1).scanClipboardEvents(*f.key, transport, Now);
+        });
+        CHECK(f.journal(1).inspect().eventWitnesses == 1);
+        CHECK(std::filesystem::remove(file));
+        transport.publishSignedEvent(scope(state), {id, view(packet.wire)});
+        CHECK(f.journal(1).scanClipboardEvents(*f.key, transport, Now).wireDigests.at(id) ==
+              SignedEventCodec::digest(view(packet.wire)));
+    });
+    test("publication rejects a substituted parent and scans reject an unrecorded local signature", [] {
+        Fixture f;
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        const auto root = f.prepare(1);
+        CHECK(f.journal(1).publishClipboardEvent(root.sequence, *f.key, transport, Now,
+                                                ClipboardPublication::Seed) == f.id(1, root.sequence));
+        auto parent = f.parent(1, root.sequence, root.wire);
+        parent.digest[0] ^= 1;
+        const auto child = f.prepare(0, {parent});
+        rejects<Error>(ErrorCode::Invalid, [&] {
+            f.journal(0).publishClipboardEvent(child.sequence, *f.key, transport, Now);
+        });
+        CHECK(!f.journal(0).inspect().pendingEvent->publicationAttempted);
+        f.journal(0).discardClipboardEvent(child.sequence, Now);
+
+        const auto localId = f.id(0, child.sequence);
+        const auto unrecorded = f.sign(0, child.sequence, {f.parent(1, root.sequence, root.wire)});
+        transport.publishSignedEvent(scope(state), {localId, view(unrecorded)});
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+            f.journal(0).scanClipboardEvents(*f.key, transport, Now);
+        });
+        CHECK(f.journal(0).inspect().eventWitnesses == 0);
+    });
+    test("an unconfirmed publication intent can be retried only with its original bytes", [] {
+        for (const auto fault : {MemoryStore::Fault::BeforeWrite, MemoryStore::Fault::AfterWrite}) {
+            Fixture f;
+            auto &store = *f.stores[0];
+            const auto state = f.journal(0).inspect().state;
+            TransportFolder folder(state);
+            storage::Directory transport(folder.path);
+            const auto packet = f.prepare(0);
+            const auto id = f.id(0, packet.sequence);
+            store.failCommit(store.attempts() + 1, fault);
+            const auto code = fault == MemoryStore::Fault::BeforeWrite ? st::ErrorCode::Io :
+                                                                       st::ErrorCode::CommitUnconfirmed;
+            rejects<st::Error>(code, [&] {
+                f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now, ClipboardPublication::Seed);
+            });
+            CHECK(!std::filesystem::exists(folder.packet(state, id)));
+            f.reopen(0);
+            CHECK(f.journal(0).inspect().pendingEvent->publicationAttempted == (fault == MemoryStore::Fault::AfterWrite));
+            if (fault == MemoryStore::Fault::BeforeWrite) {
+                f.journal(0).discardClipboardEvent(packet.sequence, Now);
+                CHECK(!f.journal(0).inspect().pendingEvent);
+            } else {
+                rejects<JournalError>(JournalCode::EventPublication, [&] {
+                    f.journal(0).discardClipboardEvent(packet.sequence, Now);
+                });
+                rejects<JournalError>(JournalCode::EventPublication, [&] {
+                    f.journal(0).scanClipboardEvents(*f.key, transport, Now);
+                });
+                CHECK(f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now,
+                                                        ClipboardPublication::Seed) == id);
+                const auto onDisk = transport.scanSignedEvents(scope(state));
+                CHECK(onDisk.size() == 1 && onDisk.front().id == id && onDisk.front().wire == view(packet.wire));
+            }
+        }
+    });
+    test("exact retry recovers both sides of an unconfirmed publication finalization", [] {
+        for (const auto fault : {MemoryStore::Fault::BeforeWrite, MemoryStore::Fault::AfterWrite}) {
+            Fixture f;
+            auto &store = *f.stores[0];
+            const auto state = f.journal(0).inspect().state;
+            TransportFolder folder(state);
+            storage::Directory transport(folder.path);
+            const auto packet = f.prepare(0);
+            const auto id = f.id(0, packet.sequence);
+            store.failCommit(store.attempts() + 2, fault);
+            const auto code = fault == MemoryStore::Fault::BeforeWrite ? st::ErrorCode::Io :
+                                                                       st::ErrorCode::CommitUnconfirmed;
+            rejects<st::Error>(code, [&] {
+                f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now, ClipboardPublication::Seed);
+            });
+            const auto onDisk = transport.scanSignedEvents(scope(state));
+            CHECK(onDisk.size() == 1 && onDisk.front().id == id && onDisk.front().wire == view(packet.wire));
+            f.reopen(0);
+            const auto status = f.journal(0).inspect();
+            if (fault == MemoryStore::Fault::BeforeWrite) {
+                CHECK(status.pendingEvent && status.pendingEvent->publicationAttempted);
+                rejects<JournalError>(JournalCode::EventPublication, [&] {
+                    f.journal(0).discardClipboardEvent(packet.sequence, Now);
+                });
+            } else {
+                CHECK(!status.pendingEvent && status.eventWitnesses == 1);
+            }
+            CHECK(f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now,
+                                                    ClipboardPublication::Seed) == id);
+            CHECK(!f.journal(0).inspect().pendingEvent && f.journal(0).inspect().eventEncryptionAttempts == 1);
+        }
+    });
+    test("only an explicit retry can restore a missing witnessed pending packet", [] {
+        Fixture f;
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        const auto root = f.prepare(1);
+        const auto rootId = f.journal(1).publishClipboardEvent(root.sequence, *f.key, transport, Now,
+                                                              ClipboardPublication::Seed);
+        const auto child = f.prepare(0, {f.parent(1, root.sequence, root.wire)});
+        const auto childId = f.id(0, child.sequence);
+        auto &store = *f.stores[0];
+        store.failCommit(store.attempts() + 2, MemoryStore::Fault::BeforeWrite);
+        rejects<st::Error>(st::ErrorCode::Io, [&] {
+            f.journal(0).publishClipboardEvent(child.sequence, *f.key, transport, Now);
+        });
+        f.reopen(0);
+        CHECK(f.journal(0).scanClipboardEvents(*f.key, transport, Now).graph.size() == 2);
+        CHECK(f.journal(0).inspect().eventWitnesses == 2);
+        CHECK(std::filesystem::remove(folder.packet(state, childId)));
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+            f.journal(0).scanClipboardEvents(*f.key, transport, Now);
+        });
+        CHECK(std::filesystem::remove(folder.packet(state, rootId)));
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+            f.journal(0).publishClipboardEvent(child.sequence, *f.key, transport, Now);
+        });
+        CHECK(!std::filesystem::exists(folder.packet(state, childId)));
+        transport.publishSignedEvent(scope(state), {rootId, view(root.wire)});
+        CHECK(f.journal(0).publishClipboardEvent(child.sequence, *f.key, transport, Now) == childId);
+        CHECK(f.journal(0).scanClipboardEvents(*f.key, transport, Now).wireDigests.at(childId) ==
+              SignedEventCodec::digest(view(child.wire)));
+        CHECK(!f.journal(0).inspect().pendingEvent && f.journal(0).inspect().eventWitnesses == 2);
+    });
+    test("an attempted Seed can repair its exact missing root when an authenticated child arrived", [] {
+        Fixture f;
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        const auto root = f.prepare(0);
+        const auto rootId = f.id(0, root.sequence);
+        auto &store = *f.stores[0];
+        store.failCommit(store.attempts() + 2, MemoryStore::Fault::BeforeWrite);
+        rejects<st::Error>(st::ErrorCode::Io, [&] {
+            f.journal(0).publishClipboardEvent(root.sequence, *f.key, transport, Now, ClipboardPublication::Seed);
+        });
+        const auto child = f.prepare(1, {f.parent(0, root.sequence, root.wire)});
+        const auto childId = f.journal(1).publishClipboardEvent(child.sequence, *f.key, transport, Now);
+        CHECK(std::filesystem::remove(folder.packet(state, rootId)));
+        f.reopen(0);
+        CHECK(f.journal(0).inspect().eventWitnesses == 0);
+        rejects<JournalError>(JournalCode::EventPublication, [&] {
+            f.journal(0).scanClipboardEvents(*f.key, transport, Now);
+        });
+        CHECK(f.journal(0).publishClipboardEvent(root.sequence, *f.key, transport, Now,
+                                                ClipboardPublication::Seed) == rootId);
+        const auto recovered = f.journal(0).scanClipboardEvents(*f.key, transport, Now);
+        CHECK(recovered.wireDigests.at(rootId) == SignedEventCodec::digest(view(root.wire)));
+        CHECK(recovered.graph.isAncestor(rootId, childId));
+        CHECK(!f.journal(0).inspect().pendingEvent && f.journal(0).inspect().eventWitnesses == 2);
+    });
+    test("a scan with unconfirmed witness persistence does not release clipboard items", [] {
+        Fixture f;
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        const auto packet = f.prepare(0);
+        const auto id = f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now,
+                                                          ClipboardPublication::Seed);
+        auto &store = *f.stores[1];
+        store.failCommit(store.attempts() + 1, MemoryStore::Fault::AfterWrite);
+        rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+            f.journal(1).scanClipboardEvents(*f.key, transport, Now);
+        });
+        f.reopen(1);
+        CHECK(f.journal(1).inspect().eventWitnesses == 1);
+        CHECK(std::filesystem::remove(folder.packet(state, id)));
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+            f.journal(1).scanClipboardEvents(*f.key, transport, Now);
+        });
+    });
+    test("rotation changes transport scope and excludes prior-generation signed packets", [] {
+        Fixture f;
+        f.admit(1);
+        f.admit(2);
+        const auto old = f.journal(0).inspect().state;
+        TransportFolder folder(old);
+        storage::Directory transport(folder.path);
+        const auto packet = f.prepare(0);
+        const auto id = f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now,
+                                                          ClipboardPublication::Seed);
+        CHECK(f.journal(1).scanClipboardEvents(*f.key, transport, Now).graph.size() == 1);
+        const auto next = SyncKey::generate();
+        const auto remove = f.journal(0).propose(Operation::Remove, f.member(2), token(1121), token(1122),
+                                                  Now, 1000, next->commitment(f.genesis.group, 1));
+        f.apply(f.certificate(remove, {0, 1}));
+        const auto current = f.journal(1).inspect().state;
+        CHECK(current.keyGeneration == old.keyGeneration + 1 && f.journal(1).inspect().eventWitnesses == 0);
+        CHECK(std::filesystem::is_regular_file(folder.packet(old, id)));
+        rejects<storage::Error>(storage::ErrorCode::Unavailable, [&] {
+            f.journal(1).scanClipboardEvents(*next, transport, Now);
+        });
+        folder.provision(current);
+        CHECK(f.journal(1).scanClipboardEvents(*next, transport, Now).graph.size() == 0);
+        transport.publishSignedEvent(scope(current), {id, view(packet.wire)});
+        rejects<Error>(ErrorCode::Stale, [&] { f.journal(1).scanClipboardEvents(*next, transport, Now); });
+    });
+    test("legacy reserved wire remains readable locally but is refused by signed publication and scan", [] {
+        const Bytes raw(32, 0x39); // Public synthetic credential.
+        Fixture f(SyncKey::import(raw));
+        f.admit(1);
+        const auto state = f.journal(0).inspect().state;
+        TransportFolder folder(state);
+        storage::Directory transport(folder.path);
+        const auto packet = f.prepare(0);
+        const auto legacy = signedV1Root(f.context(0, 0), *f.identities[0], *f.key, raw, packet.sequence);
+        const auto id = f.id(0, packet.sequence);
+        CHECK(SignedEventCodec::inspect(view(legacy)).version == 1 && legacy.size() == packet.wire.size());
+        CHECK(f.journal(1).readSignedHistory(*f.key, {{id, view(legacy)}}, Now).graph.size() == 1);
+        auto record = legacyJournal(f.stores[0]->record());
+        auto &bytes = journalBytes(record);
+        std::copy(legacy.begin(), legacy.end(), bytes.end() - static_cast<std::ptrdiff_t>(legacy.size()));
+        f.stores[0]->restore(std::move(record));
+        f.reopen(0);
+        CHECK(f.journal(0).inspect().eventEncryptionAttempts == 0);
+        CHECK(f.journal(0).resumeClipboardEvent(packet.sequence, Now).wire == legacy);
+        rejects<JournalError>(JournalCode::EventVersion, [&] {
+            f.journal(0).publishClipboardEvent(packet.sequence, *f.key, transport, Now, ClipboardPublication::Seed);
+        });
+        transport.publishSignedEvent(scope(state), {id, view(legacy)});
+        rejects<JournalError>(JournalCode::EventVersion, [&] { f.journal(1).scanClipboardEvents(*f.key, transport, Now); });
+        f.journal(0).discardClipboardEvent(packet.sequence, Now);
+        CHECK(f.prepare(0).sequence == packet.sequence + 1);
+        CHECK(f.journal(0).inspect().eventEncryptionAttempts == 1);
+    });
     test("reopened encrypted journal reconstructs heads for signing and authenticated reading", [] {
         Fixture f;
         const auto first = f.sign(0, 1);

@@ -17,7 +17,8 @@ struct Genesis {
     Token recovery{}, initialKeyCommitment{};
 };
 enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy,
-                         Delivery, KeyReuse, MissingKey, EventPending, EventReservation };
+                         Delivery, KeyReuse, MissingKey, EventPending, EventReservation, EventBudget,
+                         EventPublication, HistoryChanged, EventVersion };
 class JournalError final : public std::runtime_error {
 public:
     explicit JournalError(JournalCode code);
@@ -28,7 +29,9 @@ private:
 struct PendingClipboardEvent {
     std::uint64_t sequence;
     bool ready;
+    bool publicationAttempted;
 };
+enum class ClipboardPublication { Append, Seed };
 struct PreparedClipboardEvent {
     std::uint64_t sequence;
     crypto::Bytes wire;
@@ -44,6 +47,8 @@ struct JournalStatus {
     std::vector<Token> confirmedDeliveries;
     std::uint64_t allocatedEventSequence = 0;
     std::optional<PendingClipboardEvent> pendingEvent;
+    std::uint32_t eventEncryptionAttempts = 0;
+    std::size_t eventWitnesses = 0;
 };
 struct SignedEventHistory {
     std::vector<events::Event> events;
@@ -61,7 +66,8 @@ public:
     static constexpr std::size_t MaxOperations = 2 * MaxStates;
     static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
-    static constexpr std::size_t MaxJournalBytes = MaxControlBytes + 13 + MaxClipboardEventBytes;
+    static constexpr std::size_t MaxJournalBytes = MaxControlBytes + MaxClipboardEventBytes +
+                                                   30 + 77 * history::MaxEvents;
     TrustJournal(transaction::Store &store, Genesis genesis, Member local);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
@@ -117,8 +123,16 @@ public:
     PreparedClipboardEvent resumeClipboardEvent(std::uint64_t sequence, std::uint64_t trustedNow);
     // Explicitly retire a slot without changing its high-water sequence.
     void discardClipboardEvent(std::uint64_t sequence, std::uint64_t trustedNow);
-    // Read-only current-generation snapshot. Input identities come from the
-    // caller's checked file mapping. An empty result grants no Seed authority.
+    // Operational laboratory scan, scoped by the accepted membership. Retains
+    // exact witnesses before returning decoded contents.
+    SignedEventHistory scanClipboardEvents(const SyncKey &key, const storage::Directory &transport,
+                                            std::uint64_t trustedNow, events::Limits limits = {});
+    // Publish the exact staged packet. Seed needs explicit local authorization.
+    std::string publishClipboardEvent(std::uint64_t sequence, const SyncKey &key,
+                                       const storage::Directory &transport, std::uint64_t trustedNow,
+                                       ClipboardPublication mode = ClipboardPublication::Append,
+                                       const std::filesystem::path &privateStaging = {});
+    // Pure laboratory validator. Caller-supplied input grants no authority.
     SignedEventHistory readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
                                          std::uint64_t trustedNow, events::Limits limits = {});
 private:

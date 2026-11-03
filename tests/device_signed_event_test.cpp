@@ -23,7 +23,8 @@ constexpr std::string_view Device = "d6fg7zb23dltvpbarf55jhkl2enugpjs";
 constexpr std::string_view OtherDevice = "dkl7gbfduhp6u7g7egiozrloh4i6bvnr";
 constexpr std::uint64_t Generation = 0x0102030405060708ULL;
 constexpr std::size_t IdSize = 45;
-constexpr std::size_t IdOffset = sizeof(WireDomain) + 4 + 5 * 32 + 2 * 8;
+constexpr std::size_t VersionOffset = sizeof(WireDomain);
+constexpr std::size_t IdOffset = VersionOffset + 4 + 5 * 32 + 2 * 8;
 constexpr std::size_t ParentCountOffset = IdOffset + IdSize;
 constexpr std::size_t ParentBytes = IdSize + 32;
 constexpr std::size_t HeaderSize = ParentCountOffset + 1 + 2 * ParentBytes + 12 + 4;
@@ -46,6 +47,14 @@ constexpr char WireHex[] =
     "5aebaa648785c41031cad03980a5805b7861aa61b65e5192b2d605c8a61acab53a19a71c1f407017192d8f52086ab80f"
     "de1e430e1f3146d173f6756bafa1502dda5328301a41d833e8f66e2a71880d7f5016588250a9dab92ae7e5c1aa940a06"
     "d3564d3fbdfb4a3172e5a06c729f67c6e7539f6472bfbb06500bc04e6b802a793e869d06";
+
+// Independent Python HMAC/AESGCM/Ed25519 vector. The version 2 header uses the
+// same fixture fields and nonce as version 1, with the version number changed.
+constexpr char AuthorKeyWireTailHex[] =
+    "b1d317d2b5874e8ed012403ec4368823176eb947b2037a0b3f59c8b9235a86e2a58456d1a36f1f25459f5d19d2fa0a"
+    "e24ff5ca1397f2594789703752afe4bca753829a76455a6d04f69c12cdc31304de97988fb5d06af851ef08b24bc164"
+    "52c36d47b6c4579f59d47538a5f02bb1b06b67f91612757b6b77d5114ca321c5e0d23f30e12dd5c1422c3a58e7d5fa"
+    "62acba07894086ef63a978d8e737c9d5c01281ea7b46d8eeaf781b1c01f3dbeb7f6bafb70c";
 
 unsigned cases = 0;
 
@@ -185,7 +194,7 @@ int main()
         return SignedEventCodec::open({id, view(packet)}, context, author->member(), *key, limits);
     };
 
-    test("independent binary wire, alias, KDF and signature vectors", [&] {
+    test("independent version 1 binary wire, alias, KDF and signature vectors", [&] {
         CHECK(HeaderSize == 434 && plain.size() == 98 && wire.size() == 612);
         CHECK(SignedEventCodec::deviceName(context.author) == Device);
         CHECK(SignedEventCodec::deviceName(token(0xa1)) == OtherDevice);
@@ -206,6 +215,7 @@ int main()
         CHECK(rawHmac == derived);
         CHECK(repack(wire, plain, derived) == wire);
         const auto header = SignedEventCodec::inspect(view(wire));
+        CHECK(header.version == 1);
         CHECK(header.revision.id == id && header.revision.device == Device && header.revision.sequence == 3);
         CHECK(header.context.generation == Generation && header.context.author == context.author);
         CHECK(header.parents.size() == parents.size());
@@ -215,10 +225,29 @@ int main()
         }
         const auto decoded = open(wire);
         CHECK(decoded.revision.id == id && decoded.items == items && decoded.plaintextBytes == plain.size());
+    });
+
+    test("independent version 2 wire uses the author-specific key and authenticates its version", [&] {
+        const auto authorKey = hexBytes("1dd2c1a3de453a2cab77bb039915f347c3f5f20ae83c74b99712cf18d08a55b6");
+        Bytes version2(wire.begin(), wire.begin() + HeaderSize);
+        version2[VersionOffset + 3] = 2;
+        const auto tail = hexBytes(AuthorKeyWireTailHex);
+        version2.insert(version2.end(), tail.begin(), tail.end());
+        const auto digest = SignedEventCodec::digest(view(version2));
+        CHECK(Bytes(digest.begin(), digest.end()) ==
+              hexBytes("0fdb9196c5e12192bf92b19738d865fca5b9aec3ac3b2f677377643d2d42d03b"));
+        CHECK(SignedEventCodec::inspect(view(version2)).version == 2);
+        CHECK(repack(version2, plain, authorKey) == version2);
+        CHECK(open(version2).items == items);
+        refuses(EventErrorCode::AuthenticationFailed, [&] { open(repack(version2, plain, derived)); });
+        auto downgrade = version2;
+        downgrade[VersionOffset + 3] = 1;
+        refuses(EventErrorCode::AuthenticationFailed, [&] { open(downgrade); });
+
         const auto created = SignedEventCodec::seal(context, *author, *key, 3, parents, items);
-        CHECK(created.size() == wire.size());
-        CHECK(std::equal(wire.begin(), wire.begin() + NonceOffset, created.begin()));
-        CHECK(repack(created, plain, derived) == created);
+        CHECK(created.size() == version2.size());
+        CHECK(std::equal(version2.begin(), version2.begin() + NonceOffset, created.begin()));
+        CHECK(repack(created, plain, authorKey) == created);
         CHECK(open(created).items == items);
         CHECK(SignedEventCodec::seal(context, *author, *key, 3, parents, items) != created);
     });

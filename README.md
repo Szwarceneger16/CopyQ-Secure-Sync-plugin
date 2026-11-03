@@ -50,13 +50,12 @@ can store its sealed package durably, reopen the current key after restart and
 sign a storage receipt. An explicit catch-up operation can deliver a fresh
 package to an earlier active member at a later accepted head. The laboratory
 can publish exact envelopes and receipts to a provisioned `control/` directory
-through the native file transport. It also signs and verifies encrypted
-clipboard history for the current key generation. The private journal
-reserves a sequence before encryption and stores the exact packet before
-returning it, so a restart can resume a completed reservation byte for byte.
-Build these tests with
-`CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer. Product use requires
-guided setup, signed event publication and integration with the CopyQ profile.
+through the native file transport. Signed clipboard packets use separate
+generation directories and author-specific encryption keys. The private
+journal bounds encryption attempts, retains exact packets for publication
+retry, and detects missing or substituted packets from earlier verified scans.
+Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
+Product use requires guided setup, archive migration and CopyQ profile integration.
 
 ## Build and test pipeline
 

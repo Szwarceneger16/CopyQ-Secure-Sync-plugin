@@ -17,9 +17,18 @@ constexpr char JournalDomain[] = "CopyQ-Secure-Sync-trust-journal-lab-v1";
 constexpr char PinDomain[] = "CopyQ-Secure-Sync-trust-journal-pins-lab-v1";
 constexpr char Mime[] = "application/x-copyq-secure-sync-trust-journal-lab-v1";
 constexpr std::size_t MaxEventBytes = 4096;
+static_assert(TrustJournal::MaxClipboardEventBytes == storage::MaxSignedEventPacketBytes,
+              "Signed packet limits differ between journal and transport");
 enum class Kind : std::uint8_t { Reserve = 1, Observe = 2 };
 struct Entry { Kind kind; std::uint64_t now; Bytes bytes; };
 struct Outbound { Bytes envelope, receipt; };
+using Witnesses = std::map<std::string, Token>;
+struct EventLedger {
+    std::uint64_t generation;
+    std::uint32_t attempts = 0;
+    bool publicationAttempted = false;
+    Witnesses witnesses;
+};
 struct Log {
     std::uint64_t initial = 0, watermark = 0;
     std::vector<Entry> entries;
@@ -27,8 +36,13 @@ struct Log {
     Bytes installed;
     std::uint64_t allocatedSequence = 0;
     std::optional<Bytes> pendingEvent;
+    std::optional<EventLedger> eventLedger;
 };
 [[noreturn]] void fail(JournalCode code) { throw JournalError(code); }
+EventLedger &eventLedger(Log &log, std::uint64_t generation) {
+    if (!log.eventLedger) log.eventLedger = EventLedger{generation, 0, false, {}};
+    return *log.eventLedger;
+}
 template<class Range> void append(Bytes &out, const Range &value) {
     out.insert(out.end(), value.begin(), value.end());
 }
@@ -74,7 +88,7 @@ Bytes encode(const Log &log, const Token &pins) {
         (!log.allocatedSequence && log.pendingEvent))
         fail(JournalCode::Invalid);
     const bool lifecycle = !log.deliveries.empty() || !log.installed.empty();
-    const auto version = log.allocatedSequence ? 4 : (lifecycle ? 3 : 1);
+    const auto version = log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1));
     Bytes out; domain(out, JournalDomain); u32(out, version); append(out, pins);
     u64(out, log.initial); u64(out, log.watermark);
     u32(out, static_cast<std::uint32_t>(log.entries.size()));
@@ -92,13 +106,22 @@ Bytes encode(const Log &log, const Token &pins) {
         }
         field(out, log.installed);
     }
-    if (version == 4) {
+    if (version >= 4) {
         u64(out, log.allocatedSequence);
         out.push_back(log.pendingEvent ? 1 : 0);
         const auto size = log.pendingEvent ? log.pendingEvent->size() : 0;
         if (size > TrustJournal::MaxClipboardEventBytes) fail(JournalCode::Invalid);
         u32(out, static_cast<std::uint32_t>(size));
         if (log.pendingEvent) append(out, *log.pendingEvent);
+    }
+    if (log.eventLedger) {
+        const auto &ledger = *log.eventLedger;
+        if (ledger.witnesses.size() > history::MaxEvents) fail(JournalCode::Invalid);
+        u64(out, ledger.generation);
+        u32(out, ledger.attempts);
+        out.push_back(ledger.publicationAttempted ? 1 : 0);
+        u32(out, static_cast<std::uint32_t>(ledger.witnesses.size()));
+        for (const auto &[id, digest] : ledger.witnesses) { append(out, id); append(out, digest); }
     }
     return out;
 }
@@ -116,6 +139,14 @@ public:
     Token token() {
         need(32); Token result{};
         std::copy_n(bytes_.begin() + static_cast<std::ptrdiff_t>(pos_), 32, result.begin()); pos_ += 32; return result;
+    }
+    std::string eventId() {
+        constexpr std::size_t size = 45;
+        need(size);
+        std::string result(bytes_.begin() + static_cast<std::ptrdiff_t>(pos_),
+                           bytes_.begin() + static_cast<std::ptrdiff_t>(pos_ + size));
+        pos_ += size;
+        return result;
     }
     Bytes bytes(bool optional = false, std::size_t limit = MaxEventBytes) {
         const auto count = number32();
@@ -143,7 +174,7 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
     if (bytes.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
     Reader reader(bytes); reader.expect(JournalDomain);
     const auto version = reader.number32();
-    if (version < 1 || version > 4) fail(JournalCode::Invalid);
+    if (version < 1 || version > 5) fail(JournalCode::Invalid);
     if (reader.token() != pins) fail(JournalCode::WrongPins);
     Log log; log.initial = reader.number64(); log.watermark = reader.number64();
     const auto count = reader.number32();
@@ -174,14 +205,33 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
         if (version == 3 && log.deliveries.empty() && log.installed.empty()) fail(JournalCode::Invalid);
     }
     if (reader.consumed() > TrustJournal::MaxControlBytes) fail(JournalCode::Invalid);
-    if (version == 4) {
+    if (version >= 4) {
         log.allocatedSequence = reader.number64();
         const auto pending = reader.byte();
-        if (!log.allocatedSequence || log.allocatedSequence > history::MaxSequence || pending > 1)
+        if (log.allocatedSequence > history::MaxSequence || pending > 1 ||
+            (!log.allocatedSequence && (pending || version == 4)))
             fail(JournalCode::Invalid);
         auto wire = reader.bytes(true, TrustJournal::MaxClipboardEventBytes);
         if (pending) log.pendingEvent = std::move(wire);
         else if (!wire.empty()) fail(JournalCode::Invalid);
+    }
+    if (version == 5) {
+        EventLedger ledger{reader.number64(), reader.number32(), false, {}};
+        const auto attempted = reader.byte();
+        const auto witnessCount = reader.number32();
+        if (ledger.attempts > SignedEventCodec::MaxAttemptsPerAuthorPerGeneration ||
+            ledger.attempts > log.allocatedSequence || attempted > 1 || witnessCount > history::MaxEvents ||
+            (attempted && (!log.pendingEvent || log.pendingEvent->empty() || !ledger.attempts)))
+            fail(JournalCode::Invalid);
+        ledger.publicationAttempted = attempted != 0;
+        std::string previous;
+        for (std::uint32_t i = 0; i < witnessCount; ++i) {
+            auto id = reader.eventId();
+            if (!storage::validSignedEventId(id) || !(previous < id)) fail(JournalCode::Invalid);
+            previous = id;
+            ledger.witnesses.emplace(std::move(id), reader.token());
+        }
+        log.eventLedger = std::move(ledger);
     }
     if (!reader.done()) fail(JournalCode::Invalid);
     return log;
@@ -232,7 +282,7 @@ EnvelopeAuthority incoming(const State &state, const Proposal &proposal, const M
 SignedEventContext eventContext(const State &state, const Token &author) {
     return {state.group, state.root, state.digest, state.keyCommitment, author, state.keyGeneration};
 }
-const State &verifyPendingEvent(const Log &log, const Membership &membership, const Member &local) {
+SignedEventContext verifyPendingEvent(const Log &log, const Membership &membership, const Member &local) {
     const auto &wire = *log.pendingEvent;
     const std::string_view bytes(reinterpret_cast<const char *>(wire.data()), wire.size());
     const auto header = SignedEventCodec::inspect(bytes);
@@ -240,7 +290,13 @@ const State &verifyPendingEvent(const Log &log, const Membership &membership, co
     if (!state || member(*state, local.id) != local) fail(JournalCode::Invalid);
     const auto id = history::makeId(SignedEventCodec::deviceName(local.id), log.allocatedSequence);
     SignedEventCodec::verify({id, bytes}, eventContext(*state, local.id), local);
-    return *state;
+    if (header.version == SignedEventCodec::CurrentVersion &&
+        (!log.eventLedger || (state->keyGeneration == log.eventLedger->generation && !log.eventLedger->attempts)))
+        fail(JournalCode::Invalid);
+    if (log.eventLedger && log.eventLedger->publicationAttempted &&
+        (header.version != SignedEventCodec::CurrentVersion || state->keyGeneration != log.eventLedger->generation))
+        fail(JournalCode::Invalid);
+    return header.context;
 }
 Membership replay(const Log &log, const Genesis &g, const Member &local,
                   std::optional<EnvelopeAuthority> *installed = nullptr, std::uint64_t *pendingGeneration = nullptr) {
@@ -284,9 +340,11 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
                 KeyReceiptCodec::verify(outbound.receipt, receiptContext(context, outbound.envelope));
         }
     }
+    if (log.eventLedger && log.eventLedger->generation != membership.current().keyGeneration)
+        fail(JournalCode::Invalid);
     if (log.pendingEvent && !log.pendingEvent->empty()) {
-        const auto &head = verifyPendingEvent(log, membership, local);
-        if (pendingGeneration) *pendingGeneration = head.keyGeneration;
+        const auto context = verifyPendingEvent(log, membership, local);
+        if (pendingGeneration) *pendingGeneration = context.generation;
     }
     return membership;
 }
@@ -379,7 +437,7 @@ transaction::Record TrustJournal::initialRecord(const Genesis &g, const Member &
     if (!now) fail(JournalCode::ClockRollback);
     const auto pins = pin(g, local);
     transaction::Record record; record.schema = 2; record.binding = binding(g, local);
-    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}}, pins); return record;
+    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}, {}}, pins); return record;
 }
 void TrustJournal::initialize(state::FileStore &store, const Genesis &g, const Member &local, std::uint64_t now) {
     auto lease = store.lock(); if (!lease) fail(JournalCode::Busy);
@@ -427,9 +485,14 @@ JournalStatus TrustJournal::inspect() {
     const auto membership = replay(log, genesis_, local_);
     JournalStatus result{membership.current(), membership.forked(), log.watermark,
                          log.entries.size(), membership.reservationCount(), {}, !log.installed.empty(), {},
-                         log.allocatedSequence, {}};
+                         log.allocatedSequence, {}, 0, 0};
+    if (log.eventLedger) {
+        result.eventEncryptionAttempts = log.eventLedger->attempts;
+        result.eventWitnesses = log.eventLedger->witnesses.size();
+    }
     if (log.pendingEvent)
-        result.pendingEvent = PendingClipboardEvent{log.allocatedSequence, !log.pendingEvent->empty()};
+        result.pendingEvent = PendingClipboardEvent{log.allocatedSequence, !log.pendingEvent->empty(),
+                                                     log.eventLedger && log.eventLedger->publicationAttempted};
     for (const auto &entry : log.entries) if (entry.kind == Kind::Observe) result.certificates.push_back(entry.bytes);
     for (const auto &entry : log.deliveries)
         if (!entry.second.receipt.empty()) result.confirmedDeliveries.push_back(entry.first);
@@ -473,6 +536,8 @@ ObserveResult TrustJournal::observe(const Certificate &certificate, std::uint64_
     log.deliveries.clear();
     if (membership.forked() || previousGeneration != membership.current().keyGeneration)
         log.installed.clear();
+    if (log.eventLedger && previousGeneration != membership.current().keyGeneration)
+        log.eventLedger = EventLedger{membership.current().keyGeneration, 0, false, {}};
     auto replacement = record; storeLog(replacement, log, pins); save(record, replacement); return result;
 }
 Bytes TrustJournal::prepareDelivery(const Token &recipient, const Identity &sender, const SyncKey &key,
@@ -625,11 +690,14 @@ PreparedClipboardEvent TrustJournal::prepareClipboardEvent(const Identity &autho
     (void)eventAuthors(state);
     checkEventKey(log, genesis_, state, key);
     if (log.pendingEvent) fail(JournalCode::EventPending);
+    auto &ledger = eventLedger(log, state.keyGeneration);
+    if (ledger.attempts == SignedEventCodec::MaxAttemptsPerAuthorPerGeneration) fail(JournalCode::EventBudget);
     // Leave room for both commits, a recovery barrier, and explicit retirement.
     if (log.allocatedSequence == history::MaxSequence ||
         record.generation > std::numeric_limits<std::uint64_t>::max() - 4) throw Error(ErrorCode::Overflow);
 
     const auto sequence = ++log.allocatedSequence;
+    ++ledger.attempts;
     log.pendingEvent.emplace();
     log.watermark = now;
     auto burned = record;
@@ -677,6 +745,7 @@ void TrustJournal::discardClipboardEvent(std::uint64_t sequence, std::uint64_t n
     (void)replay(log, genesis_, local_);
     clock(log, now);
     if (!log.pendingEvent || sequence != log.allocatedSequence) fail(JournalCode::EventReservation);
+    if (log.eventLedger && log.eventLedger->publicationAttempted) fail(JournalCode::EventPublication);
     log.pendingEvent.reset();
     log.watermark = now;
     auto replacement = record;
@@ -684,8 +753,29 @@ void TrustJournal::discardClipboardEvent(std::uint64_t sequence, std::uint64_t n
     save(record, replacement);
 }
 
-SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
-                                                  std::uint64_t now, events::Limits limits) {
+namespace {
+struct WipeEvents {
+    std::vector<events::Event> &events;
+    bool released = false;
+    ~WipeEvents() {
+        if (!released) for (auto &event : events)
+            for (auto &item : event.items) if (!item.empty()) sodium_memzero(item.data(), item.size());
+    }
+};
+
+const State &clipboardAuthority(const Log &log, const Membership &membership, const Genesis &genesis,
+                                const Member &local, const SyncKey &key, std::uint64_t now) {
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    clock(log, now);
+    const auto &state = membership.current();
+    if (member(state, local.id) != local) fail(JournalCode::WrongPins);
+    checkEventKey(log, genesis, state, key);
+    return state;
+}
+
+SignedEventHistory authenticateHistory(const Membership &membership, const SyncKey &key,
+                                       const std::vector<events::Envelope> &input, events::Limits limits,
+                                       bool sharedTransport) {
     SignedEventCodec::validateLimits(limits);
     if (input.size() > limits.events) throw Error(ErrorCode::Limit);
     std::size_t remainingWire = limits.historyBytes;
@@ -694,32 +784,20 @@ SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std
             throw Error(ErrorCode::Limit);
         remainingWire -= wire.bytes.size();
     }
-    const auto lease = lock(); const auto record = load();
-    const auto log = decode(record, binding_, pin(genesis_, local_));
-    const auto membership = replay(log, genesis_, local_);
-    if (membership.forked()) throw Error(ErrorCode::Forked);
-    clock(log, now);
     const auto &state = membership.current();
-    if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
     const auto authors = eventAuthors(state);
-    checkEventKey(log, genesis_, state, key);
     std::vector<events::Event> decoded;
-    struct WipeOnFailure {
-        std::vector<events::Event> &events;
-        bool released = false;
-        ~WipeOnFailure() {
-            if (!released) for (auto &event : events)
-                for (auto &item : event.items) if (!item.empty()) sodium_memzero(item.data(), item.size());
-        }
-    } wipe{decoded};
+    WipeEvents wipe{decoded};
     std::vector<history::Revision> revisions;
     std::vector<EventEvidence> evidence;
     std::map<std::string, std::size_t> positions;
     std::map<std::string, Token> digests;
     decoded.reserve(input.size()); revisions.reserve(input.size()); evidence.reserve(input.size());
     std::size_t remainingPlain = limits.historyPlaintextBytes;
+    std::size_t roots = 0;
     for (const auto &wire : input) {
         auto header = SignedEventCodec::inspect(wire.bytes, limits);
+        if (sharedTransport && header.version != SignedEventCodec::CurrentVersion) fail(JournalCode::EventVersion);
         const auto &claimed = header.context;
         if (claimed.group != state.group || claimed.root != state.root) throw Error(ErrorCode::WrongGroup);
         if (claimed.generation != state.keyGeneration || claimed.commitment != state.keyCommitment)
@@ -741,10 +819,158 @@ SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std
             throw history::Error(history::ErrorCode::DuplicateRevision, "Duplicate signed revision ID");
         digests.emplace(event.revision.id, SignedEventCodec::digest(wire.bytes));
         revisions.push_back(event.revision);
+        if (sharedTransport && header.parents.empty() && ++roots > 1) fail(JournalCode::EventPublication);
         evidence.push_back({std::move(header.parents), head->epoch, authors.at(author.id)});
     }
     auto graph = checkedSignedGraph(revisions, evidence, positions, digests);
     wipe.released = true;
     return {std::move(decoded), std::move(graph), std::move(digests)};
+}
+
+storage::SignedEventScope eventScope(const State &state) {
+    return {state.group, state.root, state.keyGeneration};
+}
+
+std::vector<events::Envelope> transportEnvelopes(const std::vector<storage::SignedEventPacket> &packets,
+                                                const EventLedger &ledger, const std::string &localDevice,
+                                                const std::string &attemptedId, std::string_view attemptedWire,
+                                                bool restoreAttempted = false) {
+    std::vector<events::Envelope> input;
+    input.reserve(packets.size());
+    std::size_t known = 0;
+    bool attemptedVisible = false;
+    for (const auto &packet : packets) {
+        if (packet.id == attemptedId) attemptedVisible = true;
+        const auto witness = ledger.witnesses.find(packet.id);
+        if (witness != ledger.witnesses.end()) {
+            if (SignedEventCodec::digest(packet.wire) != witness->second) fail(JournalCode::HistoryChanged);
+            ++known;
+        } else if (std::string_view(packet.id).substr(0, localDevice.size()) == localDevice &&
+                   (packet.id != attemptedId || packet.wire != attemptedWire)) {
+            fail(JournalCode::HistoryChanged);
+        }
+        input.push_back({packet.id, packet.wire});
+    }
+    if (known != ledger.witnesses.size()) {
+        const auto attempted = ledger.witnesses.find(attemptedId);
+        if (!restoreAttempted || attemptedVisible || known + 1 != ledger.witnesses.size() ||
+            attempted == ledger.witnesses.end() || SignedEventCodec::digest(attemptedWire) != attempted->second)
+            fail(JournalCode::HistoryChanged);
+    }
+    return input;
+}
+
+std::string_view eventBytes(const Bytes &wire) {
+    return {reinterpret_cast<const char *>(wire.data()), wire.size()};
+}
+} // namespace
+
+SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
+                                                  std::uint64_t now, events::Limits limits) {
+    const auto lease = lock(); const auto record = load();
+    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    (void)clipboardAuthority(log, membership, genesis_, local_, key, now);
+    return authenticateHistory(membership, key, input, limits, false);
+}
+
+SignedEventHistory TrustJournal::scanClipboardEvents(const SyncKey &key, const storage::Directory &transport,
+                                                     std::uint64_t now, events::Limits limits) {
+    SignedEventCodec::validateLimits(limits);
+    const auto lease = lock(); const auto record = load();
+    const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    const auto membership = replay(log, genesis_, local_);
+    const auto &state = clipboardAuthority(log, membership, genesis_, local_, key, now);
+    const auto localDevice = SignedEventCodec::deviceName(local_.id);
+    auto &ledger = eventLedger(log, state.keyGeneration);
+    const auto folder = transport.openSignedEvents(eventScope(state));
+    const auto packets = folder->scan({limits});
+    std::string attemptedId;
+    std::string_view attemptedWire;
+    if (ledger.publicationAttempted) {
+        attemptedId = history::makeId(localDevice, log.allocatedSequence);
+        attemptedWire = eventBytes(*log.pendingEvent);
+    }
+    const auto input = transportEnvelopes(packets, ledger, localDevice, attemptedId, attemptedWire);
+    if (ledger.publicationAttempted &&
+        std::none_of(packets.begin(), packets.end(), [&](const auto &packet) { return packet.id == attemptedId; }))
+        fail(JournalCode::EventPublication);
+    auto result = authenticateHistory(membership, key, input, limits, true);
+    WipeEvents wipe{result.events};
+    if (!result.wireDigests.empty()) {
+        ledger.witnesses = result.wireDigests;
+        log.watermark = now;
+        auto replacement = record;
+        storeLog(replacement, log, pins);
+        save(record, replacement);
+    }
+    wipe.released = true;
+    return result;
+}
+
+std::string TrustJournal::publishClipboardEvent(std::uint64_t sequence, const SyncKey &key,
+                                                const storage::Directory &transport, std::uint64_t now,
+                                                ClipboardPublication mode, const std::filesystem::path &privateStaging) {
+    const auto lease = lock(); const auto record = load();
+    const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    std::uint64_t pendingGeneration = 0;
+    const auto membership = replay(log, genesis_, local_, nullptr, &pendingGeneration);
+    const auto &state = clipboardAuthority(log, membership, genesis_, local_, key, now);
+    const auto localDevice = SignedEventCodec::deviceName(local_.id);
+    if (!sequence || sequence > log.allocatedSequence) fail(JournalCode::EventReservation);
+    const auto id = history::makeId(localDevice, sequence);
+    auto &ledger = eventLedger(log, state.keyGeneration);
+    const bool pending = log.pendingEvent && sequence == log.allocatedSequence;
+    std::string_view wire;
+    if (pending) {
+        if (log.pendingEvent->empty()) fail(JournalCode::EventReservation);
+        if (pendingGeneration != state.keyGeneration) throw Error(ErrorCode::Stale);
+        wire = eventBytes(*log.pendingEvent);
+        if (SignedEventCodec::inspect(wire).version != SignedEventCodec::CurrentVersion) fail(JournalCode::EventVersion);
+    } else if (!ledger.witnesses.count(id) || ledger.publicationAttempted) {
+        fail(JournalCode::EventReservation);
+    }
+    const auto folder = transport.openSignedEvents(eventScope(state));
+    const auto packets = folder->scan();
+    const std::string attemptedId = ledger.publicationAttempted ? id : std::string{};
+    auto input = transportEnvelopes(packets, ledger, localDevice,
+        attemptedId, ledger.publicationAttempted ? wire : std::string_view{}, ledger.publicationAttempted);
+    const auto existing = std::find_if(packets.begin(), packets.end(), [&](const auto &packet) { return packet.id == id; });
+    const bool visible = existing != packets.end();
+    if (!pending) wire = existing->wire; // Every completed ID has a required witness.
+    else if (visible && existing->wire != wire) fail(JournalCode::HistoryChanged);
+    const bool seed = SignedEventCodec::inspect(wire).parents.empty();
+    if (seed != (mode == ClipboardPublication::Seed) ||
+        (seed && !visible && !packets.empty() && !ledger.publicationAttempted))
+        fail(JournalCode::EventPublication);
+    if (!visible) input.push_back({id, wire});
+    auto verified = authenticateHistory(membership, key, input, {}, true);
+    const WipeEvents wipe{verified.events};
+    if (pending && record.generation >= std::numeric_limits<std::uint64_t>::max() - 1)
+        throw Error(ErrorCode::Overflow);
+    transport.checkPublicationStaging(privateStaging);
+
+    // Record all visible evidence and irrevocably mark the slot before any
+    // native publication. An absent candidate is witnessed only after success.
+    const bool firstObservation = !ledger.witnesses.count(id);
+    ledger.witnesses = verified.wireDigests;
+    if (!visible && firstObservation) ledger.witnesses.erase(id);
+    ledger.publicationAttempted = pending;
+    log.watermark = now;
+    auto attempted = record;
+    storeLog(attempted, log, pins);
+    save(record, attempted);
+    folder->publish({id, wire}, privateStaging);
+    if (pending) {
+        ledger.witnesses = std::move(verified.wireDigests);
+        ledger.publicationAttempted = false;
+        log.pendingEvent.reset();
+        auto finished = attempted;
+        storeLog(finished, log, pins);
+        save(attempted, finished);
+    }
+    return id;
 }
 } // namespace cqs::trust

@@ -15,6 +15,7 @@ struct SignedEventParent {
 };
 
 struct SignedEventHeader {
+    std::uint32_t version = 0;
     SignedEventContext context;
     history::Revision revision;
     std::vector<SignedEventParent> parents;
@@ -24,6 +25,9 @@ struct SignedEventHeader {
 // Each parent commits to a full signed wire packet, not a semantic fingerprint.
 class SignedEventCodec final {
 public:
+    static constexpr std::uint32_t CurrentVersion = 2;
+    static constexpr std::uint32_t MaxAttemptsPerAuthorPerGeneration = 1U << 16;
+
     static void validateLimits(events::Limits limits);
     static std::string deviceName(const Token &author);
     static Token digest(std::string_view wire);
@@ -31,6 +35,7 @@ public:
     // Bounded public metadata. Use verify() or open() to authenticate it.
     static SignedEventHeader inspect(std::string_view wire, events::Limits limits = {});
 
+    // The journal must durably charge a version 2 attempt before calling seal().
     static crypto::Bytes seal(const SignedEventContext &context, const Identity &author, const SyncKey &key,
                               std::uint64_t sequence, const std::vector<SignedEventParent> &parents,
                               const std::vector<std::string> &packedItems, events::Limits limits = {});
