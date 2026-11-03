@@ -1,11 +1,12 @@
 # Stage 2: executable membership policy laboratory
 
 The stage-1 [requirements](DEVICE-TRUST-DESIGN.md) now have an isolated C++17
-policy model in `src/device_trust.h` and `src/device_trust.cpp`. It is built only
-when `BUILD_TESTING` is enabled and is **not linked into the shipping plugin**.
-No existing profile, tab, vault, transport, runtime version or encryption setting
-is modified by this work. The [protocol design](DEVICE-TRUST-PROTOCOL.md) records
-the concrete pairing direction and remaining integration requirements.
+policy model in `src/device_trust.h` and `src/device_trust.cpp`. It is built with
+`BUILD_TESTING`; the default native plugin does not link it. A separate opt-in
+[native Signed Join experiment](DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
+uses it for verified enrollment and a new local tab. The
+[protocol design](DEVICE-TRUST-PROTOCOL.md) records the concrete pairing
+direction and remaining integration requirements.
 
 ## Implemented boundary
 
@@ -86,7 +87,10 @@ Its positive policy cases cannot establish cryptographic adapter correctness.
 The separate opt-in identity/journal tests use real signatures, RFC 8032 vectors,
 invalid-key checks and fault injection; see the
 [build and validation instructions](DEVICE-TRUST-COORDINATOR.md#build-and-validation).
-An actual trusted-screen peer-verification flow is still unimplemented.
+The separate [experimental native workflow](DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
+prompts for full peer comparison and can open a reviewed checkpoint as a local
+tab. Running the policy tests does not exercise that workflow or establish
+physical-device verification.
 
 `tests/fixtures/device_trust_vectors.h` freezes independent canonical bytes and
 SHA-256 values produced by Python `struct`/`hashlib`. Signature-shaped fixture

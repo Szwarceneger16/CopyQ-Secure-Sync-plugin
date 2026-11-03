@@ -60,12 +60,15 @@ The [Join laboratory](docs/DEVICE-TRUST-COORDINATOR.md#authenticated-join-and-ac
 adds trusted terminal prompts for full peer comparison and an activation
 preflight over the installed key package and signed history. The
 [experimental native Signed Join](docs/DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
-adds a Preferences workflow for provisioned devices, from peer comparison
-through creation of a separate encrypted checkpoint. The checkpoint is
-independent of live CopyQ tabs and automatic synchronization.
+adds a Preferences workflow for provisioned devices. With
+`CQS_BUILD_SIGNED_JOIN=ON`, a separate confirmation after the verified checkpoint
+write can enable an editable local `signed_sync` tab in CopyQ 17. The workflow
+requires Encrypt Tabs and a compatible plugin configuration. The tab keeps
+local edits in its private encrypted checkpoint. It does not publish or
+replicate them, and it leaves legacy tabs and synchronization unchanged.
 Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
-Product use still requires guided provisioning, guarded profile activation and
-platform qualification.
+Signed synchronization in a regular CopyQ profile still requires guided
+provisioning, runtime integration and platform qualification.
 
 ## Build and test pipeline
 

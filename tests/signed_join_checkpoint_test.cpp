@@ -3,9 +3,11 @@
 #include "packed_items.h"
 #include "test_check.h"
 
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <thread>
 
 #if defined(__linux__) && defined(CQS_STATE_TESTING)
 #include "state_hooks.h"
@@ -82,6 +84,7 @@ int main() {
         Temp temp;
         SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
         rejects(st::ErrorCode::Missing, [&] { (void)checkpoint.read(proof); });
+        rejects(st::ErrorCode::Missing, [&] { (void)checkpoint.mount(proof); });
         CHECK(!fs::exists(temp.directory / st::FileStore::RecordName));
         checkpoint.apply(proof, tip, snapshot);
         const auto initial = disk(temp.directory);
@@ -96,6 +99,7 @@ int main() {
         changed.tipDigest = token(6);
         rejects(st::ErrorCode::InvalidRecord, [&] { reopened.apply(changed, tip, snapshot); });
         rejects(st::ErrorCode::InvalidRecord, [&] { (void)reopened.read(changed); });
+        rejects(st::ErrorCode::InvalidRecord, [&] { (void)reopened.mount(changed); });
         const tx::Snapshot empty;
         rejects(st::ErrorCode::InvalidRecord, [&] { reopened.apply(proof, event(proof, {}), empty); });
         CHECK(disk(temp.directory) == repeated);
@@ -108,6 +112,70 @@ int main() {
     }
     {
         Temp temp;
+        std::unique_ptr<SignedJoinCheckpoint::Mounted> mounted;
+        {
+            SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
+            checkpoint.apply(proof, tip, snapshot);
+            mounted = checkpoint.mount(proof);
+        }
+        SignedJoinCheckpoint reopened(temp.directory, key, profile);
+        CHECK(mounted->generation() == 1);
+        CHECK(mounted->snapshot() == snapshot);
+        const auto initial = disk(temp.directory);
+        rejects(st::ErrorCode::Busy, [&] { (void)reopened.mount(proof); });
+        rejects(st::ErrorCode::Busy, [&] { reopened.apply(proof, tip, snapshot); });
+        rejects(st::ErrorCode::Busy, [&] { (void)reopened.read(proof); });
+        const tx::Snapshot edit{{{"text/plain", Bytes{0x00, 0x7f, 0xff}}, {"text/html", Bytes{'<', '>'}}}};
+        rejects(st::ErrorCode::Stale, [&] { mounted->save(edit, 0); });
+        mounted->save(snapshot, 1);
+        CHECK(mounted->generation() == 1);
+        CHECK(disk(temp.directory) == initial);
+
+        // The session remains held even when the short record operation runs on another thread.
+        std::exception_ptr workerFailure;
+        std::thread worker([&] {
+            try {
+                mounted->save(edit, 1);
+            } catch (...) {
+                workerFailure = std::current_exception();
+            }
+        });
+        worker.join();
+        if (workerFailure) std::rethrow_exception(workerFailure);
+        CHECK(mounted->snapshot() == edit);
+        CHECK(mounted->generation() == 2);
+        const auto saved = disk(temp.directory);
+        CHECK(saved != initial);
+        rejects(st::ErrorCode::Stale, [&] { mounted->save(snapshot, 1); });
+        CHECK(disk(temp.directory) == saved);
+        mounted.reset();
+
+        CHECK(reopened.read(proof) == snapshot);
+        reopened.apply(proof, tip, snapshot);
+        CHECK(reopened.read(proof) == snapshot);
+        mounted = reopened.mount(proof);
+        CHECK(mounted->snapshot() == edit);
+        CHECK(mounted->generation() == 3);
+        const tx::Snapshot empty;
+        mounted->save(empty, 3);
+        CHECK(mounted->generation() == 4);
+        mounted.reset();
+        CHECK(reopened.read(proof) == snapshot);
+        mounted = reopened.mount(proof);
+        CHECK(mounted->snapshot().empty());
+
+        // A previously authenticated ciphertext must not roll back a live mount.
+        {
+            std::ofstream restored(temp.directory / st::FileStore::RecordName, std::ios::binary | std::ios::trunc);
+            restored.write(reinterpret_cast<const char *>(saved.data()), saved.size());
+            CHECK(restored.good());
+        }
+        rejects(st::ErrorCode::Stale, [&] { mounted->save(empty, 4); });
+        rejects(st::ErrorCode::Stale, [&] { mounted->save(snapshot, 4); });
+        CHECK(disk(temp.directory) == saved);
+    }
+    {
+        Temp temp;
         SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
         const tx::Snapshot empty;
         checkpoint.apply(proof, event(proof, {}), empty);
@@ -115,6 +183,7 @@ int main() {
         const auto original = disk(temp.directory);
         SignedJoinCheckpoint foreign(temp.directory, Bytes(32, 0x33), profile);
         rejects(st::ErrorCode::AuthenticationFailed, [&] { foreign.apply(proof, event(proof, {}), empty); });
+        rejects(st::ErrorCode::AuthenticationFailed, [&] { (void)foreign.mount(proof); });
         CHECK(disk(temp.directory) == original);
         Temp relocated;
         CHECK(fs::copy_file(temp.directory / st::FileStore::RecordName,
@@ -132,6 +201,29 @@ int main() {
         CHECK(!fs::exists(temp.directory / st::FileStore::RecordName));
     }
 #ifdef CQS_STATE_TESTING
+    {
+        Temp temp;
+        SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
+        checkpoint.apply(proof, tip, snapshot);
+        auto mounted = checkpoint.mount(proof);
+        const tx::Snapshot edit{{{"text/plain", Bytes{'e', 'd', 'i', 't'}}}};
+        st::testing::hook = [](st::testing::Point point) {
+            if (point == st::testing::Point::Published) throw std::runtime_error("Interrupted publication");
+        };
+        rejects(st::ErrorCode::CommitUnconfirmed, [&] { mounted->save(edit, 1); });
+        st::testing::hook = {};
+        CHECK(mounted->generation() == 1);
+        CHECK(mounted->snapshot() == snapshot);
+        const auto interrupted = disk(temp.directory);
+        rejects(st::ErrorCode::CommitUnconfirmed, [&] { mounted->save(edit, 1); });
+        CHECK(disk(temp.directory) == interrupted);
+        mounted.reset();
+
+        CHECK(checkpoint.read(proof) == snapshot);
+        mounted = checkpoint.mount(proof);
+        CHECK(mounted->generation() == 2);
+        CHECK(mounted->snapshot() == edit);
+    }
     {
         Temp temp;
         SignedJoinCheckpoint checkpoint(temp.directory, key, profile);

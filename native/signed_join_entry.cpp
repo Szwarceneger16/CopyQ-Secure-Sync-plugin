@@ -5,8 +5,8 @@
 #include "key_reader.h"
 #include "signed_join_checkpoint.h"
 #include "signed_join_wizard.h"
+#include "signed_tab_activation.h"
 #include "storage.h"
-#include <QCryptographicHash>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -84,16 +84,11 @@ struct Key {
     ~Key() { crypto::wipe(bytes); }
 };
 
-std::string profileBinding(const QString &settingsFile, const QString &destination, const std::string &trustBinding) {
-    QByteArray bytes("CopyQ-Secure-Sync-native-signed-join-v1");
-    bytes.append('\0').append(settingsFile.toUtf8()).append('\0').append(destination.toUtf8()).append('\0');
-    bytes.append(QByteArray::fromStdString(trustBinding));
-    return "signed-native-" + QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().toStdString();
-}
 } // namespace
 
 void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Profile &legacy,
-                         const std::function<bool()> &stillCurrent) {
+                         const std::function<bool()> &stillCurrent,
+                         const std::function<bool(const SignedTabConfiguration &, const std::string &)> &activate) {
     const QPointer<QWidget> owner(parent);
     const QPointer<QDialog> dialog(new QDialog(parent));
     const auto close = qScopeGuard([dialog] { delete dialog.data(); });
@@ -176,13 +171,15 @@ void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Pro
         crypto::wipe(journalCredential.bytes);
         trust::TrustJournal journal(journalStore, genesis, local);
         const storage::Directory transport(path(transportPath));
-        const auto binding = profileBinding(settings, checkpointPath, journalBinding);
+        const auto binding = signedTabBinding(settings, checkpointPath, journalBinding);
         trust::SignedJoinCheckpoint checkpoint(path(checkpointPath), checkpointCredential.bytes, binding);
         crypto::wipe(checkpointCredential.bytes);
         const auto groupKey = publisherKey.isEmpty() ? nullptr : trust::SyncKey::import(publisherCredential.bytes);
         crypto::wipe(publisherCredential.bytes);
         if (owner && stillCurrent()) runSignedJoinWizard(owner, journal, *identity, transport, checkpoint, binding,
-                                                         groupKey.get(), path(staging), stillCurrent);
+            groupKey.get(), path(staging), stillCurrent, [&](const trust::JoinActivation &expected) {
+                return activate({checkpointPath, checkpointKey, expected}, journalBinding);
+            });
     } catch (const std::exception &) {
         if (owner) QMessageBox::warning(owner, QString::fromLatin1(Caption),
             QStringLiteral("Signed Join setup was refused. Check the trusted pins, private paths and credential files."));

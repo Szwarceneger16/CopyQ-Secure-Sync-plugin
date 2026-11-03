@@ -193,7 +193,8 @@ void addAction(QDialog &dialog, QVBoxLayout &layout, const QString &name, Action
 void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity &identity,
                          const storage::Directory &transport, SignedJoinCheckpoint &checkpoint,
                          const std::string &profileBinding, const SyncKey *publishKey,
-                         const std::filesystem::path &privateStaging, const std::function<bool()> &stillCurrent) {
+                         const std::filesystem::path &privateStaging, const std::function<bool()> &stillCurrent,
+                         const std::function<bool(const JoinActivation &)> &activate) {
     // The preferences widget can be deleted by the host while a modal dialog
     // runs. The wizard is stack-owned so that its worker can always be joined.
     QDialog wizard;
@@ -367,14 +368,34 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
                      QString::fromStdString(expected.tipId), hex(expected.tipDigest),
                      QString::fromStdString(expected.profileBinding)),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-        (void)run([&] {
-            journal.applyJoinActivation(identity, transport, expected, now(),
-                [&](const JoinActivation &verified, const events::Event &tip, const transaction::Snapshot &snapshot) {
-                    checkpoint.apply(verified, tip, snapshot);
-                });
-            return true;
-        });
-        QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("Encrypted signed checkpoint verified."));
+        const auto write = [&] {
+            (void)run([&] {
+                journal.applyJoinActivation(identity, transport, expected, now(),
+                    [&](const JoinActivation &verified, const events::Event &tip, const transaction::Snapshot &snapshot) {
+                        checkpoint.apply(verified, tip, snapshot);
+                    });
+                return true;
+            });
+        };
+        write();
+        if (!activate || QMessageBox::question(&wizard, QObject::tr("Secure Sync — activate signed tab"),
+                QObject::tr("The encrypted signed checkpoint was verified. Enable a new local signed_sync tab for this profile? "
+                            "Edits stay in the private checkpoint. CopyQ commands, clipboard actions and exports can access open items."),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("Encrypted signed checkpoint verified."));
+            return;
+        }
+        // A membership change or new tip while the confirmation was open
+        // invalidates the original review. Exact retries retain local edits.
+        write();
+        if (!activate(expected)) {
+            QMessageBox::warning(&wizard, QObject::tr("Secure Sync — activation refused"),
+                QObject::tr("The encrypted checkpoint is retained. Enable Encrypt Tabs, move Secure Sync to the first "
+                            "plugin position, disable incompatible plugins and check that signed_sync is unused."));
+            return;
+        }
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync"),
+            QObject::tr("Create the signed_sync tab in CopyQ to open the encrypted local history."));
     });
     applicantActions->addStretch();
     memberActions->addStretch();

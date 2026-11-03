@@ -8,6 +8,7 @@
 #include <QLineEdit>
 #include <QApplication>
 #include <QFileDialog>
+#include <QFileDevice>
 #include <QDir>
 #include <QCoreApplication>
 #include <future>
@@ -26,8 +27,10 @@
 #include "gui_clipboard.h"
 #include "ui_actions.h"
 #include "history_transition.h"
+#include "signed_tab_marker.h"
 #ifdef CQS_BUILD_SIGNED_JOIN
 #include "signed_join_entry.h"
+#include "signed_tab_activation.h"
 #endif
 
 struct SecureSyncJob {
@@ -312,6 +315,17 @@ private:
 }
 
 SecureSyncPlugin::SecureSyncPlugin() {
+#ifdef CQS_BUILD_SIGNED_JOIN
+    signedTab_.setGuard([this] {
+        if (closing_ || !isEnabled() || signedTabSetting_.isEmpty() ||
+            !cqs::native::signedTabHostReady(settingsFile_)) return false;
+        QSettings settings(settingsFile_, QSettings::IniFormat);
+        settings.beginGroup("Plugins/securesync");
+        return settings.value(cqs::native::SignedTabSetting).toByteArray() == signedTabSetting_ &&
+               settings.status() == QSettings::NoError;
+    });
+    connect(&signedTab_, &cqs::native::SignedTabStorage::error, this, &SecureSyncPlugin::error);
+#endif
     scheduleClock_.start();
     connect(&transportWatch_,&cqs::native::TransportWatch::changed,this,[this]{schedule_.changed(scheduleClock_.elapsed());});
     connect(&storage_,&cqs::native::StandaloneStorage::modelEdited,this,[this]{schedule_.changed(scheduleClock_.elapsed());});
@@ -323,6 +337,9 @@ SecureSyncPlugin::SecureSyncPlugin() {
         // event loop, then preserve committed edits before CopyQ destroys tabs.
         if(syncThread_)syncThread_->wait();
         try{storage_.finishAsyncImport();if(storage_.hasModels())storage_.checkpointModels();}catch(...){emit error(tr("Shutdown checkpoint unconfirmed; retain encrypted state and recover before synchronization."));}
+#ifdef CQS_BUILD_SIGNED_JOIN
+        if (signedTab_.hasModel()) signedTab_.checkpoint();
+#endif
     });
     supervisor_.setInterval(1000);connect(&supervisor_,&QTimer::timeout,this,&SecureSyncPlugin::superviseRuntime);
     storage_.setUnlocker([this]{return scriptCallback({QStringLiteral("unlockStorage")}).toString()==QLatin1String("Unlocked");});
@@ -667,15 +684,41 @@ QString SecureSyncPlugin::beginRuntime(const QString &token){
         catch(...){finishRuntime(job,operationFailure());}
     });return "Working";
 }
-bool SecureSyncPlugin::canSaveItems(const QString &tab) const { return isEnabled() && storage_.canSave(tab); }
+bool SecureSyncPlugin::canSaveItems(const QString &tab) const {
+#ifdef CQS_BUILD_SIGNED_JOIN
+    if (signedTabClaimed_ && tab == QLatin1String(cqs::native::SignedTabName)) return isEnabled();
+#endif
+    return isEnabled() && storage_.canSave(tab);
+}
 bool SecureSyncPlugin::canLoadItems(QIODevice *file) const {
+    if (cqs::native::recognizesSignedTabMarker(file)) return true;
+#ifdef CQS_BUILD_SIGNED_JOIN
+    if (signedTabClaimed_) {
+        const auto *cache = qobject_cast<QFileDevice *>(file);
+        const auto expected = cqs::native::signedTabCachePath();
+        if (cache && !expected.isEmpty() && QDir::cleanPath(cache->fileName()) == expected) return true;
+    }
+#endif
     const_cast<cqs::native::StandaloneStorage &>(storage_).inspectNativeCache(file);
     return cqs::native::StandaloneStorage::recognizes(file);
 }
 ItemSaverPtr SecureSyncPlugin::initializeTab(const QString &tab, QAbstractItemModel *model, int maximum) {
+#ifdef CQS_BUILD_SIGNED_JOIN
+    if (signedTabClaimed_ && tab == QLatin1String(cqs::native::SignedTabName))
+        return isEnabled() ? signedTab_.initialize(tab, model, maximum) : ItemSaverPtr{};
+#endif
     return isEnabled() ? storage_.initialize(tab, model, maximum) : ItemSaverPtr{};
 }
 ItemSaverPtr SecureSyncPlugin::loadItems(const QString &tab, QAbstractItemModel *model, QIODevice *file, int maximum) {
+    if (cqs::native::recognizesSignedTabMarker(file)) {
+#ifdef CQS_BUILD_SIGNED_JOIN
+        if (isEnabled()) return signedTab_.load(tab, model, file, maximum);
+#endif
+        return {};
+    }
+#ifdef CQS_BUILD_SIGNED_JOIN
+    if (signedTabClaimed_ && tab == QLatin1String(cqs::native::SignedTabName)) return {};
+#endif
     return isEnabled() ? storage_.load(tab, model, file, maximum) : ItemSaverPtr{};
 }
 ItemScriptable *SecureSyncPlugin::scriptableObject() { return new Script; }
@@ -1069,6 +1112,13 @@ void SecureSyncPlugin::loadSettings(const QSettings &s) {
     if(runtimeBusy_){emit error(tr("Settings change deferred until synchronization finishes."));return;}
     automaticToken_.clear();automaticKeys_.reset();
     settingsFile_=s.fileName();automaticEnabled_=s.value("automatic_enabled",false).toBool();
+#ifdef CQS_BUILD_SIGNED_JOIN
+    if (!signedTab_.hasModel()) {
+        signedTabClaimed_ = s.contains(cqs::native::SignedTabSetting);
+        signedTabSetting_ = s.value(cqs::native::SignedTabSetting).toByteArray();
+        signedTab_.setConfiguration(cqs::native::decodeSignedTab(settingsFile_, signedTabSetting_));
+    }
+#endif
     if(copyqGuiServer())supervisor_.start();
     const auto next=cqs::native::loadProfile(s);
     if(storage_.hasModels()&&next!=profile_){emit error(tr("Profile change deferred: close/unload the owned tab or use the explicit encrypted handoff."));return;}
@@ -1080,6 +1130,35 @@ void SecureSyncPlugin::loadSettings(const QSettings &s) {
     storage_.setCacheFile(s.value("host_cache_file").toString());
     if (panel_) panel_->setProfile(profile_);
 }
+#ifdef CQS_BUILD_SIGNED_JOIN
+bool SecureSyncPlugin::activateSignedTab(const cqs::native::SignedTabConfiguration &configuration,
+                                        const std::string &journalBinding) {
+    using namespace cqs::native;
+    if (signedTab_.hasModel() || !signedTabHostReady(settingsFile_)) return false;
+    const auto encoded = encodeSignedTab(configuration, journalBinding);
+    auto validated = decodeSignedTab(settingsFile_, encoded);
+    if (!validated) return false;
+    QSettings settings(settingsFile_, QSettings::IniFormat);
+    settings.beginGroup("Plugins/securesync");
+    if (settings.contains(SignedTabSetting)) {
+        if (settings.value(SignedTabSetting).toByteArray() != encoded) return false;
+    } else {
+        if (!signedTabDestinationFree(settingsFile_)) return false;
+        settings.setValue(SignedTabSetting, encoded);
+        settings.sync();
+    }
+    if (settings.status() != QSettings::NoError) return false;
+    QSettings confirmed(settingsFile_, QSettings::IniFormat);
+    confirmed.sync();
+    confirmed.beginGroup("Plugins/securesync");
+    if (confirmed.value(SignedTabSetting).toByteArray() != encoded ||
+        confirmed.status() != QSettings::NoError) return false;
+    signedTabClaimed_ = true;
+    signedTabSetting_ = encoded;
+    signedTab_.setConfiguration(std::move(validated));
+    return true;
+}
+#endif
 void SecureSyncPlugin::applySettings(QSettings &s) {
     if (!panel_) return;
     ++settingsEpoch_;saveAutomaticPreference(panel_->automaticEnabled());
@@ -1132,7 +1211,10 @@ QWidget *SecureSyncPlugin::createSettingsWidget(QWidget *parent) {
         }
         signedJoinOpen_ = true;
         const auto reset = qScopeGuard([owner] { if (owner) owner->signedJoinOpen_ = false; });
-        cqs::native::openSignedJoinSetup(widget, settings, profile, stillCurrent);
+        cqs::native::openSignedJoinSetup(widget, settings, profile, stillCurrent,
+            [&](const cqs::native::SignedTabConfiguration &configuration, const std::string &journalBinding) {
+                return stillCurrent() && activateSignedTab(configuration, journalBinding);
+            });
     });
 #endif
     connect(widget, &cqs::native::SettingsWidget::inspectRequested, this,
@@ -1223,6 +1305,13 @@ void SecureSyncPlugin::runPanelAction(const QString &id){
 }
 void SecureSyncPlugin::setEnabled(bool enabled) {
     if(!enabled){++controlEpoch_;if(runtimeJob_)runtimeJob_->operation->cancel();saveAutomaticPreference(false);resolving_=false;automaticToken_.clear();automaticKeys_.reset();if(runtimeBusy_){emit error(tr("Synchronization is stopping; retain the plugin until encrypted recovery is checked."));return;}}
+#ifdef CQS_BUILD_SIGNED_JOIN
+    if (!enabled && signedTab_.hasModel()) {
+        if (signedTab_.checkpoint())
+            emit error(tr("Disable deferred: close and unload the signed_sync tab first."));
+        return;
+    }
+#endif
     if(!enabled&&profile_.standaloneStorage&&!storage_.converted()){
         try{if(storage_.hasModels())storage_.checkpointModels();}catch(...){emit error(tr("Disable refused: local checkpoint could not be confirmed."));return;}
         emit error(tr("Disable deferred: prepare encrypted CopyQ handoff before removing this plugin."));return;

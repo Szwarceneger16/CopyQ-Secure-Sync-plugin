@@ -12,6 +12,7 @@ class Identity;
 class SignedJoinCheckpoint;
 class SyncKey;
 class TrustJournal;
+struct JoinActivation;
 }
 
 namespace cqs::native {
@@ -21,5 +22,6 @@ void runSignedJoinWizard(QWidget *parent, trust::TrustJournal &journal, const tr
                          const storage::Directory &transport, trust::SignedJoinCheckpoint &checkpoint,
                          const std::string &profileBinding, const trust::SyncKey *publishKey = nullptr,
                          const std::filesystem::path &privateStaging = {},
-                         const std::function<bool()> &stillCurrent = {});
+                         const std::function<bool()> &stillCurrent = {},
+                         const std::function<bool(const trust::JoinActivation &)> &activate = {});
 } // namespace cqs::native

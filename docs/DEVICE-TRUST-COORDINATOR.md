@@ -6,8 +6,10 @@ envelopes, durable recipient storage, file transport, signed clipboard event
 publication, read-only legacy archive migration, and authenticated Join with
 activation preflight. Build them with
 `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
-The tests use disposable directories and synthetic keys. Product integration
-requires native setup, cloud delivery, CopyQ profile activation and recovery.
+The tests use disposable directories and synthetic keys. The separate
+[native experiment](#experimental-native-signed-join) can open a verified Join
+checkpoint in an editable local CopyQ tab. Guided provisioning, live signed
+synchronization, cloud delivery and recovery remain product integration work.
 The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
@@ -209,8 +211,8 @@ private staging directory on the same fixed NTFS volume. Keep that directory
 outside the transport.
 
 The file transport exercises the control exchange in isolated directories.
-Address discovery, cloud-client delivery and profile activation remain product
-integration work. A file sync service can withhold packets or membership changes.
+Address discovery and cloud-client delivery remain product integration work.
+A file sync service can withhold packets or membership changes.
 Control headers and receipts expose public protocol metadata to observers of
 the transport.
 
@@ -410,9 +412,10 @@ witnesses, requires exactly one tip, and validates that tip's packed CopyQ
 MIME data. The journal commits the observed packet digests before returning
 the profile binding, group, root, membership head, member ID, generation and
 exact tip ID and digest. The profile binding is a caller-selected label. The
-preflight does not open the native profile or inspect its local tab. Native
-activation still requires a guarded profile write and a live CopyQ Join
-acknowledgement. The terminal adapter is separate from CopyQ's settings UI.
+preflight does not open the native profile or inspect its local tab. The
+terminal adapter is separate from CopyQ's settings UI. The native experiment
+below can mount the reviewed checkpoint locally; it does not acknowledge live
+signed synchronization to peers.
 
 ## Experimental native Signed Join
 
@@ -423,10 +426,17 @@ libsodium 1.0.22-or-newer development installation using its shared library
 or a static library built with position-independent code where the module
 linker requires it. The experimental option defaults to off.
 
-On a disposable CopyQ profile, enable Encrypt Tabs and open **Preferences →
-Devices and recovery → Signed Join (experimental)**. The dialog opens a
-previously provisioned identity vault and trust journal. Supply these pins
-from trusted local setup, encoded as contiguous hex in field order.
+Use a disposable CopyQ 17 profile. Enable **Encrypt Tabs**, put **Secure Sync**
+first in CopyQ's plugin priority list (including disabled entries), and enable
+only plugins supported by the experiment: Secure Sync and any of Text, Image,
+Notes, FakeVim, Pinned Items and Tags (`securesync`, `itemtext`, `itemimage`,
+`itemnotes`, `itemfakevim`, `itempinned`, `itemtags`). The guard checks the actual
+CopyQ plugin inventory and priority. Other enabled plugins can affect how CopyQ
+stores, renders or handles tab items.
+
+Open **Preferences → Devices and recovery → Signed Join (experimental)**. The
+dialog opens a previously provisioned identity vault and trust journal. Supply
+these pins from trusted local setup, encoded as contiguous hex in field order.
 
 | Field | Bytes in order | Hex digits |
 | --- | --- | --- |
@@ -454,19 +464,50 @@ requires an available signed history.
    member publishes a sealed key for the intended recipient, who installs
    it using the immutable packet address. The storage receipt acknowledges
    the sealed key write.
-4. The applicant reviews the verified signed tip and explicitly confirms the
-   encrypted checkpoint. The journal rechecks the accepted membership,
-   installed key, history and exact reviewed tip under its trust lease.
+4. The applicant selects **Review and write signed checkpoint**, reviews the
+   verified signed tip and confirms the encrypted checkpoint. The journal
+   rechecks the accepted membership, installed key, history and exact reviewed
+   tip under its trust lease.
    The destination FileStore uses an exclusive session lease and a record
    lease to create the encrypted checkpoint and verify readback. An
    interrupted write can be retried with the same profile binding, signed
    provenance and snapshot. A conflicting existing destination is refused.
+5. After the durable write is verified, separately confirm **Activate signed
+   tab**. Confirming repeats the signed-history and checkpoint checks against
+   the reviewed tip. If you decline, the encrypted checkpoint is retained
+   without enabling the tab. First activation requires that the name
+   `signed_sync` and its mnemonic aliases are unused and that the CopyQ `.dat`
+   cache for that tab is absent. After activation, create a tab named exactly
+   `signed_sync` and open it. On later starts, reopen the same tab with the
+   private checkpoint and its credential file available.
 
-The checkpoint uses a separate record binding and contains the verified MIME
-snapshot and signed provenance. This workflow preserves Encrypt Tabs settings
-and leaves live tab activation, automatic synchronization and installer
-integration for later work. Signed verification refuses legacy packets and
-uses the signed generation scope throughout.
+### Local tab storage boundary
+
+The checkpoint holds the signed provenance and the verified MIME snapshot as an
+immutable baseline. It also stores the editable local copy. Opening the tab
+authenticates this private encrypted record and acquires an exclusive session
+lease for the lifetime of the saver. Updates to the working copy are committed
+and checked by reading the encrypted record back. CopyQ's tab file contains a
+routing marker with a binding digest and checkpoint record generation. Opening
+requires the same binding and a checkpoint at least as recent as that marker.
+A checkpoint may be ahead of the marker if CopyQ's tab file update was
+interrupted after the encrypted write. The marker contains no clipboard items
+or credential bytes. Settings remember the checkpoint and credential file
+paths and the reviewed checkpoint's binding and provenance. Keep the raw
+checkpoint credential file private and outside the shared root.
+
+An incompatible live plugin configuration, a missing or invalid checkpoint or
+credential, or a conflicting tab or cache on first activation causes refusal.
+There is no automatic conversion of an existing tab. Signed verification
+refuses legacy packets and uses the signed generation scope throughout. The
+existing legacy storage and synchronization paths remain separate.
+
+The local tab opens from the checkpoint without the signed transport or trust
+journal. It does not publish edits or replicate changes made on other devices.
+Like other CopyQ tabs, its open contents are available as plaintext to CopyQ
+commands. Copying items to the system clipboard or exporting them can put
+plaintext outside the checkpoint. Treat that data as you would data in any
+other CopyQ tab.
 
 ## Clock and rollback limits
 
@@ -516,9 +557,12 @@ retry. The receipt and lifecycle suites cover commit-before-sign, receipt
 substitution, catch-up, rotation, historical replay and encrypted disk reopen.
 The Join suite covers request durability, full peer comparisons, exact
 certificate retry and signed-history preflight with synthetic clipboard
-data. The signed checkpoint suite exercises encrypted reopen, exact retry
-and refusal of changed data. Native builds with testing enabled include
-the Qt comparison dialog test.
+data. The signed checkpoint suite exercises encrypted reopen, exact retry,
+immutable baseline retention and refusal of changed or stale data. Native
+builds with testing enabled include the Qt comparison dialog test. The opt-in
+native build also includes `native-signed-tab-storage` and exercises marker
+handling in `native-loader`. These focused tests do not qualify the installed
+CopyQ GUI or sandboxed packages.
 Exact results belong to the implementing PR and current test run.
 
 Qualification still requires Windows/NTFS and Flatpak, physical power-loss

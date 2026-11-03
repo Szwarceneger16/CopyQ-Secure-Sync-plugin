@@ -311,13 +311,17 @@ prompt; they must not silently weaken the trust policy or CopyQ encryption.
 G1-G4 have concrete choices and isolated implementations for membership,
 identity storage, signing, approvals, key envelopes and locally verified
 enrollment. Activation preflight verifies the installed sealed package and the
-current signed history before producing readiness metadata. Product work still
-includes the native setup interface, durable originator-key preparation, cloud
-discovery, CopyQ profile activation, acknowledged Join, recovery and platform
-qualification. Full disk/key rollback across restarts requires an external
-monotonic anchor or explicit recovery policy. G5's signed event migration and
-G6-G7's installer/platform qualification still gate distribution. Advanced
-settings remain ordinary UI.
+current signed history before producing readiness metadata. The
+[experimental native Signed Join](DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
+can open a reviewed checkpoint as an editable local `signed_sync` tab after
+separate confirmation. Its editable copy stays local. The earlier
+sealed-key storage receipt does not acknowledge that the tab opened or that
+its contents can be replicated. Product work still includes guided provisioning,
+durable originator-key preparation, cloud discovery, live signed synchronization,
+acknowledged Join, recovery and platform qualification. Full disk/key rollback
+across restarts requires an external monotonic anchor or explicit recovery policy.
+G5's signed event migration and G6-G7's installer/platform qualification still
+gate distribution. Advanced settings remain ordinary UI.
 
 ## Primary references
 

@@ -279,6 +279,109 @@ std::string readCheckpointBytes(const std::filesystem::path &path)
     CHECK(input.is_open());
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
+
+#ifdef CQS_TEST_NATIVE_SIGNED_JOIN
+enum class WizardActivation { NoCallback, Accept, Decline, AdvanceTip };
+
+void exerciseNativeWizard(WizardActivation choice)
+{
+    Fixture f;
+    f.enrollFirst();
+    Transport transport(f.journal(0).inspect().state);
+    CHECK(!seed(f, transport).empty() && !install(f).empty());
+    const auto directory = privateCheckpoint(transport);
+    const auto record = directory / st::FileStore::RecordName;
+    const auto expected = f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
+    const auto snapshot = cqs::packed::decode(ValidItems);
+    SignedJoinCheckpoint checkpoint(directory, Bytes(32, 0x44), Binding);
+    bool checkpointConfirmed = false;
+    bool activationReviewed = false;
+    bool completed = false;
+    unsigned activationCalls = 0;
+    std::function<bool(const JoinActivation &)> activate;
+    if (choice != WizardActivation::NoCallback) {
+        activate = [&](const JoinActivation &actual) {
+            CHECK(checkpointConfirmed && activationReviewed && !completed);
+            CHECK(actual.profileBinding == expected.profileBinding && actual.group == expected.group &&
+                  actual.root == expected.root && actual.head == expected.head && actual.member == expected.member &&
+                  actual.generation == expected.generation && actual.tipId == expected.tipId &&
+                  actual.tipDigest == expected.tipDigest);
+            const auto mounted = checkpoint.mount(actual);
+            CHECK(mounted->generation() == 2 && mounted->snapshot() == snapshot);
+            ++activationCalls;
+            return true;
+        };
+    }
+
+    QTimer::singleShot(0, [&] {
+        auto *wizard = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        CHECK(wizard);
+        const auto buttons = wizard->findChildren<QPushButton *>();
+        const auto write = std::find_if(buttons.begin(), buttons.end(), [](const QPushButton *button) {
+            return button->text().startsWith(QStringLiteral("5. "));
+        });
+        CHECK(write != buttons.end());
+        QTimer respond;
+        QObject::connect(&respond, &QTimer::timeout, [&] {
+            auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (!message) return;
+            if (auto *yes = message->button(QMessageBox::Yes)) {
+                if (!checkpointConfirmed) {
+                    CHECK(message->text().startsWith(QStringLiteral("Write this verified history")));
+                    CHECK(!std::filesystem::exists(record) && activationCalls == 0);
+                    checkpointConfirmed = true;
+                    yes->click();
+                    return;
+                }
+                CHECK(!activationReviewed && choice != WizardActivation::NoCallback && activationCalls == 0);
+                CHECK(message->text().startsWith(QStringLiteral("The encrypted signed checkpoint was verified.")));
+                {
+                    const auto mounted = checkpoint.mount(expected);
+                    CHECK(mounted->generation() == 1 && mounted->snapshot() == snapshot);
+                }
+                activationReviewed = true;
+                if (choice == WizardActivation::AdvanceTip) {
+                    const std::vector<SignedEventParent> parents{{expected.tipId, expected.tipDigest}};
+                    const auto prepared = f.journal(0).prepareClipboardEvent(*f.identities[0], *f.key, parents, ValidItems, Now);
+                    CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now).empty());
+                }
+                auto *answer = choice == WizardActivation::Decline ? message->button(QMessageBox::No) : yes;
+                CHECK(answer);
+                answer->click();
+                return;
+            }
+
+            CHECK(checkpointConfirmed && !completed);
+            switch (choice) {
+            case WizardActivation::Accept:
+                CHECK(message->text().startsWith(QStringLiteral("Create the signed_sync tab")));
+                break;
+            case WizardActivation::AdvanceTip:
+                CHECK(message->icon() == QMessageBox::Warning &&
+                      message->text().startsWith(QStringLiteral("The operation failed or its durable outcome is unconfirmed.")));
+                break;
+            case WizardActivation::NoCallback:
+            case WizardActivation::Decline:
+                CHECK(message->text() == QStringLiteral("Encrypted signed checkpoint verified."));
+                break;
+            }
+            completed = true;
+            message->accept();
+        });
+        respond.start(2);
+        (*write)->click();
+        wizard->reject();
+    });
+    cqs::native::runSignedJoinWizard(nullptr, f.journal(1), *f.identities[1], transport.directory(),
+                                     checkpoint, Binding, nullptr, {}, {}, activate);
+    CHECK(checkpointConfirmed && completed && activationReviewed == (choice != WizardActivation::NoCallback));
+    CHECK(activationCalls == (choice == WizardActivation::Accept ? 1u : 0u));
+    const auto mounted = checkpoint.mount(expected);
+    CHECK(mounted->generation() == (choice == WizardActivation::Accept ? 2u : 1u));
+    CHECK(mounted->snapshot() == snapshot);
+    CHECK(std::filesystem::is_empty(transport.root / "events"));
+}
+#endif
 #endif
 } // namespace
 
@@ -647,46 +750,16 @@ int main(int argc, char **argv)
     });
 #ifdef CQS_TEST_NATIVE_SIGNED_JOIN
     test("the native wizard confirms and writes the signed checkpoint without a legacy write", [] {
-        Fixture f;
-        f.enrollFirst();
-        Transport transport(f.journal(0).inspect().state);
-        CHECK(!seed(f, transport).empty() && !install(f).empty());
-        const auto directory = privateCheckpoint(transport);
-        const auto expected = f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
-        SignedJoinCheckpoint checkpoint(directory, Bytes(32, 0x44), Binding);
-        bool confirmed = false;
-        bool completed = false;
-        QTimer::singleShot(0, [&] {
-            auto *wizard = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            CHECK(wizard);
-            const auto buttons = wizard->findChildren<QPushButton *>();
-            const auto write = std::find_if(buttons.begin(), buttons.end(), [](const QPushButton *button) {
-                return button->text().startsWith(QStringLiteral("5. "));
-            });
-            CHECK(write != buttons.end());
-            QTimer respond;
-            QObject::connect(&respond, &QTimer::timeout, [&] {
-                auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
-                if (!message) return;
-                if (auto *yes = message->button(QMessageBox::Yes)) {
-                    CHECK(!confirmed);
-                    confirmed = true;
-                    yes->click();
-                } else {
-                    CHECK(confirmed && message->text() == QStringLiteral("Encrypted signed checkpoint verified."));
-                    completed = true;
-                    message->accept();
-                }
-            });
-            respond.start(2);
-            (*write)->click();
-            wizard->reject();
-        });
-        cqs::native::runSignedJoinWizard(nullptr, f.journal(1), *f.identities[1], transport.directory(),
-                                         checkpoint, Binding);
-        CHECK(confirmed && completed);
-        CHECK(checkpoint.read(expected) == cqs::packed::decode(ValidItems));
-        CHECK(std::filesystem::is_empty(transport.root / "events"));
+        exerciseNativeWizard(WizardActivation::NoCallback);
+    });
+    test("the native wizard activates only after a separate confirmation and fresh checkpoint verification", [] {
+        exerciseNativeWizard(WizardActivation::Accept);
+    });
+    test("declining native tab activation keeps the verified signed checkpoint", [] {
+        exerciseNativeWizard(WizardActivation::Decline);
+    });
+    test("a new signed tip during native tab confirmation refuses activation and keeps the checkpoint", [] {
+        exerciseNativeWizard(WizardActivation::AdvanceTip);
     });
 #endif
 #endif
