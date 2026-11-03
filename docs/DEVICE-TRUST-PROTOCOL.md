@@ -1,4 +1,4 @@
-# Device trust protocol decisions: stage 2
+# Device trust protocol decisions
 
 Status: engineering baseline for the isolated policy model, not a deployed wire
 protocol or audited cryptographic implementation. The [stage-1 requirements](DEVICE-TRUST-DESIGN.md)
@@ -14,23 +14,19 @@ approval identities, retained ancestor witnesses and local signing reservations.
 `SignatureVerifier` is an explicit injected boundary: the model asks it to verify
 each signature against exact bytes and the parent's signing public key.
 
-The base model's test verifier is public deterministic test machinery, not
-encryption. The optional [control-plane laboratory](DEVICE-TRUST-COORDINATOR.md)
-adds a real libsodium verifier/signer and an encrypted durable approval journal.
-It validates pinned history and commits reservations before signing. It does not
-publish transport files, integrate a private identity vault, grant operating-system
-permissions, release K-SYNC or change a user's tab. Copying a base model object
-still provides no crash-durability evidence.
+The optional [control-plane laboratory](DEVICE-TRUST-COORDINATOR.md) adds real
+libsodium signatures, an encrypted identity vault, durable approval coordination
+and signed key envelopes. It replays pinned history, commits reservations before
+signing and durably stages the exact ciphertext for each authorized recipient.
+The acceptance gates cover integration with a running CopyQ profile.
 
 ## Cryptographic suite selected for integration
 
-The implemented opt-in adapter uses libsodium single-part **Ed25519 detached
-signatures** and independently generated **X25519 encryption keys**. The proposed
-key-delivery adapter will use `crypto_box_seal()` / `crypto_box_seal_open()` for
-per-recipient envelopes; envelope creation and opening are not implemented yet.
-Generate signing and encryption keypairs separately; do not convert an Ed25519
-key or derive both roles from an ordinary unlock password. Group and request
-identifiers, nonce fields and recovery credentials use a cryptographic RNG.
+The opt-in adapter uses libsodium single-part **Ed25519 detached signatures**,
+independently generated **X25519 encryption keys**, and `crypto_box_seal()` /
+`crypto_box_seal_open()` for recipient envelopes. Device signing and encryption
+keypairs use separate randomness. Group and request identifiers, nonce fields
+and recovery credentials use a cryptographic RNG.
 
 This is an explicit alternative to the earlier HPKE candidate, not HPKE or MLS
 conformance. The sealed-box construction is library-provided; do not reproduce
@@ -169,56 +165,52 @@ recovery is the baseline escape path, not automatic selection of a winner.
 
 ## Key delivery and acknowledgement contract
 
-This is the future adapter contract; no delivery implementation is supplied here.
-Before collecting rotation votes, a coordinator creates and privately journals
-the fresh random 32-byte group key. The proposed public commitment is SHA-256 of
-the domain `CopyQ-Secure-Sync-data-key-commitment-control-v1` including NUL,
-followed by `group32 || keyGeneration-u64BE || key32`. The group ID is generated
-before its initial key commitment and genesis root, avoiding a circular root
-definition. No raw key enters the proposal. Production version/encoding must
-freeze this construction with independent vectors before any real key is used.
+The 32-byte data key commitment uses SHA-256 of
+`CopyQ-Secure-Sync-data-key-commitment-control-v1` including NUL, followed by
+`group32 || keyGeneration-u64BE || key32`. The group ID precedes the genesis root
+and initial key commitment in setup. `SyncKey` holds the key and uses guarded
+memory for commitment calculation and sealed payloads. The journal compares the
+candidate key with the commitments for prior generations using their original
+generation numbers. This detects reuse even when the current commitment differs.
 
-The model requires a nonzero initial commitment, exact retention on Add, and a
-different nonzero commitment with incremented generation on Remove. It cannot
-prove that a supplied commitment represents a fresh/random secret. The real
-coordinator must validate the journaled secret against it; the receiver must
-recompute it from the delivered key before accepting the generation. This binds
-all distributors to the key approved by the same certificate, rather than merely
-a shared numeric generation. Losing that prepared secret requires explicit
-recovery, not substitution of a different key under existing approvals.
-Because the generation is part of the commitment, its inequality alone also
-cannot detect reuse of the same raw key. Require fresh RNG output, refuse known
-raw-key reuse, and fail closed on generator failure in the actual key adapter.
+The isolated envelope codec has a fixed 832-byte encoding. Its public header is
+`CopyQ-Secure-Sync-key-envelope-lab-v1` including NUL, followed by the context.
+The context is 301 bytes in this order.
 
-First validate the full certificate against pinned history and check the current
-membership/fork state. Then construct a recipient-specific, versioned envelope
-context containing group/root, accepted successor digest, proposal digest,
-recipient `Member96`, sender member ID, key generation, commitment and scope of
-history access.
+| Field | Encoding |
+| --- | --- |
+| Version | u32BE, value 1 |
+| Group and pinned root | `group32 || root32` |
+| Accepted successor and proposal digest | `successor32 || proposal32` |
+| Recipient identity | `Member96` |
+| Sender | member ID, 32 bytes |
+| Key generation | u64BE |
+| Key commitment | 32 bytes |
+| Scope | u8, value 1 for current generation |
 
-Seal the key payload to the verified recipient's X25519 public key, and sign the
-exact public context and ciphertext with a current authorized sender's Ed25519
-identity. Include that same context inside the sealed payload and compare it after
-decryption. The receiver checks sender authority, signatures, certificate and all
-bindings before accepting the decrypted key; a sealed box alone is not admission.
-The final envelope domains/serialization and independent vectors are mandatory
-adapter work and are not inferred from the membership model encoding.
+The sealed payload is `CopyQ-Secure-Sync-key-envelope-plaintext-lab-v1` including
+NUL, the identical context and `key32`. Its sealed-box encoding adds 48 bytes to
+the 381-byte plaintext. The 64-byte detached signature covers the exact public
+header and sealed bytes. The receiver checks its pinned current head, sender,
+recipient, signature and ephemeral X25519 key before opening. It compares the
+inner context and recomputes the commitment before returning the guarded key.
+Independent fixtures exercise the byte layout and detached signature.
 
-Recheck the currently known membership and recipient's authority immediately
-before release; a historically valid admission is not permission to send a later
-generation to a now-removed device. A locally hidden revocation remains the stated
-transport limitation. The optional journal already persists full authenticated
-membership certificate bytes, including observed fork branches. A production
-key-delivery archive must retain that proof; the base model's two fork-evidence
-digests alone are insufficient.
+The [coordinator](DEVICE-TRUST-COORDINATOR.md#key-delivery-at-the-accepted-head)
+stages at most one exact ciphertext per current recipient and invalidates that
+outbox on a head change or fork. The archive retains both authenticated fork
+certificates. Scope 1 delivers the current generation key, with access to all
+records encrypted under it. Membership is authorized by the accepted intent,
+so different valid certificate signature sets can yield the same envelope context.
 
-Persist the exact prepared envelope before immutable publication; retry its bytes
-rather than resealing under the same operation unexpectedly. After validated local
-initialization and authenticated Join, the recipient signs a stage-specific
-acknowledgement bound to the group, successor, request and received package digest.
-Do not display complete onboarding from a file write or a generic online status.
-Removal distributes a fresh future-data key only to survivors; encrypting it
-solely under the old shared key would also give it to the removed member.
+Product integration must durably prepare the random rotation secret before
+soliciting approvals, install a received key only for its validated generation,
+recheck membership at immutable publication and specify how an eligible peer
+catches up if delivery missed the accepted head. After authenticated Join, the
+recipient signs a stage-specific acknowledgement bound to group, successor,
+request and package digest. Show completion only after that acknowledgement.
+A removed member keeps any earlier key it obtained. A later generation uses a
+fresh key and survivor-specific delivery.
 
 ## Independent recovery credential
 
@@ -253,14 +245,14 @@ for verification, granting access, changing launch/permissions, migration and
 destructive actions. Automatic discovery, validation and safe retry need no repeated
 prompt; they must not silently weaken the trust policy or CopyQ encryption.
 
-G1-G4 now have explicit candidate choices, a tested policy foundation, and opt-in
-real identity/signing and durable approval coordination. These are isolated
-components, not completed production proof. Remaining work includes qualified
-identity-vault storage, trusted-screen peer verification, production transport
-formats, envelope/acknowledgement vectors, recovery-package qualification and
-independent review. Full disk/key rollback across restarts requires an external
-monotonic anchor or explicit recovery policy. G5's signed event migration and G6-G7's installer/platform
-qualification still gate distribution. Advanced settings remain ordinary UI.
+G1-G4 now have concrete choices and isolated implementations for membership,
+identity storage, signing, approvals and key envelopes. Remaining product work
+includes trusted-screen verification, durable generation-key installation and
+rotation preparation, publication and acknowledgement, recovery and platform
+qualification. Full disk/key rollback across restarts requires an external
+monotonic anchor or explicit recovery policy. G5's signed event migration and
+G6-G7's installer/platform qualification still gate distribution. Advanced
+settings remain ordinary UI.
 
 ## Primary references
 

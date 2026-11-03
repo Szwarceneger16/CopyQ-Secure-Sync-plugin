@@ -142,4 +142,14 @@ Signature Identity::sign(const crypto::Bytes &message) const {
         throw crypto::Error("Device signature failed");
     return signature;
 }
+
+bool Identity::openSealed(std::uint8_t *plaintext, std::size_t plaintextSize,
+                          const std::uint8_t *ciphertext, std::size_t ciphertextSize) const noexcept {
+    if (ciphertextSize < crypto_box_SEALBYTES || plaintextSize != ciphertextSize - crypto_box_SEALBYTES ||
+        plaintextSize > SodiumVerifier::MaxMessage) {
+        return false;
+    }
+    return crypto_box_seal_open(plaintext, ciphertext, static_cast<unsigned long long>(ciphertextSize),
+                                member_.encryptionKey.data(), secrets_->encryption) == 0;
+}
 } // namespace cqs::trust

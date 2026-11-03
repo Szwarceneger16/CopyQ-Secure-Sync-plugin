@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "device_trust_journal.h"
 #include "device_identity.h"
+#include "device_key_envelope.h"
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -17,6 +18,7 @@ struct Entry { Kind kind; std::uint64_t now; Bytes bytes; };
 struct Log {
     std::uint64_t initial = 0, watermark = 0;
     std::vector<Entry> entries;
+    std::map<Token, Bytes> deliveries;
 };
 [[noreturn]] void fail(JournalCode code) { throw JournalError(code); }
 template<class Range> void append(Bytes &out, const Range &value) {
@@ -54,9 +56,10 @@ std::string hex(const Token &value) {
     return out;
 }
 Bytes encode(const Log &log, const Token &pins) {
-    if (!log.initial || log.watermark < log.initial || log.entries.size() > TrustJournal::MaxOperations)
+    if (!log.initial || log.watermark < log.initial || log.entries.size() > TrustJournal::MaxOperations ||
+        log.deliveries.size() > MaxMembers)
         fail(JournalCode::Invalid);
-    Bytes out; domain(out, JournalDomain); u32(out, 1); append(out, pins);
+    Bytes out; domain(out, JournalDomain); u32(out, log.deliveries.empty() ? 1 : 2); append(out, pins);
     u64(out, log.initial); u64(out, log.watermark);
     u32(out, static_cast<std::uint32_t>(log.entries.size()));
     for (const auto &entry : log.entries) {
@@ -64,6 +67,15 @@ Bytes encode(const Log &log, const Token &pins) {
         out.push_back(static_cast<std::uint8_t>(entry.kind)); u64(out, entry.now);
         u32(out, static_cast<std::uint32_t>(entry.bytes.size())); append(out, entry.bytes);
         if (out.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
+    }
+    if (!log.deliveries.empty()) {
+        u32(out, static_cast<std::uint32_t>(log.deliveries.size()));
+        for (const auto &delivery : log.deliveries) {
+            if (delivery.second.empty() || delivery.second.size() > MaxEventBytes) fail(JournalCode::Invalid);
+            append(out, delivery.first); u32(out, static_cast<std::uint32_t>(delivery.second.size()));
+            append(out, delivery.second);
+            if (out.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
+        }
     }
     return out;
 }
@@ -105,7 +117,8 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
     const auto &bytes = record.local->front().begin()->second;
     if (bytes.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
     Reader reader(bytes); reader.expect(JournalDomain);
-    if (reader.number32() != 1) fail(JournalCode::Invalid);
+    const auto version = reader.number32();
+    if (version != 1 && version != 2) fail(JournalCode::Invalid);
     if (reader.token() != pins) fail(JournalCode::WrongPins);
     Log log; log.initial = reader.number64(); log.watermark = reader.number64();
     const auto count = reader.number32();
@@ -117,8 +130,45 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
         const auto now = reader.number64();
         log.entries.push_back({kind, now, reader.bytes()});
     }
+    if (version == 2) {
+        const auto deliveryCount = reader.number32();
+        if (!deliveryCount || deliveryCount > MaxMembers) fail(JournalCode::Invalid);
+        Token previous{};
+        for (std::uint32_t i = 0; i < deliveryCount; ++i) {
+            const auto recipient = reader.token();
+            if (!(previous < recipient)) fail(JournalCode::Invalid);
+            log.deliveries.emplace(recipient, reader.bytes()); previous = recipient;
+        }
+    }
     if (!reader.done()) fail(JournalCode::Invalid);
     return log;
+}
+const Member &member(const State &state, const Token &id) {
+    const auto found = std::find_if(state.members.begin(), state.members.end(),
+        [&](const Member &candidate) { return candidate.id == id; });
+    if (found == state.members.end()) throw Error(ErrorCode::NotMember);
+    return *found;
+}
+Proposal currentProposal(const Log &log, const Membership &membership) {
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    if (!membership.current().epoch) fail(JournalCode::Delivery);
+    for (auto entry = log.entries.rbegin(); entry != log.entries.rend(); ++entry) {
+        if (entry->kind == Kind::Observe) {
+            auto proposal = decodeCertificate(entry->bytes).proposal;
+            if (proposalDigest(proposal) != membership.current().intent) fail(JournalCode::Invalid);
+            return proposal;
+        }
+    }
+    fail(JournalCode::Invalid);
+}
+KeyEnvelopeContext deliveryContext(const State &state, const Proposal &proposal, const Member &sender,
+                                   const Token &recipientId) {
+    if (member(state, sender.id) != sender) fail(JournalCode::WrongPins);
+    const auto &recipient = member(state, recipientId);
+    if (sender.id == recipientId || (proposal.operation == Operation::Add && recipient != proposal.subject))
+        fail(JournalCode::Delivery);
+    return {state.group, state.root, state.digest, state.intent, recipient, sender.id,
+            state.keyGeneration, state.keyCommitment, KeyScope::CurrentGeneration};
 }
 Membership replay(const Log &log, const Genesis &g, const Member &local) {
     auto membership = model(g); SodiumVerifier verifier;
@@ -138,7 +188,25 @@ Membership replay(const Log &log, const Genesis &g, const Member &local) {
         watermark = std::max(watermark, entry.now);
     }
     if (log.watermark < watermark) fail(JournalCode::Invalid);
+    if (!log.deliveries.empty()) {
+        const auto proposal = currentProposal(log, membership);
+        for (const auto &delivery : log.deliveries) {
+            const auto context = deliveryContext(membership.current(), proposal, local, delivery.first);
+            KeyEnvelopeCodec::verify(delivery.second, context, local);
+        }
+    }
     return membership;
+}
+void checkPriorKeys(const Log &log, const Genesis &genesis, const State &state, const SyncKey &key) {
+    if (!state.keyGeneration) return;
+    if (key.commitment(state.group, 0) == genesis.initialKeyCommitment) fail(JournalCode::KeyReuse);
+    for (const auto &entry : log.entries) {
+        if (entry.kind != Kind::Observe) continue;
+        const auto proposal = decodeCertificate(entry.bytes).proposal;
+        if (proposal.operation == Operation::Remove && proposal.keyGeneration < state.keyGeneration &&
+            key.commitment(state.group, proposal.keyGeneration) == proposal.keyCommitment)
+            fail(JournalCode::KeyReuse);
+    }
 }
 void clock(const Log &log, std::uint64_t now) {
     if (!now || now < log.watermark) fail(JournalCode::ClockRollback);
@@ -159,7 +227,7 @@ transaction::Record TrustJournal::initialRecord(const Genesis &g, const Member &
     if (!now) fail(JournalCode::ClockRollback);
     const auto pins = pin(g, local);
     transaction::Record record; record.schema = 2; record.binding = binding(g, local);
-    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}}, pins); return record;
+    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}}, pins); return record;
 }
 void TrustJournal::initialize(state::FileStore &store, const Genesis &g, const Member &local, std::uint64_t now) {
     auto lease = store.lock(); if (!lease) fail(JournalCode::Busy);
@@ -244,6 +312,40 @@ ObserveResult TrustJournal::observe(const Certificate &certificate, std::uint64_
     if (result == ObserveResult::Applied) clock(log, now);
     else if (!now) fail(JournalCode::ClockRollback);
     add(log, Kind::Observe, now, encodeCertificate(certificate));
+    log.deliveries.clear();
     auto replacement = record; storeLog(replacement, log, pins); save(record, std::move(replacement)); return result;
+}
+Bytes TrustJournal::prepareDelivery(const Token &recipient, const Identity &sender, const SyncKey &key,
+                                    std::uint64_t now) {
+    const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins); const auto membership = replay(log, genesis_, local_);
+    if (sender.member() != local_) fail(JournalCode::WrongPins);
+    clock(log, now);
+    const auto proposal = currentProposal(log, membership);
+    const auto context = deliveryContext(membership.current(), proposal, local_, recipient);
+    if (key.commitment(context.group, context.generation) != context.commitment)
+        throw EnvelopeError(EnvelopeCode::KeyMismatch);
+    checkPriorKeys(log, genesis_, membership.current(), key);
+    const auto prior = log.deliveries.find(recipient);
+    if (prior != log.deliveries.end()) return prior->second;
+    auto wire = KeyEnvelopeCodec::seal(context, sender, key);
+    log.deliveries.emplace(recipient, wire); log.watermark = now;
+    auto replacement = record; storeLog(replacement, log, pins); save(record, std::move(replacement));
+    return wire;
+}
+std::unique_ptr<SyncKey> TrustJournal::receiveDelivery(const Bytes &wire, const Identity &recipient,
+                                                       std::uint64_t now) {
+    const auto lease = lock(); const auto record = load();
+    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    if (recipient.member() != local_) fail(JournalCode::WrongPins);
+    clock(log, now);
+    const auto proposal = currentProposal(log, membership);
+    const auto claimed = KeyEnvelopeCodec::inspect(wire);
+    const auto &sender = member(membership.current(), claimed.sender);
+    const auto context = deliveryContext(membership.current(), proposal, sender, local_.id);
+    auto key = KeyEnvelopeCodec::open(wire, context, sender, recipient);
+    checkPriorKeys(log, genesis_, membership.current(), *key);
+    return key;
 }
 } // namespace cqs::trust

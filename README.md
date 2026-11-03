@@ -44,12 +44,12 @@ bounded membership validation and adversarial tests. Its
 decisions and remaining integration gates. It is not active in the plugin and
 does not yet provide a working pairing wizard or installer.
 
-An [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) now adds
-real Ed25519 signatures, independent device encryption keys and an encrypted
-approval journal that commits a verified intent before signing. It requires
-libsodium 1.0.22 or newer and is built only with `CQS_TEST_DEVICE_CRYPTO=ON`.
-The shipping module has no new dependency; key delivery, vault integration and
-the guided setup flow remain separate implementation gates.
+The [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) exercises
+Ed25519 approvals, a local identity vault and signed key envelopes for authorized
+recipients. The encrypted journal commits approval intent before signing and
+stores the exact envelope before returning it for delivery. Build the isolated
+tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer. Product use
+requires guided setup, transport and authenticated key installation.
 
 ## Build and test pipeline
 

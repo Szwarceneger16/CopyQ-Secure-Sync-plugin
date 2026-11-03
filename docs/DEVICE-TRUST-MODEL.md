@@ -14,9 +14,9 @@ domain-separated encodings. It derives state/intent digests using the existing
 platform SHA-256 backend and delegates approval signature verification to an
 explicit `SignatureVerifier` implementation. The optional
 [control-plane laboratory](DEVICE-TRUST-COORDINATOR.md) supplies a real libsodium
-verifier, private-key signer and durable approval coordinator. The base model
-keeps its dependency-free verifier boundary; neither component releases a group
-key or runs in the shipping plugin.
+verifier, private-key signer, durable approval coordinator and per-recipient
+key delivery for isolated tests. The base model keeps its dependency-free
+verifier boundary.
 
 Membership starts from a locally pinned, explicitly supplied genesis. Constructing
 a new `Membership` from arbitrary remote data is not a trust decision. The
@@ -53,9 +53,9 @@ holds a Store lease, replays authenticated history, checks the exact confirmed
 digest, durably commits the reservation, and only then calls the real signer.
 Its tests separately exercise failed/ambiguous commits and disk reopening.
 Copying the base model still demonstrates only state-machine behavior. Complete
-disk/key backup rollback across restart, platform power-loss behavior, private-key
-vault integration and the versioned signed event path remain qualification gates.
-There is deliberately no production key delivery.
+disk/key backup rollback across restart, platform power-loss behavior and the
+versioned signed event path remain qualification gates. The opt-in coordinator
+exercises encrypted identity storage and per-recipient key delivery in isolation.
 
 Similarly, computing `verificationDigest()` is not proof that a user compared it.
 Only a trusted-screen/out-of-band comparison in the reviewed pairing flow may

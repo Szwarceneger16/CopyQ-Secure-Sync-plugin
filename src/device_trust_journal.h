@@ -6,12 +6,14 @@
 
 namespace cqs::trust {
 class Identity;
+class SyncKey;
 struct Genesis {
     Token group{};
     Member founder;
     Token recovery{}, initialKeyCommitment{};
 };
-enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy };
+enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy,
+                         Delivery, KeyReuse };
 class JournalError final : public std::runtime_error {
 public:
     explicit JournalError(JournalCode code);
@@ -57,6 +59,15 @@ public:
     Approval approve(const Proposal &proposal, const Identity &identity,
                      const Token &confirmedDigest, std::uint64_t trustedNow);
     ObserveResult observe(const Certificate &certificate, std::uint64_t trustedNow);
+    // Prepare one exact ciphertext for an authorized recipient at the accepted
+    // head. Retry returns the stored bytes. A transport publisher must recheck
+    // authorization under its live guard before releasing the prepared bytes.
+    crypto::Bytes prepareDelivery(const Token &recipient, const Identity &sender,
+                                  const SyncKey &key, std::uint64_t trustedNow);
+    // Authenticates against the current pinned head before opening. The returned
+    // key remains guarded. Installing it in a CopyQ profile is a separate step.
+    std::unique_ptr<SyncKey> receiveDelivery(const crypto::Bytes &wire, const Identity &recipient,
+                                             std::uint64_t trustedNow);
 private:
     std::unique_ptr<transaction::Store::Lease> lock();
     transaction::Record load();

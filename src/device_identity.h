@@ -4,6 +4,8 @@
 #include <memory>
 
 namespace cqs::trust {
+class KeyEnvelopeCodec;
+
 // Opt-in laboratory adapter, never linked into the shipping plugin. Requires
 // libsodium >= 1.0.22; distribution provenance/platform qualification is separate.
 class SodiumVerifier final : public SignatureVerifier {
@@ -17,9 +19,9 @@ public:
     static constexpr std::size_t MaxMessage = 65536;
 };
 
-// A low-level identity primitive, not a pairing authorization API. Callers must
-// durably reserve the exact verified intent before calling sign(). Secret key
-// material stays in guarded, locked libsodium memory until explicit export.
+// A low-level identity primitive. The coordinator authorizes the exact message
+// before signing and durably reserves any membership vote. Secret key material
+// stays in guarded, locked libsodium memory until explicit export.
 class Identity final {
 public:
     static std::unique_ptr<Identity> generate();
@@ -38,9 +40,12 @@ public:
     // buffer immediately. Never place this record in transport/logs/clipboard.
     crypto::Bytes exportPrivate() const;
 private:
+    friend class KeyEnvelopeCodec;
     struct Secrets;
     Identity();
     void derive();
+    bool openSealed(std::uint8_t *plaintext, std::size_t plaintextSize,
+                    const std::uint8_t *ciphertext, std::size_t ciphertextSize) const noexcept;
     Member member_;
     Secrets *secrets_ = nullptr;
 };

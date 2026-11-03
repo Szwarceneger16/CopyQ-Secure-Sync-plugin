@@ -1,17 +1,13 @@
-# Device identities and durable approvals: isolated control-plane laboratory
+# Device identities, durable approvals and key delivery
 
-`src/device_identity.*` and `src/device_trust_journal.*` extend the
-[membership model](DEVICE-TRUST-MODEL.md) with real signatures and protected local
-approval persistence. They are built only when both `BUILD_TESTING` and
-`CQS_TEST_DEVICE_CRYPTO` are enabled. **The shipping CopyQ plugin does not link
-this code or libsodium.** No profile, tab, existing vault, startup setting or cloud
-folder is opened by enabling these tests.
-
-This increment does not provide a pairing wizard, transport publication,
-per-recipient group-key envelopes, a recovery-package format or an installer.
-The [protocol design](DEVICE-TRUST-PROTOCOL.md) and
-[acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) remain the
-product contract.
+The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
+with real signatures, a local identity vault, durable approvals and signed key
+envelopes. Build them with `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
+The tests use disposable directories and synthetic keys. Product integration
+requires peer verification, transport publication, installation of the received
+key, acknowledged Join and recovery. The [protocol design](DEVICE-TRUST-PROTOCOL.md)
+and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
+the product contract.
 
 ## Identity and signature boundary
 
@@ -35,13 +31,19 @@ admission. `TrustJournal::approve()` supplies that policy and durability orderin
 Calling the raw signer directly would bypass the coordinator's protections and
 must not become an application pairing path.
 
-`exportPrivate()` returns an explicitly sensitive plaintext record with a
-domain/version marker, device ID, Ed25519 seed and X25519 secret. The caller must
-encrypt it into a separately qualified local vault and wipe the returned buffer.
-`restore()` accepts only an already authenticated/decrypted local record; it
-re-derives the public keys and does not establish membership. Neither method is
-a cloud transfer or recovery API. The new identity vault integration remains
-unfinished; the approval journal contains no private identity keys or K-SYNC.
+`exportPrivate()` returns sensitive plaintext containing a domain/version
+marker, device ID, Ed25519 seed and X25519 secret. `IdentityVault` stores this
+record in a dedicated local `state::FileStore` with either a protected 32-byte
+wrapping key or password protection. The binding commits to externally pinned
+group, root and full member keys. Explicit create-only provisioning takes the
+record lease. Reopen authenticates the record, validates its shape and re-derives
+the public keys before matching the complete local member. Use a separate private
+directory outside the synchronization folder.
+
+The vault wipes exported and returned private record buffers it owns. The shared
+FileStore codec can allocate transient plaintext buffers during serialization or
+failed parsing. Secret memory locking applies to the live `Identity`. The
+approval journal stores public membership data and sealed key envelopes.
 
 ## Pinned encrypted journal
 
@@ -114,6 +116,36 @@ certificates, then remains latched on reopen. A duplicate accepted certificate
 is idempotent. Once forked, fresh membership and signing operations refuse;
 there is no automatic branch winner or quorum downgrade.
 
+## Key delivery at the accepted head
+
+`prepareDelivery()` holds the journal lease through replay, authorization,
+encryption and commit. An Add authorizes delivery from an existing member to the
+new member. A Remove authorizes delivery between two distinct survivors. Both
+operations use the exact current successor and proposal digests. Peers with
+different valid quorum subsets for the same proposal can therefore interoperate.
+The sender proves possession of the accepted generation key by matching its
+commitment. Both sides recompute candidate commitments for retained earlier
+generations and reject known raw-key reuse.
+
+One envelope per recipient is staged in the encrypted journal. Version 1 records
+remain readable. Version 2 appends a nonempty, recipient-sorted table of at most
+32 entries. Each entry is `recipient32 || length-u32BE || envelope`, following a
+`count-u32BE`. Entries use the existing 4,096-byte field and 2 MiB journal limits.
+Reopen verifies each saved envelope's exact context and sender signature. An
+exact retry returns the same ciphertext. A commit error suppresses the result
+and requires reopening. Advancing the head or observing a fork clears the old
+outbox while retaining the membership evidence.
+
+`receiveDelivery()` verifies local pins, current authorization and the signature
+before opening the sealed payload. It compares the inner and outer context and
+the key commitment before returning a guarded key. An accepted envelope grants
+access to records encrypted with that generation, including its existing
+history. A newer accepted head invalidates packages tied to the older head.
+Production needs an authorized catch-up or a rule that coordinates head changes
+with delivery completion. Publication must recheck the head under a live guard
+because prepared bytes can outlive the journal lease. A peer can enforce only
+the revocations and forks it has already observed.
+
 ## Clock and rollback limits
 
 The encrypted record retains a high-watermark policy time. Fresh signing and
@@ -144,7 +176,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_trust_journal)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,
@@ -154,12 +186,13 @@ reservation/observation replay order, stale/expired requests, fork persistence,
 clock rollback, wrong pins, malformed records and failures before/after the
 commit acknowledgement. Its Linux disk case uses disposable private directories
 to test encrypted FileStore creation and reopen. No user keys or profiles are
-loaded. Exact results belong to the implementing PR and current test run.
+loaded. The vault, envelope and delivery suites cover authenticated reopen,
+recipient and context substitution, key commitment checks and durable ciphertext
+retry. Exact results belong to the implementing PR and current test run.
 
-Passing these suites does not qualify the new component on Windows/NTFS or
-Flatpak, establish physical power-loss behavior, exercise human peer verification,
-or prove a production key-delivery path. Existing CI builds do not automatically
-enable this optional dependency.
+Qualification still requires Windows/NTFS and Flatpak, physical power-loss
+behavior, human peer verification and production transport. Enable the optional
+build flag to include these suites in CI.
 
 ## Dependency qualification
 
