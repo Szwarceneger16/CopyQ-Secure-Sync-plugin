@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "device_trust.h"
+#include "device_join.h"
 #include "device_signed_event.h"
 #include "state_store.h"
 #include <atomic>
@@ -19,7 +20,7 @@ struct Genesis {
 };
 enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy,
                          Delivery, KeyReuse, MissingKey, EventPending, EventReservation, EventBudget,
-                         EventPublication, HistoryChanged, EventVersion, Migration };
+                         EventPublication, HistoryChanged, EventVersion, Migration, Enrollment };
 class JournalError final : public std::runtime_error {
 public:
     explicit JournalError(JournalCode code);
@@ -55,6 +56,13 @@ struct JournalStatus {
     std::uint32_t eventEncryptionAttempts = 0;
     std::size_t eventWitnesses = 0;
     std::optional<ArchiveMigrationStatus> migration;
+    bool verifiedJoin = false;
+};
+struct JoinActivation {
+    std::string profileBinding;
+    Token group, root, head, member, tipDigest;
+    std::uint64_t generation;
+    std::string tipId;
 };
 struct SignedEventHistory {
     std::vector<events::Event> events;
@@ -73,7 +81,7 @@ public:
     static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxJournalBytes = MaxControlBytes + MaxClipboardEventBytes +
-                                                   71 + 77 * history::MaxEvents;
+                                                   94 + 77 * history::MaxEvents;
     TrustJournal(transaction::Store &store, Genesis genesis, Member local);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
@@ -93,6 +101,19 @@ public:
     // Transport fields/QR files cannot provide this authorization.
     Approval approve(const Proposal &proposal, const Identity &identity,
                      const Token &confirmedDigest, std::uint64_t trustedNow);
+    // Pins and the identity vault must come from trusted local setup.
+    JoinRequest beginJoin(const Identity &applicant, std::uint64_t trustedNow);
+    Proposal proposeJoin(const JoinRequest &request, std::uint64_t trustedNow, std::uint64_t expires);
+    JoinReview reviewJoin(const Proposal &proposal, const std::vector<Token> &approvers,
+                          std::uint64_t trustedNow);
+    JoinReview reviewJoinApproval(const Proposal &proposal, std::uint64_t trustedNow);
+    ObserveResult acceptJoin(const Certificate &certificate,
+                             const std::vector<JoinConfirmation> &confirmations,
+                             std::uint64_t trustedNow);
+    // Verifies readiness and durably witnesses the signed history. The result
+    // contains no key or clipboard data and does not authorize a later write.
+    JoinActivation preflightJoinActivation(const Identity &applicant, const storage::Directory &transport,
+                                           std::string profileBinding, std::uint64_t trustedNow);
     ObserveResult observe(const Certificate &certificate, std::uint64_t trustedNow);
     // Prepare one exact ciphertext for an authorized recipient at the accepted
     // head. Retry returns the stored bytes. A transport publisher must recheck

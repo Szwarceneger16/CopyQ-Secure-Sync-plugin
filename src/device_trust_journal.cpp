@@ -4,6 +4,7 @@
 #include "device_identity.h"
 #include "device_key_envelope.h"
 #include "device_key_receipt.h"
+#include "packed_items.h"
 #include "storage.h"
 #include <sodium.h>
 #include <algorithm>
@@ -35,6 +36,9 @@ struct ArchiveMigration {
     std::uint64_t sequence;
     bool completed;
 };
+struct Enrollment {
+    Token request, acceptedIntent;
+};
 struct Log {
     std::uint64_t initial = 0, watermark = 0;
     std::vector<Entry> entries;
@@ -44,10 +48,18 @@ struct Log {
     std::optional<Bytes> pendingEvent;
     std::optional<EventLedger> eventLedger;
     std::optional<ArchiveMigration> migration;
+    std::optional<Enrollment> enrollment;
 };
 [[noreturn]] void fail(JournalCode code) { throw JournalError(code); }
 bool sameConfirmation(const Token &a, const Token &b) noexcept {
     return sodium_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+Token randomJoinToken() {
+    const auto random = crypto::random(Token{}.size());
+    Token token{};
+    std::copy(random.begin(), random.end(), token.begin());
+    if (token == Token{}) fail(JournalCode::Enrollment);
+    return token;
 }
 EventLedger &eventLedger(Log &log, std::uint64_t generation) {
     if (!log.eventLedger) log.eventLedger = EventLedger{generation, 0, false, {}};
@@ -95,10 +107,12 @@ void field(Bytes &out, const Bytes &bytes) {
 Bytes encode(const Log &log, const Token &pins) {
     if (!log.initial || log.watermark < log.initial || log.entries.size() > TrustJournal::MaxOperations ||
         log.deliveries.size() > MaxMembers || log.allocatedSequence > history::MaxSequence ||
-        (!log.allocatedSequence && log.pendingEvent))
+        (!log.allocatedSequence && log.pendingEvent) ||
+        (log.enrollment && (!log.eventLedger || log.migration)))
         fail(JournalCode::Invalid);
     const bool lifecycle = !log.deliveries.empty() || !log.installed.empty();
-    const auto version = log.migration ? 6 : (log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1)));
+    const auto version = log.enrollment ? 7 : (log.migration ? 6 :
+        (log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1))));
     Bytes out; domain(out, JournalDomain); u32(out, version); append(out, pins);
     u64(out, log.initial); u64(out, log.watermark);
     u32(out, static_cast<std::uint32_t>(log.entries.size()));
@@ -137,6 +151,10 @@ Bytes encode(const Log &log, const Token &pins) {
         append(out, log.migration->confirmation);
         u64(out, log.migration->sequence);
         out.push_back(log.migration->completed ? 1 : 0);
+    }
+    if (log.enrollment) {
+        append(out, log.enrollment->request);
+        append(out, log.enrollment->acceptedIntent);
     }
     return out;
 }
@@ -189,7 +207,7 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
     if (bytes.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
     Reader reader(bytes); reader.expect(JournalDomain);
     const auto version = reader.number32();
-    if (version < 1 || version > 6) fail(JournalCode::Invalid);
+    if (version < 1 || version > 7) fail(JournalCode::Invalid);
     if (reader.token() != pins) fail(JournalCode::WrongPins);
     Log log; log.initial = reader.number64(); log.watermark = reader.number64();
     const auto count = reader.number32();
@@ -258,6 +276,12 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
             fail(JournalCode::Invalid);
         log.migration = ArchiveMigration{confirmation, sequence, completed != 0};
     }
+    if (version == 7) {
+        const auto request = reader.token();
+        const auto acceptedIntent = reader.token();
+        if (request == Token{}) fail(JournalCode::Invalid);
+        log.enrollment = Enrollment{request, acceptedIntent};
+    }
     if (!reader.done()) fail(JournalCode::Invalid);
     return log;
 }
@@ -266,6 +290,9 @@ const Member &member(const State &state, const Token &id) {
         [&](const Member &candidate) { return candidate.id == id; });
     if (found == state.members.end()) throw Error(ErrorCode::NotMember);
     return *found;
+}
+bool hasIdentity(const std::vector<Member> &members, const Token &id) {
+    return std::any_of(members.begin(), members.end(), [&](const Member &m) { return m.id == id; });
 }
 Proposal currentProposal(const Log &log, const Membership &membership) {
     if (membership.forked()) throw Error(ErrorCode::Forked);
@@ -332,6 +359,7 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
     const auto claimed = log.installed.empty() ? std::nullopt
         : std::optional<KeyEnvelopeContext>(KeyEnvelopeCodec::inspect(log.installed));
     std::optional<EnvelopeAuthority> proof;
+    bool acceptedJoin = false;
     std::uint64_t watermark = log.initial;
     for (const auto &entry : log.entries) {
         if (!entry.now) fail(JournalCode::Invalid);
@@ -344,6 +372,13 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
             const auto result = membership.observe(certificate, entry.now, verifier);
             if (result == ObserveResult::AlreadyKnown ||
                 (result == ObserveResult::Applied && entry.now < watermark)) fail(JournalCode::Invalid);
+            const auto &proposal = certificate.proposal;
+            if (log.enrollment && result == ObserveResult::Applied &&
+                proposal.operation == Operation::Add && proposal.subject.id == local.id) {
+                if (acceptedJoin || proposal.subject != local || proposal.request != log.enrollment->request ||
+                    proposalDigest(proposal) != log.enrollment->acceptedIntent) fail(JournalCode::Invalid);
+                acceptedJoin = true;
+            }
             if (claimed && result == ObserveResult::Applied && membership.current().digest == claimed->successor) {
                 proof = incoming(membership.current(), certificate.proposal, local, *claimed);
                 KeyEnvelopeCodec::verify(log.installed, proof->context, proof->sender);
@@ -352,6 +387,9 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
         watermark = std::max(watermark, entry.now);
     }
     if (log.watermark < watermark) fail(JournalCode::Invalid);
+    if (log.enrollment &&
+        (local.id == g.founder.id || acceptedJoin != (log.enrollment->acceptedIntent != Token{})))
+        fail(JournalCode::Invalid);
     if (claimed && (!proof || membership.forked() ||
         proof->context.generation != membership.current().keyGeneration ||
         proof->context.commitment != membership.current().keyCommitment ||
@@ -472,7 +510,7 @@ transaction::Record TrustJournal::initialRecord(const Genesis &g, const Member &
     if (!now) fail(JournalCode::ClockRollback);
     const auto pins = pin(g, local);
     transaction::Record record; record.schema = 2; record.binding = binding(g, local);
-    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}, {}, {}}, pins); return record;
+    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}, {}, {}, {}}, pins); return record;
 }
 void TrustJournal::initialize(state::FileStore &store, const Genesis &g, const Member &local, std::uint64_t now) {
     auto lease = store.lock(); if (!lease) fail(JournalCode::Busy);
@@ -520,7 +558,8 @@ JournalStatus TrustJournal::inspect() {
     const auto membership = replay(log, genesis_, local_);
     JournalStatus result{membership.current(), membership.forked(), log.watermark,
                          log.entries.size(), membership.reservationCount(), {}, !log.installed.empty(), {},
-                         log.allocatedSequence, {}, 0, 0, {}};
+                         log.allocatedSequence, {}, 0, 0, {}, false};
+    result.verifiedJoin = log.enrollment && log.enrollment->acceptedIntent != Token{};
     if (log.migration)
         result.migration = ArchiveMigrationStatus{log.migration->sequence, log.migration->completed};
     if (log.eventLedger) {
@@ -561,6 +600,90 @@ Approval TrustJournal::approve(const Proposal &proposal, const Identity &identit
     save(record, replacement);
     return {local_.id, identity.sign(approvalBytes(proposal, local_))};
 }
+
+JoinRequest TrustJournal::beginJoin(const Identity &applicant, std::uint64_t now) {
+    const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    const auto membership = replay(log, genesis_, local_);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    if (applicant.member() != local_) fail(JournalCode::WrongPins);
+    clock(log, now);
+    const auto &state = membership.current();
+    if (hasIdentity(state.members, local_.id) || hasIdentity(state.retired, local_.id) || log.migration)
+        fail(JournalCode::Enrollment);
+    if (!log.enrollment) {
+        log.enrollment = Enrollment{randomJoinToken(), {}};
+        (void)eventLedger(log, state.keyGeneration);
+    }
+    log.watermark = now;
+    auto replacement = record;
+    storeLog(replacement, log, pins);
+    save(record, replacement);
+    return {local_, log.enrollment->request};
+}
+
+Proposal TrustJournal::proposeJoin(const JoinRequest &request, std::uint64_t now, std::uint64_t expires) {
+    return propose(Operation::Add, request.applicant, request.request, randomJoinToken(), now, expires);
+}
+
+JoinReview TrustJournal::reviewJoin(const Proposal &proposal, const std::vector<Token> &approvers,
+                                   std::uint64_t now) {
+    const auto lease = lock(); const auto record = load();
+    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    clock(log, now);
+    if (!log.enrollment || log.enrollment->acceptedIntent != Token{}) fail(JournalCode::Enrollment);
+    return reviewJoinProposal(membership, proposal, {local_, log.enrollment->request}, approvers, now);
+}
+
+JoinReview TrustJournal::reviewJoinApproval(const Proposal &proposal, std::uint64_t now) {
+    const auto lease = lock(); const auto record = load();
+    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    clock(log, now);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
+    return trust::reviewJoinApproval(membership, proposal, local_, now);
+}
+
+ObserveResult TrustJournal::acceptJoin(const Certificate &certificate,
+                                      const std::vector<JoinConfirmation> &confirmations, std::uint64_t now) {
+    const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    auto membership = replay(log, genesis_, local_);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    clock(log, now);
+    if (!log.enrollment) fail(JournalCode::Enrollment);
+    const auto &proposal = certificate.proposal;
+    const auto wire = encodeCertificate(certificate);
+    const auto intent = proposalDigest(proposal);
+    if (intent == Token{}) fail(JournalCode::Enrollment);
+    const bool accepted = log.enrollment->acceptedIntent != Token{};
+    if (accepted) {
+        if (member(membership.current(), local_.id) != local_ || intent != log.enrollment->acceptedIntent ||
+            std::none_of(log.entries.begin(), log.entries.end(), [&](const Entry &entry) {
+                return entry.kind == Kind::Observe && entry.bytes == wire;
+            })) fail(JournalCode::Enrollment);
+    } else {
+        std::vector<Token> approvers;
+        approvers.reserve(certificate.approvals.size());
+        for (const auto &approval : certificate.approvals) approvers.push_back(approval.signer);
+        const auto review = reviewJoinProposal(membership, proposal, {local_, log.enrollment->request}, approvers, now);
+        verifyJoinConfirmations(review, confirmations);
+        if (membership.observe(certificate, now, SodiumVerifier{}) != ObserveResult::Applied)
+            fail(JournalCode::Enrollment);
+        add(log, Kind::Observe, now, wire);
+        log.enrollment->acceptedIntent = intent;
+        log.deliveries.clear();
+    }
+    // The accepted Add and its locally verified enrollment marker share one
+    // durability barrier. An exact retry confirms that barrier after reopen.
+    log.watermark = now;
+    auto replacement = record;
+    storeLog(replacement, log, pins);
+    save(record, replacement);
+    return accepted ? ObserveResult::AlreadyKnown : ObserveResult::Applied;
+}
+
 ObserveResult TrustJournal::observe(const Certificate &certificate, std::uint64_t now) {
     const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins); auto membership = replay(log, genesis_, local_);
@@ -568,6 +691,8 @@ ObserveResult TrustJournal::observe(const Certificate &certificate, std::uint64_
     const auto previousGeneration = membership.current().keyGeneration;
     const auto result = membership.observe(certificate, now, verifier);
     if (result == ObserveResult::AlreadyKnown) return result;
+    if (result == ObserveResult::Applied && log.enrollment && certificate.proposal.operation == Operation::Add &&
+        certificate.proposal.subject.id == local_.id) fail(JournalCode::Enrollment);
     if (result == ObserveResult::Applied) clock(log, now);
     else if (!now) fail(JournalCode::ClockRollback);
     add(log, Kind::Observe, now, encodeCertificate(certificate));
@@ -916,6 +1041,24 @@ std::vector<events::Envelope> transportEnvelopes(const std::vector<storage::Sign
 std::string_view eventBytes(const Bytes &wire) {
     return {reinterpret_cast<const char *>(wire.data()), wire.size()};
 }
+
+SignedEventHistory verifiedTransportHistory(const storage::Directory &transport, const Membership &membership,
+    const SyncKey &key, const Member &local, const Log &log, const EventLedger &ledger, events::Limits limits) {
+    const auto localDevice = SignedEventCodec::deviceName(local.id);
+    const auto folder = transport.openSignedEvents(eventScope(membership.current()));
+    const auto packets = folder->scan({limits});
+    std::string attemptedId;
+    std::string_view attemptedWire;
+    if (ledger.publicationAttempted) {
+        attemptedId = history::makeId(localDevice, log.allocatedSequence);
+        attemptedWire = eventBytes(*log.pendingEvent);
+    }
+    const auto input = transportEnvelopes(packets, ledger, localDevice, attemptedId, attemptedWire);
+    if (ledger.publicationAttempted &&
+        std::none_of(packets.begin(), packets.end(), [&](const auto &packet) { return packet.id == attemptedId; }))
+        fail(JournalCode::EventPublication);
+    return authenticateHistory(membership, key, input, limits, true);
+}
 } // namespace
 
 SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
@@ -936,21 +1079,8 @@ SignedEventHistory TrustJournal::scanClipboardEvents(const SyncKey &key, const s
     const auto membership = replay(log, genesis_, local_);
     const auto &state = clipboardAuthority(log, membership, genesis_, local_, key, now);
     if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
-    const auto localDevice = SignedEventCodec::deviceName(local_.id);
     auto &ledger = eventLedger(log, state.keyGeneration);
-    const auto folder = transport.openSignedEvents(eventScope(state));
-    const auto packets = folder->scan({limits});
-    std::string attemptedId;
-    std::string_view attemptedWire;
-    if (ledger.publicationAttempted) {
-        attemptedId = history::makeId(localDevice, log.allocatedSequence);
-        attemptedWire = eventBytes(*log.pendingEvent);
-    }
-    const auto input = transportEnvelopes(packets, ledger, localDevice, attemptedId, attemptedWire);
-    if (ledger.publicationAttempted &&
-        std::none_of(packets.begin(), packets.end(), [&](const auto &packet) { return packet.id == attemptedId; }))
-        fail(JournalCode::EventPublication);
-    auto result = authenticateHistory(membership, key, input, limits, true);
+    auto result = verifiedTransportHistory(transport, membership, key, local_, log, ledger, limits);
     WipeEvents wipe{result.events};
     if (!result.wireDigests.empty()) {
         ledger.witnesses = result.wireDigests;
@@ -960,6 +1090,42 @@ SignedEventHistory TrustJournal::scanClipboardEvents(const SyncKey &key, const s
         save(record, replacement);
     }
     wipe.released = true;
+    return result;
+}
+
+JoinActivation TrustJournal::preflightJoinActivation(const Identity &applicant, const storage::Directory &transport,
+                                                      std::string profileBinding, std::uint64_t now) {
+    state::validateBinding(profileBinding);
+    const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    std::optional<EnvelopeAuthority> installed;
+    const auto membership = replay(log, genesis_, local_, &installed);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    if (applicant.member() != local_) fail(JournalCode::WrongPins);
+    clock(log, now);
+    if (!log.enrollment || log.enrollment->acceptedIntent == Token{} || log.pendingEvent)
+        fail(JournalCode::Enrollment);
+    if (!installed) fail(JournalCode::MissingKey);
+    const auto key = KeyEnvelopeCodec::open(log.installed, installed->context, installed->sender, applicant);
+    const auto &state = clipboardAuthority(log, membership, genesis_, local_, *key, now);
+    auto &ledger = eventLedger(log, state.keyGeneration);
+    auto verified = verifiedTransportHistory(transport, membership, *key, local_, log, ledger, {});
+    const WipeEvents wipe{verified.events};
+    const auto &tips = verified.graph.tips();
+    if (tips.size() != 1) fail(JournalCode::Enrollment);
+    const auto &id = tips.front();
+    const auto tip = std::find_if(verified.events.begin(), verified.events.end(),
+                                  [&](const auto &event) { return event.revision.id == id; });
+    if (tip == verified.events.end()) fail(JournalCode::Invalid);
+    auto snapshot = packed::decode(tip->items);
+    for (auto &item : snapshot) for (auto &field : item) crypto::wipe(field.second);
+    JoinActivation result{std::move(profileBinding), state.group, state.root, state.digest, local_.id,
+                          verified.wireDigests.at(id), state.keyGeneration, id};
+    ledger.witnesses = std::move(verified.wireDigests);
+    log.watermark = now;
+    auto replacement = record;
+    storeLog(replacement, log, pins);
+    save(record, replacement);
     return result;
 }
 

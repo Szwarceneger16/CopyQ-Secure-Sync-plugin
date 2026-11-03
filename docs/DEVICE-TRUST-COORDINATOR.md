@@ -2,12 +2,13 @@
 
 The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
 with real signatures, a local identity vault, durable approvals, signed key
-envelopes, durable recipient storage, file transport and signed clipboard event
-publication, and a read-only legacy archive migration source. Build them with
+envelopes, durable recipient storage, file transport, signed clipboard event
+publication, read-only legacy archive migration, and authenticated Join with
+activation preflight. Build them with
 `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. Product integration
-requires peer verification, cloud delivery, CopyQ profile activation,
-authenticated Join and recovery. The [protocol design](DEVICE-TRUST-PROTOCOL.md)
+requires native setup, cloud delivery, CopyQ profile activation and recovery.
+The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
 
@@ -166,8 +167,9 @@ already staged for it. The signed receipt commits to the envelope digest, both
 endpoints, the membership transition, generation, commitment and scope. The
 sender persists that receipt alongside the package until the head advances.
 Repeating a valid receipt for the same package is idempotent. A receipt is the
-authenticated recipient's assertion of storage. The honest implementation signs
-it after persistence. Authenticated CopyQ Join is a separate product milestone.
+authenticated recipient's assertion of storage. The implementation signs it
+after persistence. A live CopyQ Join acknowledgement requires the profile
+integration to apply the accepted snapshot.
 
 Version 1 and 2 journal records remain readable. When delivery fields exist,
 version 3 writes the usual event log followed by an outbound count (`u32BE`),
@@ -359,8 +361,58 @@ evidence, and an Add, rotation or detected fork blocks the pending migration.
 After finalization, ordinary enrollment can proceed. The source lease
 serializes local access to the private record. Legacy peers can still change
 files they control, and subsequent source changes can block a retry. Product
-integration still requires a trusted confirmation and setup wizard,
-authenticated Join, profile activation and cloud-client qualification.
+integration still requires native guided setup, profile activation and
+cloud-client qualification.
+
+## Authenticated Join and activation preflight
+
+The applicant journal uses independently trusted genesis pins and the
+applicant's full local vault identity. `beginJoin()` checks that the identity
+is eligible and persists a random 32-byte request before returning it. A
+reopened journal repeats the durability barrier before returning the same
+pending request. `proposeJoin()` binds that request to a fresh nonce and the
+approver's current parent. The applicant's previously accepted certificate
+chain supplies its view of the parent. Fresh admission uses a trusted clock and a live
+proposal deadline. Historical import with backdated acceptance is outside
+this flow.
+
+The optional terminal adapter uses trusted local input and output streams.
+It shows the group, genesis root, applicant, expiry and access consequences.
+`showJoinApplicantReview()` displays the intended approvers' comparison
+values on the applicant's screen before votes are signed.
+Each participant derives the full 256-bit comparison digest locally for the
+exact Add proposal and selected approver. The applicant enters the full
+comparison from each actual certificate signer after checking it against
+that signer's trusted screen or independent authenticated channel. The
+approver uses the same process before signing. Both accept 64 hex digits
+with optional fixed grouping. The adapter reads the clock again after the
+prompts. A cancelled or mismatched comparison submits no approval or Join.
+
+`acceptJoin()` rechecks the local request, current parent, exact signer set
+and quorum, full comparisons and certificate signatures. The accepted Add
+and its verified enrollment marker commit together under one journal lease.
+The journal can confirm the same accepted certificate after reopening
+without another Add. Ordinary certificate observation can retain valid fork
+evidence. An applicant with a pending request must use the verified path to
+accept its own Add. Low-level Add observations provide no verified Join
+marker for activation. The marker records the admission and current membership
+still governs access.
+
+Version 7 appends the 32-byte request and 32-byte accepted intent digest to
+the version 5 payload. An all-zero intent represents a request still
+awaiting admission. Version 6 remains the separate founder migration format.
+Replay checks the admission marker against the accepted Add in the log.
+
+`preflightJoinActivation()` requires the verified admission and reopens the
+sealed key package from the private journal for the current member and key
+generation. It authenticates the signed generation scope and its retained
+witnesses, requires exactly one tip, and validates that tip's packed CopyQ
+MIME data. The journal commits the observed packet digests before returning
+the profile binding, group, root, membership head, member ID, generation and
+exact tip ID and digest. The profile binding is a caller-selected label. The
+preflight does not open the native profile or inspect its local tab. Native
+activation still requires a guarded profile write and a live CopyQ Join
+acknowledgement. The terminal adapter is separate from CopyQ's settings UI.
 
 ## Clock and rollback limits
 
@@ -394,7 +446,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration|device_join)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,
@@ -408,6 +460,9 @@ loaded. The vault, envelope and delivery suites cover authenticated reopen,
 recipient and context substitution, key commitment checks and durable ciphertext
 retry. The receipt and lifecycle suites cover commit-before-sign, receipt
 substitution, catch-up, rotation, historical replay and encrypted disk reopen.
+The Join suite covers request durability, full peer comparisons, exact
+certificate retry, and signed-history preflight with synthetic clipboard
+data.
 Exact results belong to the implementing PR and current test run.
 
 Qualification still requires Windows/NTFS and Flatpak, physical power-loss

@@ -126,10 +126,10 @@ digest exclusively from attacker-supplied keys while ignoring the local identity
 Record the local confirmation for this exact digest and then reserve the signing
 intent. `TrustJournal::approve()` enforces this order in the optional laboratory:
 only after a durable Store commit may the signer receive the exact approval bytes.
-Its confirmed-digest parameter is a trusted local caller boundary, not a finished
-human-verification interface. The UI
-confirmation is a local trusted action, not a boolean supplied by a transport
-file. Two cloned signing identities count once. Separate keys enrolled on one
+Its confirmed-digest parameter is a trusted local caller boundary. The optional
+terminal setup adapter displays the full comparison and requires local input
+from each peer's trusted screen. Transport data supplies no confirmation.
+Two cloned signing identities count once. Separate keys enrolled on one
 physical host do not prove independent computers or protect against that OS's
 compromise; explain this boundary when presenting two-device protection.
 
@@ -308,11 +308,13 @@ for verification, granting access, changing launch/permissions, migration and
 destructive actions. Automatic discovery, validation and safe retry need no repeated
 prompt; they must not silently weaken the trust policy or CopyQ encryption.
 
-G1-G4 now have concrete choices and isolated implementations for membership,
-identity storage, signing, approvals and key envelopes. Remaining product work
-includes trusted-screen verification, durable originator-key preparation,
-cloud address discovery and delivery, CopyQ profile activation, acknowledged Join, recovery
-and platform qualification. Full disk/key rollback across restarts requires an external
+G1-G4 have concrete choices and isolated implementations for membership,
+identity storage, signing, approvals, key envelopes and locally verified
+enrollment. Activation preflight verifies the installed sealed package and the
+current signed history before producing readiness metadata. Product work still
+includes the native setup interface, durable originator-key preparation, cloud
+discovery, CopyQ profile activation, acknowledged Join, recovery and platform
+qualification. Full disk/key rollback across restarts requires an external
 monotonic anchor or explicit recovery policy. G5's signed event migration and
 G6-G7's installer/platform qualification still gate distribution. Advanced
 settings remain ordinary UI.

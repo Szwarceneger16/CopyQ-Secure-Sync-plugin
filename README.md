@@ -28,7 +28,7 @@ preserving post-crash edits, durable history witnesses and safe capacity limits.
 The [native settings panel](docs/NATIVE-SETTINGS.md) integrates device/recovery
 actions, live status with local-save evidence and explicitly copied redacted diagnostics.
 
-## Guided setup design (not implemented)
+## Guided setup design and laboratory
 
 The [stage-1 device trust design](docs/DEVICE-TRUST-DESIGN.md) specifies future
 peer-verified pairing, two-device approval after one-time bootstrap, equal device
@@ -41,8 +41,7 @@ RC installation and manual key transfer remain unchanged.
 The [stage-2 policy laboratory](docs/DEVICE-TRUST-MODEL.md) implements isolated,
 bounded membership validation and adversarial tests. Its
 [pairing protocol design](docs/DEVICE-TRUST-PROTOCOL.md) records concrete security
-decisions and remaining integration gates. It is not active in the plugin and
-does not yet provide a working pairing wizard or installer.
+decisions and remaining integration gates.
 
 The [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) exercises
 Ed25519 approvals, a local identity vault and signed key envelopes. A recipient
@@ -57,8 +56,12 @@ retry, and detects missing or substituted packets from earlier verified scans.
 The [archive migration laboratory](docs/DEVICE-TRUST-COORDINATOR.md#explicit-legacy-archive-migration)
 can seed a fresh signed group from the verified legacy tip while preserving
 the encrypted legacy state and history in place.
+The [Join laboratory](docs/DEVICE-TRUST-COORDINATOR.md#authenticated-join-and-activation-preflight)
+adds trusted terminal prompts for full peer comparison and an activation
+preflight over the installed key package and signed history. The preflight
+returns readiness metadata for a future profile integration.
 Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
-Product use requires guided setup, authenticated Join and CopyQ profile integration.
+Product use requires native guided setup and guarded CopyQ profile activation.
 
 ## Build and test pipeline
 
