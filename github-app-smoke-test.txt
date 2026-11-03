@@ -1,0 +1,1 @@
+GitHub App write-access smoke test.
