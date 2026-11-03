@@ -54,8 +54,11 @@ through the native file transport. Signed clipboard packets use separate
 generation directories and author-specific encryption keys. The private
 journal bounds encryption attempts, retains exact packets for publication
 retry, and detects missing or substituted packets from earlier verified scans.
+The [archive migration laboratory](docs/DEVICE-TRUST-COORDINATOR.md#explicit-legacy-archive-migration)
+can seed a fresh signed group from the verified legacy tip while preserving
+the encrypted legacy state and history in place.
 Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
-Product use requires guided setup, archive migration and CopyQ profile integration.
+Product use requires guided setup, authenticated Join and CopyQ profile integration.
 
 ## Build and test pipeline
 

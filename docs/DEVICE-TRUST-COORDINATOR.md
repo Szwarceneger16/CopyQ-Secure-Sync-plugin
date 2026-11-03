@@ -3,7 +3,7 @@
 The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
 with real signatures, a local identity vault, durable approvals, signed key
 envelopes, durable recipient storage, file transport and signed clipboard event
-publication. Build them with
+publication, and a read-only legacy archive migration source. Build them with
 `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. Product integration
 requires peer verification, cloud delivery, CopyQ profile activation,
@@ -242,7 +242,7 @@ count if the first commit persisted. Resume and publication reuse ciphertext.
 An occupied reservation blocks new preparation. The journal retains ciphertext
 and ciphertext digests.
 
-Existing payload versions 1–4 remain readable. Version 4 added the sequence as
+Existing payload versions 1–5 remain readable. Version 4 added the sequence as
 `u64BE`, a one-byte reservation flag, and a `u32BE` packet length followed by
 the exact packet. A clear flag requires zero length. A set flag with zero length
 marks an allocated sequence without a recoverable packet. Version 5 keeps that
@@ -308,9 +308,59 @@ returning decoded items. The evidence survives restart and detects omissions
 and substitutions that contradict earlier verified scans. A service can still
 withhold events or membership changes that the client has never seen.
 
-This remains an isolated laboratory path. CopyQ profile integration, explicit
-legacy archive migration and real cloud-client delivery qualification remain
-open.
+### Explicit legacy archive migration
+
+`previewLegacyMigration()` computes a confirmation for a verified legacy
+archive and a pinned successor. The source Store lease stays held while
+reading the authenticated private record and scanning the legacy transport.
+The source must have a schema 6 private record with the expected binding and
+legacy key identity, one accepted tip and a complete witness map. The scan
+must match every retained witness and the accepted head, with the head as its
+sole tip. The source must have no pending import, publication or resolution.
+The decoded MIME snapshot of the accepted tip must equal both the saved head
+snapshot and the local checkpoint. The source is read-only throughout.
+
+The confirmation uses a domain-separated HMAC key derived from the legacy
+key. It binds the canonical logical source record and every authenticated
+legacy event fingerprint, ordered by ID, to the successor group, genesis root,
+key generation, key commitment and founder identity. The digest stays local
+and requires explicit authorization from the trusted caller. It grants no
+membership or Join authority. The successor starts with an unused founder
+journal at epoch zero in generation zero, a separate synchronization key and
+an empty, provisioned signed scope. A preexisting membership approval
+reservation prevents migration from starting. Before reserving the first
+sequence, the migration checks the Seed payload against the 2 MiB signed
+packet limit.
+
+`migrateLegacyArchive()` revalidates the source and confirmation while holding
+both the source and successor leases. It durably binds the migration intent
+to a reserved sequence, seals the accepted tip as one parentless v2 packet,
+and commits the exact ciphertext. It then records the publication attempt
+before the immutable write. Finalization retains the packet witness and marks
+the migration complete in the same journal commit. The original encrypted
+archive and private state stay in place. The signed successor starts with a
+snapshot of the verified tip. Its remote readers authenticate that new packet
+under the successor membership rules.
+
+Journal payload version 6 appends a 32-byte confirmation MAC, the migration
+sequence as `u64BE` and a one-byte completion flag to the version 5 payload.
+`inspect()` reports the sequence and completion status. A retry checks the
+same source proof again. If the reservation commit persisted without a packet,
+the retry burns a fresh sequence and encryption attempt. Once the packet is
+durably staged, the retry uses its exact bytes. An ambiguous final commit can
+be reconciled against the retained witness. While migration is pending,
+ordinary preparation, resume, scan, publication and discard cannot bypass
+the intent.
+
+An incomplete migration requires the founder-only genesis state at every
+attempt. Local membership approval and outbound key delivery remain blocked
+until finalization. The journal can still observe valid external membership
+evidence, and an Add, rotation or detected fork blocks the pending migration.
+After finalization, ordinary enrollment can proceed. The source lease
+serializes local access to the private record. Legacy peers can still change
+files they control, and subsequent source changes can block a retry. Product
+integration still requires a trusted confirmation and setup wizard,
+authenticated Join, profile activation and cloud-client qualification.
 
 ## Clock and rollback limits
 
@@ -344,7 +394,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,

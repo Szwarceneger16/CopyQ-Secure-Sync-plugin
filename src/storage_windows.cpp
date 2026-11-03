@@ -473,8 +473,9 @@ void Directory::Impl::publishPacket(const Pinned &dir, const std::wstring &name,
     }
 
     const auto source = child(stagingRoot.folder(), temporaryName());
+    auto attributes = security.attributes;
     Handle raw(CreateFileW(source.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL,
-                           FILE_SHARE_READ | FILE_SHARE_DELETE, &security.attributes, CREATE_NEW,
+                           FILE_SHARE_READ | FILE_SHARE_DELETE, &attributes, CREATE_NEW,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, nullptr));
     const auto initial = stamp(raw.get(), false);
     Staging staged{{std::move(raw), source, initial, false}};

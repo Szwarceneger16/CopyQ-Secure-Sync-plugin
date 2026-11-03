@@ -29,6 +29,8 @@ public:
     static constexpr std::uint32_t MaxAttemptsPerAuthorPerGeneration = 1U << 16;
 
     static void validateLimits(events::Limits limits);
+    // Check a prospective root payload before any sequence is reserved.
+    static void validateSeedPayload(const std::vector<std::string> &items, events::Limits limits = {});
     static std::string deviceName(const Token &author);
     static Token digest(std::string_view wire);
 

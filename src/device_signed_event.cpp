@@ -25,6 +25,8 @@ constexpr std::uint32_t LegacyVersion = 1;
 constexpr std::size_t DeviceSize = 32, IdSize = 45, MaxParents = 2;
 constexpr std::size_t NonceSize = 12, TagSize = 16, SignatureSize = Signature{}.size();
 constexpr std::size_t PayloadMinimum = sizeof(PayloadDomain) + 4;
+constexpr std::size_t WireOverhead = sizeof(WireDomain) + 4 + 5 * Token{}.size() + 2 * 8 +
+                                    IdSize + 1 + NonceSize + 4 + TagSize + SignatureSize;
 
 static_assert(crypto_auth_hmacsha256_KEYBYTES == SyncKey::Size && crypto_auth_hmacsha256_BYTES == 32,
               "Signed event key derivation sizes changed");
@@ -266,8 +268,13 @@ void checkPacked(std::string_view item) {
 
 // Uncompressed payload: domain, u32 count, then u32 length and canonical
 // base64 bytes for each item. The transaction layer validates MIME semantics.
-void encodePayload(WipedBytes &plain, const std::vector<std::string> &items, std::size_t sizeLimit, std::size_t itemLimit) {
-    if (items.size() > itemLimit || sizeLimit < PayloadMinimum) fail(EventError::SizeLimit, "Signed event exceeds payload budget");
+std::size_t payloadSize(const std::vector<std::string> &items, std::size_t parentCount, events::Limits limits) {
+    const auto overhead = WireOverhead + parentCount * (IdSize + Token{}.size());
+    const auto limit = wireLimit(limits);
+    if (!limits.events || overhead > limit) fail(EventError::SizeLimit, "Signed event exceeds wire budget");
+    const auto sizeLimit = std::min(plainLimit(limits), limit - overhead);
+    if (items.size() > limits.items || sizeLimit < PayloadMinimum)
+        fail(EventError::SizeLimit, "Signed event exceeds payload budget");
     std::size_t size = PayloadMinimum;
     for (const auto &item : items) {
         if (sizeLimit - size < 4 || item.size() > sizeLimit - size - 4)
@@ -275,7 +282,10 @@ void encodePayload(WipedBytes &plain, const std::vector<std::string> &items, std
         checkPacked(item);
         size += 4 + item.size();
     }
+    return size;
+}
 
+void encodePayload(WipedBytes &plain, const std::vector<std::string> &items, std::size_t size) {
     plain.value.reserve(size);
     domain(plain.value, PayloadDomain);
     u32(plain.value, static_cast<std::uint32_t>(items.size()));
@@ -347,6 +357,11 @@ SignedEventHeader SignedEventCodec::inspect(std::string_view wire, events::Limit
     return parse(wire, limits).header;
 }
 
+void SignedEventCodec::validateSeedPayload(const std::vector<std::string> &items, events::Limits limits) {
+    validateLimits(limits);
+    (void)payloadSize(items, 0, limits);
+}
+
 Bytes SignedEventCodec::seal(const SignedEventContext &context, const Identity &author, const SyncKey &key,
                              std::uint64_t sequence, const std::vector<SignedEventParent> &parents,
                              const std::vector<std::string> &packedItems, events::Limits limits) {
@@ -373,13 +388,10 @@ Bytes SignedEventCodec::seal(const SignedEventContext &context, const Identity &
         append(wire, parent.digest);
     }
 
-    const auto overhead = wire.size() + NonceSize + 4 + TagSize + SignatureSize;
-    const auto limit = wireLimit(limits);
-    if (!limits.events || overhead > limit) fail(EventError::SizeLimit, "Signed event exceeds wire budget");
     Bytes cipher;
     {
         WipedBytes plain;
-        encodePayload(plain, packedItems, std::min(plainLimit(limits), limit - overhead), limits.items);
+        encodePayload(plain, packedItems, payloadSize(packedItems, parents.size(), limits));
         const auto nonce = crypto::random(NonceSize);
         append(wire, nonce);
         u32(wire, static_cast<std::uint32_t>(plain.value.size() + TagSize));

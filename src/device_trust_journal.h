@@ -10,6 +10,7 @@ namespace cqs::storage { class Directory; }
 namespace cqs::trust {
 class Identity;
 class SyncKey;
+struct LegacyArchiveSource;
 enum class KeyScope : std::uint8_t;
 struct Genesis {
     Token group{};
@@ -18,7 +19,7 @@ struct Genesis {
 };
 enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy,
                          Delivery, KeyReuse, MissingKey, EventPending, EventReservation, EventBudget,
-                         EventPublication, HistoryChanged, EventVersion };
+                         EventPublication, HistoryChanged, EventVersion, Migration };
 class JournalError final : public std::runtime_error {
 public:
     explicit JournalError(JournalCode code);
@@ -36,6 +37,10 @@ struct PreparedClipboardEvent {
     std::uint64_t sequence;
     crypto::Bytes wire;
 };
+struct ArchiveMigrationStatus {
+    std::uint64_t sequence;
+    bool completed;
+};
 struct JournalStatus {
     State state;
     bool forked = false;
@@ -49,6 +54,7 @@ struct JournalStatus {
     std::optional<PendingClipboardEvent> pendingEvent;
     std::uint32_t eventEncryptionAttempts = 0;
     std::size_t eventWitnesses = 0;
+    std::optional<ArchiveMigrationStatus> migration;
 };
 struct SignedEventHistory {
     std::vector<events::Event> events;
@@ -67,7 +73,7 @@ public:
     static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxJournalBytes = MaxControlBytes + MaxClipboardEventBytes +
-                                                   30 + 77 * history::MaxEvents;
+                                                   71 + 77 * history::MaxEvents;
     TrustJournal(transaction::Store &store, Genesis genesis, Member local);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
@@ -132,10 +138,24 @@ public:
                                        const storage::Directory &transport, std::uint64_t trustedNow,
                                        ClipboardPublication mode = ClipboardPublication::Append,
                                        const std::filesystem::path &privateStaging = {});
+    // Read-only preview. A trusted local caller must confirm the exact digest
+    // before the source tip can become the fresh founder's signed Seed.
+    Token previewLegacyMigration(const LegacyArchiveSource &source, const SyncKey &successorKey,
+                                 std::uint64_t trustedNow);
+    std::string migrateLegacyArchive(const LegacyArchiveSource &source, const Token &confirmed,
+                                     const Identity &founder, const SyncKey &successorKey,
+                                     const storage::Directory &successor, std::uint64_t trustedNow,
+                                     const std::filesystem::path &privateStaging = {});
     // Pure laboratory validator. Caller-supplied input grants no authority.
     SignedEventHistory readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
                                          std::uint64_t trustedNow, events::Limits limits = {});
 private:
+    PreparedClipboardEvent prepareClipboardEventLocked(const Identity &author, const SyncKey &key,
+        const std::vector<SignedEventParent> &parents, const std::vector<std::string> &packedItems,
+        std::uint64_t now, events::Limits limits, const Token *migration = nullptr);
+    std::string publishClipboardEventLocked(std::uint64_t sequence, const SyncKey &key,
+        const storage::Directory &transport, std::uint64_t now, ClipboardPublication mode,
+        const std::filesystem::path &privateStaging, const Token *migration = nullptr);
     crypto::Bytes prepare(const Token &recipient, const Identity &sender, const SyncKey &key,
                          std::uint64_t now, KeyScope scope);
     std::unique_ptr<transaction::Store::Lease> lock();

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "device_trust_journal.h"
+#include "device_archive_migration.h"
 #include "device_identity.h"
 #include "device_key_envelope.h"
 #include "device_key_receipt.h"
@@ -29,6 +30,11 @@ struct EventLedger {
     bool publicationAttempted = false;
     Witnesses witnesses;
 };
+struct ArchiveMigration {
+    Token confirmation;
+    std::uint64_t sequence;
+    bool completed;
+};
 struct Log {
     std::uint64_t initial = 0, watermark = 0;
     std::vector<Entry> entries;
@@ -37,8 +43,12 @@ struct Log {
     std::uint64_t allocatedSequence = 0;
     std::optional<Bytes> pendingEvent;
     std::optional<EventLedger> eventLedger;
+    std::optional<ArchiveMigration> migration;
 };
 [[noreturn]] void fail(JournalCode code) { throw JournalError(code); }
+bool sameConfirmation(const Token &a, const Token &b) noexcept {
+    return sodium_memcmp(a.data(), b.data(), a.size()) == 0;
+}
 EventLedger &eventLedger(Log &log, std::uint64_t generation) {
     if (!log.eventLedger) log.eventLedger = EventLedger{generation, 0, false, {}};
     return *log.eventLedger;
@@ -88,7 +98,7 @@ Bytes encode(const Log &log, const Token &pins) {
         (!log.allocatedSequence && log.pendingEvent))
         fail(JournalCode::Invalid);
     const bool lifecycle = !log.deliveries.empty() || !log.installed.empty();
-    const auto version = log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1));
+    const auto version = log.migration ? 6 : (log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1)));
     Bytes out; domain(out, JournalDomain); u32(out, version); append(out, pins);
     u64(out, log.initial); u64(out, log.watermark);
     u32(out, static_cast<std::uint32_t>(log.entries.size()));
@@ -122,6 +132,11 @@ Bytes encode(const Log &log, const Token &pins) {
         out.push_back(ledger.publicationAttempted ? 1 : 0);
         u32(out, static_cast<std::uint32_t>(ledger.witnesses.size()));
         for (const auto &[id, digest] : ledger.witnesses) { append(out, id); append(out, digest); }
+    }
+    if (log.migration) {
+        append(out, log.migration->confirmation);
+        u64(out, log.migration->sequence);
+        out.push_back(log.migration->completed ? 1 : 0);
     }
     return out;
 }
@@ -174,7 +189,7 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
     if (bytes.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
     Reader reader(bytes); reader.expect(JournalDomain);
     const auto version = reader.number32();
-    if (version < 1 || version > 5) fail(JournalCode::Invalid);
+    if (version < 1 || version > 6) fail(JournalCode::Invalid);
     if (reader.token() != pins) fail(JournalCode::WrongPins);
     Log log; log.initial = reader.number64(); log.watermark = reader.number64();
     const auto count = reader.number32();
@@ -215,7 +230,7 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
         if (pending) log.pendingEvent = std::move(wire);
         else if (!wire.empty()) fail(JournalCode::Invalid);
     }
-    if (version == 5) {
+    if (version >= 5) {
         EventLedger ledger{reader.number64(), reader.number32(), false, {}};
         const auto attempted = reader.byte();
         const auto witnessCount = reader.number32();
@@ -232,6 +247,16 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
             ledger.witnesses.emplace(std::move(id), reader.token());
         }
         log.eventLedger = std::move(ledger);
+    }
+    if (version == 6) {
+        const auto confirmation = reader.token();
+        const auto sequence = reader.number64();
+        const auto completed = reader.byte();
+        if (confirmation == Token{} || !sequence || sequence > log.allocatedSequence || completed > 1 ||
+            (!completed && (!log.pendingEvent || sequence != log.allocatedSequence)) ||
+            (completed && log.pendingEvent && sequence == log.allocatedSequence))
+            fail(JournalCode::Invalid);
+        log.migration = ArchiveMigration{confirmation, sequence, completed != 0};
     }
     if (!reader.done()) fail(JournalCode::Invalid);
     return log;
@@ -296,6 +321,9 @@ SignedEventContext verifyPendingEvent(const Log &log, const Membership &membersh
     if (log.eventLedger && log.eventLedger->publicationAttempted &&
         (header.version != SignedEventCodec::CurrentVersion || state->keyGeneration != log.eventLedger->generation))
         fail(JournalCode::Invalid);
+    if (log.migration && !log.migration->completed &&
+        (header.version != SignedEventCodec::CurrentVersion || state->keyGeneration || !header.parents.empty()))
+        fail(JournalCode::Invalid);
     return header.context;
 }
 Membership replay(const Log &log, const Genesis &g, const Member &local,
@@ -342,6 +370,13 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
     }
     if (log.eventLedger && log.eventLedger->generation != membership.current().keyGeneration)
         fail(JournalCode::Invalid);
+    if (log.migration) {
+        if (local != g.founder) fail(JournalCode::Invalid);
+        if (log.migration->completed && !membership.current().keyGeneration &&
+            !log.eventLedger->witnesses.count(history::makeId(SignedEventCodec::deviceName(local.id),
+                                                               log.migration->sequence)))
+            fail(JournalCode::Invalid);
+    }
     if (log.pendingEvent && !log.pendingEvent->empty()) {
         const auto context = verifyPendingEvent(log, membership, local);
         if (pendingGeneration) *pendingGeneration = context.generation;
@@ -437,7 +472,7 @@ transaction::Record TrustJournal::initialRecord(const Genesis &g, const Member &
     if (!now) fail(JournalCode::ClockRollback);
     const auto pins = pin(g, local);
     transaction::Record record; record.schema = 2; record.binding = binding(g, local);
-    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}, {}}, pins); return record;
+    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}, {}, {}}, pins); return record;
 }
 void TrustJournal::initialize(state::FileStore &store, const Genesis &g, const Member &local, std::uint64_t now) {
     auto lease = store.lock(); if (!lease) fail(JournalCode::Busy);
@@ -485,7 +520,9 @@ JournalStatus TrustJournal::inspect() {
     const auto membership = replay(log, genesis_, local_);
     JournalStatus result{membership.current(), membership.forked(), log.watermark,
                          log.entries.size(), membership.reservationCount(), {}, !log.installed.empty(), {},
-                         log.allocatedSequence, {}, 0, 0};
+                         log.allocatedSequence, {}, 0, 0, {}};
+    if (log.migration)
+        result.migration = ArchiveMigrationStatus{log.migration->sequence, log.migration->completed};
     if (log.eventLedger) {
         result.eventEncryptionAttempts = log.eventLedger->attempts;
         result.eventWitnesses = log.eventLedger->witnesses.size();
@@ -512,6 +549,7 @@ Approval TrustJournal::approve(const Proposal &proposal, const Identity &identit
                               const Token &confirmedDigest, std::uint64_t now) {
     const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins); auto membership = replay(log, genesis_, local_);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (identity.member() != local_) fail(JournalCode::WrongPins);
     valid(proposal.subject); clock(log, now);
     if (verificationDigest(proposal, local_) != confirmedDigest) fail(JournalCode::Confirmation);
@@ -552,6 +590,7 @@ Bytes TrustJournal::prepare(const Token &recipient, const Identity &sender, cons
                             std::uint64_t now, KeyScope scope) {
     const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins); const auto membership = replay(log, genesis_, local_);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (sender.member() != local_) fail(JournalCode::WrongPins);
     clock(log, now);
     const auto proposal = currentProposal(log, membership);
@@ -633,6 +672,7 @@ std::string TrustJournal::publishDelivery(const Token &recipient, const storage:
                                          std::uint64_t now, const std::filesystem::path &privateStaging) {
     const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins); const auto membership = replay(log, genesis_, local_);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (membership.forked()) throw Error(ErrorCode::Forked);
     clock(log, now);
     const auto delivery = log.deliveries.find(recipient);
@@ -676,9 +716,16 @@ PreparedClipboardEvent TrustJournal::prepareClipboardEvent(const Identity &autho
                                                             const std::vector<SignedEventParent> &parents,
                                                             const std::vector<std::string> &packedItems,
                                                             std::uint64_t now, events::Limits limits) {
+    const auto lease = lock();
+    return prepareClipboardEventLocked(author, key, parents, packedItems, now, limits);
+}
+
+PreparedClipboardEvent TrustJournal::prepareClipboardEventLocked(const Identity &author, const SyncKey &key,
+    const std::vector<SignedEventParent> &parents, const std::vector<std::string> &packedItems,
+    std::uint64_t now, events::Limits limits, const Token *migration) {
     SignedEventCodec::validateLimits(limits);
     limits.eventBytes = std::min(limits.eventBytes, MaxClipboardEventBytes);
-    const auto lease = lock(); const auto record = load();
+    const auto record = load();
     const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins);
     const auto membership = replay(log, genesis_, local_);
@@ -689,7 +736,10 @@ PreparedClipboardEvent TrustJournal::prepareClipboardEvent(const Identity &autho
     if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
     (void)eventAuthors(state);
     checkEventKey(log, genesis_, state, key);
-    if (log.pendingEvent) fail(JournalCode::EventPending);
+    if (log.migration && !log.migration->completed &&
+        (!migration || !sameConfirmation(*migration, log.migration->confirmation))) fail(JournalCode::Migration);
+    if (log.pendingEvent && (!migration || !log.migration || !log.pendingEvent->empty()))
+        fail(JournalCode::EventPending);
     auto &ledger = eventLedger(log, state.keyGeneration);
     if (ledger.attempts == SignedEventCodec::MaxAttemptsPerAuthorPerGeneration) fail(JournalCode::EventBudget);
     // Leave room for both commits, a recovery barrier, and explicit retirement.
@@ -699,6 +749,7 @@ PreparedClipboardEvent TrustJournal::prepareClipboardEvent(const Identity &autho
     const auto sequence = ++log.allocatedSequence;
     ++ledger.attempts;
     log.pendingEvent.emplace();
+    if (migration) log.migration = ArchiveMigration{*migration, sequence, false};
     log.watermark = now;
     auto burned = record;
     storeLog(burned, log, pins);
@@ -725,6 +776,7 @@ PreparedClipboardEvent TrustJournal::resumeClipboardEvent(std::uint64_t sequence
     if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
     if (!log.pendingEvent || log.pendingEvent->empty() || sequence != log.allocatedSequence)
         fail(JournalCode::EventReservation);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (pendingGeneration != state.keyGeneration) throw Error(ErrorCode::Stale);
     (void)eventAuthors(state);
     if (record.generation >= std::numeric_limits<std::uint64_t>::max() - 1) throw Error(ErrorCode::Overflow);
@@ -745,6 +797,7 @@ void TrustJournal::discardClipboardEvent(std::uint64_t sequence, std::uint64_t n
     (void)replay(log, genesis_, local_);
     clock(log, now);
     if (!log.pendingEvent || sequence != log.allocatedSequence) fail(JournalCode::EventReservation);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (log.eventLedger && log.eventLedger->publicationAttempted) fail(JournalCode::EventPublication);
     log.pendingEvent.reset();
     log.watermark = now;
@@ -882,6 +935,7 @@ SignedEventHistory TrustJournal::scanClipboardEvents(const SyncKey &key, const s
     auto log = decode(record, binding_, pins);
     const auto membership = replay(log, genesis_, local_);
     const auto &state = clipboardAuthority(log, membership, genesis_, local_, key, now);
+    if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     const auto localDevice = SignedEventCodec::deviceName(local_.id);
     auto &ledger = eventLedger(log, state.keyGeneration);
     const auto folder = transport.openSignedEvents(eventScope(state));
@@ -912,12 +966,27 @@ SignedEventHistory TrustJournal::scanClipboardEvents(const SyncKey &key, const s
 std::string TrustJournal::publishClipboardEvent(std::uint64_t sequence, const SyncKey &key,
                                                 const storage::Directory &transport, std::uint64_t now,
                                                 ClipboardPublication mode, const std::filesystem::path &privateStaging) {
-    const auto lease = lock(); const auto record = load();
+    const auto lease = lock();
+    return publishClipboardEventLocked(sequence, key, transport, now, mode, privateStaging);
+}
+
+std::string TrustJournal::publishClipboardEventLocked(std::uint64_t sequence, const SyncKey &key,
+    const storage::Directory &transport, std::uint64_t now, ClipboardPublication mode,
+    const std::filesystem::path &privateStaging, const Token *migration) {
+    const auto record = load();
     const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins);
     std::uint64_t pendingGeneration = 0;
     const auto membership = replay(log, genesis_, local_, nullptr, &pendingGeneration);
     const auto &state = clipboardAuthority(log, membership, genesis_, local_, key, now);
+    if (migration) {
+        if (!log.migration || !sameConfirmation(log.migration->confirmation, *migration) ||
+            log.migration->sequence != sequence || state.keyGeneration || mode != ClipboardPublication::Seed ||
+            (!log.migration->completed && state.epoch))
+            fail(JournalCode::Migration);
+    } else if (log.migration && (!log.migration->completed || log.migration->sequence == sequence)) {
+        fail(JournalCode::Migration);
+    }
     const auto localDevice = SignedEventCodec::deviceName(local_.id);
     if (!sequence || sequence > log.allocatedSequence) fail(JournalCode::EventReservation);
     const auto id = history::makeId(localDevice, sequence);
@@ -967,10 +1036,65 @@ std::string TrustJournal::publishClipboardEvent(std::uint64_t sequence, const Sy
         ledger.witnesses = std::move(verified.wireDigests);
         ledger.publicationAttempted = false;
         log.pendingEvent.reset();
+        if (migration) log.migration->completed = true;
         auto finished = attempted;
         storeLog(finished, log, pins);
         save(attempted, finished);
     }
     return id;
+}
+
+namespace {
+Token migrationConfirmation(const VerifiedLegacyArchive &archive, const LegacyArchiveSource &source,
+    const Log &log, const Membership &membership, const Genesis &genesis, const Member &local,
+    const SyncKey &key, std::uint64_t now) {
+    const auto &state = clipboardAuthority(log, membership, genesis, local, key, now);
+    if (local != genesis.founder || state.keyGeneration ||
+        ((!log.migration || !log.migration->completed) && state.epoch) ||
+        (!log.migration && (!log.entries.empty() || log.allocatedSequence ||
+                            (log.eventLedger && !log.eventLedger->witnesses.empty()))))
+        fail(JournalCode::Migration);
+    if (key.sameKey(*SyncKey::import(source.legacyKey))) fail(JournalCode::Migration);
+    const auto confirmation = archive.confirmation(eventContext(state, local.id));
+    if (confirmation == Token{} || (log.migration && !sameConfirmation(log.migration->confirmation, confirmation)))
+        fail(JournalCode::Migration);
+    if (!log.migration || (log.pendingEvent && log.pendingEvent->empty())) {
+        events::Limits limits;
+        limits.eventBytes = TrustJournal::MaxClipboardEventBytes;
+        SignedEventCodec::validateSeedPayload(archive.packedItems(), limits);
+    }
+    return confirmation;
+}
+} // namespace
+
+Token TrustJournal::previewLegacyMigration(const LegacyArchiveSource &source, const SyncKey &key,
+                                          std::uint64_t now) {
+    const VerifiedLegacyArchive archive(source);
+    const auto lease = lock();
+    const auto log = decode(load(), binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    return migrationConfirmation(archive, source, log, membership, genesis_, local_, key, now);
+}
+
+std::string TrustJournal::migrateLegacyArchive(const LegacyArchiveSource &source, const Token &confirmed,
+    const Identity &founder, const SyncKey &key, const storage::Directory &successor, std::uint64_t now,
+    const std::filesystem::path &privateStaging) {
+    const VerifiedLegacyArchive archive(source);
+    const auto lease = lock();
+    const auto log = decode(load(), binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    if (founder.member() != local_) fail(JournalCode::WrongPins);
+    if (!sameConfirmation(migrationConfirmation(archive, source, log, membership, genesis_, local_, key, now), confirmed))
+        fail(JournalCode::Confirmation);
+    successor.checkPublicationStaging(privateStaging);
+    if (!log.migration && !successor.openSignedEvents(eventScope(membership.current()))->scan().empty())
+        fail(JournalCode::Migration);
+
+    const bool needsPacket = !log.migration || (log.pendingEvent && log.pendingEvent->empty());
+    const auto sequence = needsPacket
+        ? prepareClipboardEventLocked(founder, key, {}, archive.packedItems(), now, {}, &confirmed).sequence
+        : log.migration->sequence;
+    return publishClipboardEventLocked(sequence, key, successor, now, ClipboardPublication::Seed,
+                                       privateStaging, &confirmed);
 }
 } // namespace cqs::trust
