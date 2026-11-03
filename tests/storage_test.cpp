@@ -138,6 +138,57 @@ int main(int argc, char **argv) {
         Temp t; fs::create_directory(t.device); CHECK(::mkfifo(t.event.c_str(), 0600) == 0);
         Directory d(t.root); bad(ErrorCode::UnsafeEntry, [&] { d.scan(key); });
     });
+    test("control packet staging failure leaves no named file", [] {
+        Temp t;
+        const auto control = t.root / "control";
+        fs::create_directory(control);
+        const Directory d(t.root);
+        const cqs::crypto::Bytes packet{0x00, 0x80, 0xff, 0x42};
+        on(Point::PublishReady, [&] {
+            CHECK(fs::is_empty(control));
+            throw Error(ErrorCode::Io, "Injected control staging failure");
+        });
+        bad(ErrorCode::Io, [&] { d.publishControl(packet); });
+        CHECK(fs::is_empty(control));
+    });
+    test("control packet post-link fault preserves exact bytes for confirmation", [] {
+        Temp t;
+        const auto control = t.root / "control";
+        fs::create_directory(control);
+        const Directory d(t.root);
+        const cqs::crypto::Bytes packet{0x00, 0x80, 0xff, 0x42};
+        const auto id = cqs::storage::controlPacketId(packet);
+        const auto path = control / (id + ".cqc");
+        on(Point::PublishLinked, [&] {
+            CHECK(fs::exists(path));
+            throw Error(ErrorCode::Io, "Injected control publication barrier failure");
+        });
+        bad(ErrorCode::PublishedUnconfirmed, [&] { d.publishControl(packet); });
+        CHECK(d.readControl(id) == packet);
+        struct stat before{}, after{};
+        CHECK(::lstat(path.c_str(), &before) == 0);
+        bool confirmed = false;
+        on(Point::FilePinned, [&] { confirmed = true; });
+        d.publishControl(packet);
+        CHECK(confirmed);
+        CHECK(::lstat(path.c_str(), &after) == 0);
+        CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
+        CHECK(d.readControl(id) == packet);
+    });
+    test("control packet publication cannot overwrite a competing name", [] {
+        Temp t;
+        const auto control = t.root / "control";
+        fs::create_directory(control);
+        const Directory d(t.root);
+        const cqs::crypto::Bytes packet{0x00, 0x80, 0xff, 0x42};
+        const auto id = cqs::storage::controlPacketId(packet);
+        const auto path = control / (id + ".cqc");
+        const std::string conflicting(packet.size(), 'x');
+        on(Point::PublishReady, [&] { write(path, conflicting); });
+        bad(ErrorCode::Changed, [&] { d.publishControl(packet); });
+        CHECK(read(path) == conflicting);
+        bad(ErrorCode::Changed, [&] { d.readControl(id); });
+    });
     test("UNIX socket is rejected without opening its content", [] {
         Temp t; fs::create_directory(t.device); int s = ::socket(AF_UNIX, SOCK_STREAM, 0); CHECK(s >= 0);
         sockaddr_un address{}; address.sun_family = AF_UNIX;

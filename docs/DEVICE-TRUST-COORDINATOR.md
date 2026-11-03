@@ -2,9 +2,10 @@
 
 The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
 with real signatures, a local identity vault, durable approvals, signed key
-envelopes and durable recipient storage. Build them with `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
+envelopes, durable recipient storage and file transport. Build them with
+`BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. Product integration
-requires peer verification, transport publication, CopyQ profile activation,
+requires peer verification, cloud delivery, CopyQ profile activation,
 authenticated Join and recovery. The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
@@ -134,8 +135,9 @@ envelope against current membership and the sender's pinned identity. A retry
 commits the same bytes again before returning them, including when the prior
 commit reported an uncertain result. Advancing the head or observing a fork
 clears staged envelopes and their receipts while retaining membership evidence.
-Publication must recheck the head under a live guard because a returned package
-can outlive the lease. A peer can enforce the revocations and forks it observes.
+`publishDelivery()` rechecks the head under a live lease because a prepared
+package can outlive the lease that staged it. A peer can enforce the revocations
+and forks it observes.
 
 ## Recipient installation and receipts
 
@@ -172,6 +174,40 @@ entries require nonempty envelopes and at most 32 recipients. A version 3
 record requires at least one outbound envelope or an installed package. Each
 field is bounded to 4,096 bytes and the entire journal to 2 MiB.
 
+## Bounded file transport
+
+Provision a dedicated `control/` child alongside `events/` under the existing
+transport root. Control addresses are 64 lowercase hexadecimal characters, the
+SHA-256 digest of the exact packet. The transport stores `<address>.cqc` files
+and caps each packet at 4,096 bytes. The caller supplies the address for a
+targeted read. The native backends open and recheck pinned paths, enforce the
+file bounds before allocating and verify the address before returning bytes.
+An absent control directory requires explicit provisioning. An address check
+establishes byte integrity. Journal verification establishes authorization.
+
+`publishDelivery()` selects its envelope from the verified current outbox.
+`publishReceipt()` reopens the installed package against the exact current head
+before signing its receipt. Both hold the journal lease through a successful
+local commit and the transport publication barrier. This prevents a local
+membership update from slipping between authorization and publication. The
+recipient calls `installDelivery()` with the retrieved envelope. The sender
+calls `recordReceipt()` with the retrieved receipt. Both validate the signed
+context against local history after the transport read.
+
+Publication stages the packet privately, then exposes its final name without
+replacement. Retrying an existing name requires exact bytes and a fresh native
+durability barrier. A durability error can leave the final name visible. Retry
+under current authorization using the same packet address. Linux uses an
+anonymous staged inode and mount identity checks. Windows uses an explicit
+private staging directory on the same fixed NTFS volume. Keep that directory
+outside the transport.
+
+The file transport exercises the control exchange in isolated directories.
+Address discovery, cloud-client delivery, profile activation and signed clipboard
+events remain product integration work. A file sync service can withhold packets
+or membership changes, and control headers and receipts expose public protocol
+metadata to observers of the transport.
+
 ## Clock and rollback limits
 
 The encrypted record retains a high-watermark policy time. Fresh signing and
@@ -202,7 +238,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,

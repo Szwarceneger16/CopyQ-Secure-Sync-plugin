@@ -2,6 +2,7 @@
 #pragma once
 
 #include "events.h"
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 
@@ -33,6 +34,25 @@ public:
 private:
     ErrorCode code_;
 };
+
+inline constexpr std::size_t MaxControlPacketBytes = 4096;
+
+inline void validateControlPacketId(const std::string &id) {
+    if (id.size() != 64 || !std::all_of(id.begin(), id.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })) throw Error(ErrorCode::InvalidPath, "Invalid control packet address");
+}
+
+inline std::string controlPacketId(const crypto::Bytes &packet) {
+    if (packet.empty() || packet.size() > MaxControlPacketBytes)
+        throw Error(ErrorCode::InvalidLimits, "Invalid control packet size");
+    const auto digest = crypto::sha256(packet);
+    if (digest.size() != 32) throw Error(ErrorCode::Io, "Cannot address control packet");
+    constexpr char hex[] = "0123456789abcdef";
+    std::string id; id.reserve(64);
+    for (const auto byte : digest) { id.push_back(hex[byte >> 4]); id.push_back(hex[byte & 15]); }
+    return id;
+}
 
 // An existing, dedicated transport root with an existing events/ directory.
 // Never create a missing root implicitly: a missing mount is not an empty history.
@@ -69,6 +89,11 @@ public:
     // Reconcile an interrupted publication: exact immutable ciphertext readback
     // and a fresh native durability barrier. Never rewrites an existing event.
     void confirm(const crypto::Bytes &key, const events::Envelope &envelope,events::Limits limits = {}) const;
+    // Targeted opaque packets under an existing control/ directory. The address
+    // is SHA-256 of the bytes. Protocol authentication belongs to the caller.
+    // Repeating publication confirms the exact existing file without replacing it.
+    void publishControl(const crypto::Bytes &packet, const std::filesystem::path &privateStaging = {}) const;
+    crypto::Bytes readControl(const std::string &packetId) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

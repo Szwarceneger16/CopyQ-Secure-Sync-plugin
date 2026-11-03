@@ -95,6 +95,29 @@ void sameFilesystem(const struct stat &s, dev_t device) {
     if (s.st_dev != device)
         fail(ErrorCode::UnsafeEntry, "Nested transport mounts are not supported");
 }
+std::uint64_t mountId(int parent, const char *name, int flags) {
+#ifdef STATX_MNT_ID
+    struct statx info{};
+    if (::statx(parent, name, flags | AT_NO_AUTOMOUNT, STATX_MNT_ID, &info) != 0) {
+        if (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)
+            fail(ErrorCode::UnsupportedFilesystem, "Control transport needs Linux mount IDs");
+        ioError();
+    }
+    if ((info.stx_mask & STATX_MNT_ID) != 0) return info.stx_mnt_id;
+#else
+    (void)parent;
+    (void)name;
+    (void)flags;
+#endif
+    fail(ErrorCode::UnsupportedFilesystem, "Control transport needs Linux mount IDs");
+}
+std::uint64_t mountId(int fd) { return mountId(fd, "", AT_EMPTY_PATH); }
+void mappedOnMount(const Link &link, std::uint64_t mount, bool unchanged = false) {
+    mapped(link, unchanged);
+    // st_dev alone cannot distinguish a same-filesystem bind mount.
+    if (mountId(link.fd.get()) != mount || mountId(link.parent, link.name.c_str(), AT_SYMLINK_NOFOLLOW) != mount)
+        fail(ErrorCode::UnsafeEntry, "Nested control transport mount is not supported");
+}
 // Each name is a single component from readdir, never a path from JSON.
 std::vector<std::string> names(int fd, std::size_t &remaining) {
     const int duplicate = ::openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -187,6 +210,42 @@ void writeAll(int fd, std::string_view data) {
         data.remove_prefix(static_cast<std::size_t>(n));
     }
 }
+Fd anonymousFile(int dir) {
+    const int raw = ::openat(dir, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    if (raw < 0 && (errno == EOPNOTSUPP || errno == EINVAL || errno == EISDIR || errno == ENOSYS))
+        fail(ErrorCode::UnsupportedFilesystem, "Transport filesystem lacks anonymous staging support");
+    return Fd(raw);
+}
+bool linkAnonymous(int file, int dir, const std::string &name) {
+    // O_TMPFILE has no attacker-replaceable source pathname and linkat never
+    // replaces an existing destination. The procfs fallback follows only our
+    // pinned descriptor when an unprivileged process cannot use AT_EMPTY_PATH.
+    int linked = ::linkat(file, "", dir, name.c_str(), AT_EMPTY_PATH);
+    if (linked != 0 && (errno == EPERM || errno == ENOENT || errno == EINVAL)) {
+        linked = ::linkat(AT_FDCWD, procName(file).c_str(), dir, name.c_str(), AT_SYMLINK_FOLLOW);
+    }
+    if (linked == 0) return true;
+    if (errno == EEXIST) return false;
+    ioError();
+}
+struct ControlFolder {
+    Link link;
+    std::uint64_t mount;
+};
+Link controlFile(const ControlFolder &dir, const std::string &name) {
+    auto file = pinFile(dir.link.fd.get(), name, dir.link.stamp.st_dev);
+    constexpr mode_t disallowed = S_ISUID | S_ISGID | S_ISVTX | S_IXUSR | S_IXGRP | S_IXOTH;
+    if ((file.stamp.st_mode & disallowed) != 0 || (file.stamp.st_mode & S_IRUSR) == 0)
+        fail(ErrorCode::UnsafeEntry, "Invalid control packet permissions");
+    mappedOnMount(file, dir.mount, true);
+    return file;
+}
+bool entryExists(int dir, const std::string &name) {
+    struct stat existing{};
+    if (::fstatat(dir, name.c_str(), &existing, AT_SYMLINK_NOFOLLOW) == 0) return true;
+    if (errno == ENOENT) return false;
+    ioError();
+}
 } // namespace
 
 struct Directory::Impl {
@@ -215,9 +274,111 @@ struct Directory::Impl {
     }
     int eventsFd() const { return chain.back().fd.get(); }
     void verify() const { for (const auto &link : chain) mapped(link); }
+    const Link &rootLink() const { return chain[chain.size() - 2]; }
+    void verifyControl(const ControlFolder &dir) const {
+        verify();
+        mappedOnMount(rootLink(), dir.mount);
+        mappedOnMount(dir.link, dir.mount);
+    }
+    ControlFolder control() const {
+        verify();
+        const auto &root = rootLink();
+        ControlFolder dir{directory(root.fd.get(), "control"), mountId(root.fd.get())};
+        owned(dir.link.stamp);
+        sameFilesystem(dir.link.stamp, root.stamp.st_dev);
+        verifyControl(dir);
+        return dir;
+    }
+    void confirmControl(const ControlFolder &dir, const std::string &name, std::string_view wire,
+                        const struct stat *expected = nullptr) const {
+        verifyControl(dir);
+        auto file = controlFile(dir, name);
+        if (expected && !same(file.stamp, *expected))
+            fail(ErrorCode::Changed, "Published control packet identity changed");
+        if (static_cast<std::uintmax_t>(file.stamp.st_size) != wire.size())
+            fail(ErrorCode::Changed, "Published control packet size differs");
+        CQS_HOOK(FilePinned);
+        if (readFile(file) != wire) fail(ErrorCode::Changed, "Published control packet differs");
+        try {
+            Fd durable(::open(procName(file.fd.get()).c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+            if (!same(status(durable.get()), file.stamp) || mountId(durable.get()) != dir.mount)
+                fail(ErrorCode::Changed, "Control packet changed before confirmation");
+            syncFd(durable.get());
+            syncFd(dir.link.fd.get());
+            syncFd(rootLink().fd.get());
+            if (!same(status(durable.get()), file.stamp))
+                fail(ErrorCode::Changed, "Control packet changed during confirmation");
+            mappedOnMount(file, dir.mount, true);
+            verifyControl(dir);
+        } catch (...) {
+            fail(ErrorCode::PublishedUnconfirmed, "Control packet may be published; durability or identity unconfirmed");
+        }
+    }
 };
 Directory::Directory(const std::filesystem::path &root) : impl_(std::make_unique<Impl>(root)) {}
 Directory::~Directory() = default;
+
+crypto::Bytes Directory::readControl(const std::string &packetId) const {
+    validateControlPacketId(packetId);
+    const auto dir = impl_->control();
+    const auto file = controlFile(dir, packetId + ".cqc");
+    const auto size = static_cast<std::uintmax_t>(file.stamp.st_size);
+    if (!size || size > MaxControlPacketBytes)
+        fail(ErrorCode::ScanLimit, "Control packet exceeds transport byte budget");
+    CQS_HOOK(FilePinned);
+    const auto wire = readFile(file);
+    crypto::Bytes packet(wire.begin(), wire.end());
+    if (controlPacketId(packet) != packetId)
+        fail(ErrorCode::Changed, "Control packet content does not match its address");
+    mappedOnMount(file, dir.mount, true);
+    impl_->verifyControl(dir);
+    return packet;
+}
+
+void Directory::publishControl(const crypto::Bytes &packet, const std::filesystem::path &privateStaging) const {
+    if (!privateStaging.empty()) fail(ErrorCode::InvalidPath, "Linux publication uses anonymous staging");
+    const auto name = controlPacketId(packet) + ".cqc";
+    const std::string wire(reinterpret_cast<const char *>(packet.data()), packet.size());
+    const auto dir = impl_->control();
+    const auto parent = dir.link.fd.get();
+    if (entryExists(parent, name)) {
+        impl_->confirmControl(dir, name, wire);
+        return;
+    }
+
+    const auto temporary = anonymousFile(parent);
+    if (::fchmod(temporary.get(), 0600) != 0) ioError();
+    writeAll(temporary.get(), wire);
+    CQS_HOOK(PublishWritten);
+    syncFd(temporary.get());
+    const auto staged = status(temporary.get());
+    owned(staged);
+    sameFilesystem(staged, dir.link.stamp.st_dev);
+    if (!S_ISREG(staged.st_mode) || (staged.st_mode & 07777) != 0600 || staged.st_nlink != 0 ||
+        staged.st_size != static_cast<off_t>(wire.size()) || mountId(temporary.get()) != dir.mount)
+        fail(ErrorCode::Io, "Anonymous control packet staging failed");
+
+    CQS_HOOK(PublishReady);
+    impl_->verifyControl(dir);
+    if (!same(status(temporary.get()), staged)) fail(ErrorCode::Changed, "Control packet changed during staging");
+    if (!linkAnonymous(temporary.get(), parent, name)) {
+        impl_->confirmControl(dir, name, wire);
+        return;
+    }
+    try {
+        const auto linked = status(temporary.get());
+        if (!identity(linked, staged) || linked.st_size != staged.st_size || linked.st_nlink != 1 ||
+            linked.st_mtim.tv_sec != staged.st_mtim.tv_sec || linked.st_mtim.tv_nsec != staged.st_mtim.tv_nsec)
+            fail(ErrorCode::Changed, "Control packet changed during publication");
+        CQS_HOOK(PublishLinked);
+        impl_->confirmControl(dir, name, wire, &linked);
+    } catch (...) {
+        // The final name may already be visible. Retrying its exact address
+        // confirms it without deleting or replacing an existing packet.
+        fail(ErrorCode::PublishedUnconfirmed, "Control packet may be published; durability or identity unconfirmed");
+    }
+}
+
 void Directory::confirm(const crypto::Bytes &key,const events::Envelope &envelope,events::Limits limits) const {
     const auto event=events::decode(key,envelope,limits);impl_->verify();
     auto dir=directory(impl_->eventsFd(),event.revision.device);owned(dir.stamp);
@@ -321,10 +482,7 @@ void Directory::publish(const crypto::Bytes &key, const events::Envelope &envelo
     sameFilesystem(dir.stamp, status(impl_->eventsFd()).st_dev);
     // Also persists a device directory left by an interrupted earlier publisher.
     syncFd(impl_->eventsFd());
-    const int raw = ::openat(dir.fd.get(), ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
-    if (raw < 0 && (errno == EOPNOTSUPP || errno == EINVAL || errno == EISDIR || errno == ENOSYS))
-        fail(ErrorCode::UnsupportedFilesystem, "Transport filesystem lacks anonymous staging support");
-    Fd temporary(raw);
+    const auto temporary = anonymousFile(dir.fd.get());
     writeAll(temporary.get(), wire);
     CQS_HOOK(PublishWritten);
     syncFd(temporary.get());
@@ -334,19 +492,8 @@ void Directory::publish(const crypto::Bytes &key, const events::Envelope &envelo
     CQS_HOOK(PublishReady);
     impl_->verify();
     mapped(dir);
-    // O_TMPFILE has no attacker-replaceable source pathname and no partial final
-    // name. linkat atomically creates a name, never replaces an existing one.
-    int linked = ::linkat(temporary.get(), "", dir.fd.get(), filename.c_str(), AT_EMPTY_PATH);
-    if (linked != 0 && (errno == EPERM || errno == ENOENT || errno == EINVAL)) {
-        // Unprivileged processes may not use AT_EMPTY_PATH. procfs is trusted;
-        // this follows our own pinned fd, not any transport-provided symlink.
-        linked = ::linkat(AT_FDCWD, procName(temporary.get()).c_str(),
-                          dir.fd.get(), filename.c_str(), AT_SYMLINK_FOLLOW);
-    }
-    if (linked != 0) {
-        if (errno == EEXIST) fail(ErrorCode::AlreadyExists, "Event ID already exists; never overwritten");
-        ioError();
-    }
+    if (!linkAnonymous(temporary.get(), dir.fd.get(), filename))
+        fail(ErrorCode::AlreadyExists, "Event ID already exists; never overwritten");
     try {
         const auto linkedStamp = status(temporary.get());
         // Linking changes ctime/nlink but not mtime or the file contents.

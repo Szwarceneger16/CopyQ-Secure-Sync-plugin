@@ -216,10 +216,14 @@ against the staged package and current head before saving it. Historical
 validated packages can supply the installed key only while the recipient,
 generation and commitment remain current and the journal is free of forks.
 
-Product integration must durably prepare the random rotation secret before
-soliciting approvals and recheck membership at immutable publication. Use the
-validated installed key to start authenticated CopyQ Join. The product must
-publish its separate completion acknowledgement after Join has succeeded.
+The isolated [file transport](DEVICE-TRUST-COORDINATOR.md#bounded-file-transport)
+publishes the envelope and storage receipt under the current journal lease.
+Each packet has a targeted SHA-256 address and immutable file name. Recipients
+still validate the signed context against their accepted history. Product
+integration must durably prepare the rotation secret before soliciting approvals
+and use the installed key only after signed clipboard events and profile activation
+are qualified. Publish a separate completion acknowledgement after authenticated
+CopyQ Join has succeeded.
 A removed member keeps any earlier key it obtained. A later generation uses a
 fresh key and survivor-specific delivery.
 
@@ -259,7 +263,7 @@ prompt; they must not silently weaken the trust policy or CopyQ encryption.
 G1-G4 now have concrete choices and isolated implementations for membership,
 identity storage, signing, approvals and key envelopes. Remaining product work
 includes trusted-screen verification, durable originator-key preparation,
-production transport and CopyQ profile activation, acknowledged Join, recovery
+cloud address discovery and delivery, CopyQ profile activation, acknowledged Join, recovery
 and platform qualification. Full disk/key rollback across restarts requires an external
 monotonic anchor or explicit recovery policy. G5's signed event migration and
 G6-G7's installer/platform qualification still gate distribution. Advanced

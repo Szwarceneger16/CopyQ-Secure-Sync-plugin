@@ -3,6 +3,7 @@
 #include "device_identity.h"
 #include "device_key_envelope.h"
 #include "device_key_receipt.h"
+#include "storage.h"
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -457,5 +458,48 @@ bool TrustJournal::recordReceipt(const Bytes &receipt, std::uint64_t now) {
     delivery.receipt = receipt; log.watermark = now;
     auto replacement = record; storeLog(replacement, log, pins); save(record, std::move(replacement));
     return true;
+}
+
+std::string TrustJournal::publishDelivery(const Token &recipient, const storage::Directory &transport,
+                                         std::uint64_t now, const std::filesystem::path &privateStaging) {
+    const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins); const auto membership = replay(log, genesis_, local_);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    clock(log, now);
+    const auto delivery = log.deliveries.find(recipient);
+    if (delivery == log.deliveries.end()) fail(JournalCode::Delivery);
+    const auto &wire = delivery->second.envelope;
+    const auto id = storage::controlPacketId(wire);
+    // Replay checked the saved envelope against this exact current head. Keep
+    // the same lease through the local and transport durability barriers.
+    log.watermark = now;
+    auto replacement = record; storeLog(replacement, log, pins);
+    save(record, std::move(replacement));
+    transport.publishControl(wire, privateStaging);
+    return id;
+}
+
+std::string TrustJournal::publishReceipt(const Identity &recipient, const storage::Directory &transport,
+                                        std::uint64_t now, const std::filesystem::path &privateStaging) {
+    const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    std::optional<EnvelopeAuthority> proof;
+    const auto membership = replay(log, genesis_, local_, &proof);
+    if (recipient.member() != local_) fail(JournalCode::WrongPins);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    clock(log, now);
+    if (!proof || proof->context.successor != membership.current().digest) fail(JournalCode::Delivery);
+    {
+        const auto key = KeyEnvelopeCodec::open(log.installed, proof->context, proof->sender, recipient);
+        checkPriorKeys(log, genesis_, membership.current(), *key);
+    }
+    const auto receipt = receiptContext(proof->context, log.installed);
+    log.watermark = now;
+    auto replacement = record; storeLog(replacement, log, pins);
+    save(record, std::move(replacement));
+    const auto wire = KeyReceiptCodec::sign(receipt, recipient);
+    const auto id = storage::controlPacketId(wire);
+    transport.publishControl(wire, privateStaging);
+    return id;
 }
 } // namespace cqs::trust

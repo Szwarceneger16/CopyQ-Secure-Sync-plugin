@@ -4,6 +4,8 @@
 #include "state_store.h"
 #include <atomic>
 
+namespace cqs::storage { class Directory; }
+
 namespace cqs::trust {
 class Identity;
 class SyncKey;
@@ -80,6 +82,13 @@ public:
     std::unique_ptr<SyncKey> loadInstalledKey(const Identity &recipient, std::uint64_t trustedNow);
     // True when a verified storage receipt was added to the current outbox.
     bool recordReceipt(const crypto::Bytes &receipt, std::uint64_t trustedNow);
+    // Publish only a currently authorized staged package, under the journal lease.
+    std::string publishDelivery(const Token &recipient, const storage::Directory &transport,
+                                std::uint64_t trustedNow, const std::filesystem::path &privateStaging = {});
+    // A storage receipt for the current head is signed after a durable local
+    // barrier, then published under the same lease. Returns its packet address.
+    std::string publishReceipt(const Identity &recipient, const storage::Directory &transport,
+                               std::uint64_t trustedNow, const std::filesystem::path &privateStaging = {});
 private:
     crypto::Bytes prepare(const Token &recipient, const Identity &sender, const SyncKey &key,
                          std::uint64_t now, KeyScope scope);

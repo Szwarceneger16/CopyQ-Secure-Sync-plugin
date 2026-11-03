@@ -48,10 +48,11 @@ The [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) exercise
 Ed25519 approvals, a local identity vault and signed key envelopes. A recipient
 can store its sealed package durably, reopen the current key after restart and
 sign a storage receipt. An explicit catch-up operation can deliver a fresh
-package to an earlier active member at a later accepted head. Build these tests
-with `CQS_TEST_DEVICE_CRYPTO=ON` and
-libsodium 1.0.22 or newer. Product use requires guided setup, guarded transport
-and integration with the CopyQ profile.
+package to an earlier active member at a later accepted head. The laboratory
+can publish exact envelopes and receipts to a provisioned `control/` directory
+through the native file transport. Build these tests with
+`CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer. Product use requires
+guided setup, signed clipboard events and integration with the CopyQ profile.
 
 ## Build and test pipeline
 
