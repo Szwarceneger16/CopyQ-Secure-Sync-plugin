@@ -192,42 +192,57 @@ void addAction(QDialog &dialog, QVBoxLayout &layout, const QString &name, Action
 
 enum class BlockedReplicaImport { RowLimit, ProtectedRows };
 
-SignedReplicaResult synchronize(TrustJournal &journal, const Identity &identity, const storage::Directory &transport,
-    SignedJoinCheckpoint &checkpoint, const SignedReplicaRequest &request, const std::filesystem::path &privateStaging) {
-    auto mounted = checkpoint.mount(request.expected);
-    const auto confirmSource = [&] {
-        if (!request.confirmSource || !request.confirmSource()) throw JournalError(JournalCode::Enrollment);
-    };
-    if (request.sourcePinned) confirmSource();
-    else if (mounted->replica().pending) throw JournalError(JournalCode::Enrollment);
+struct LocalSnapshot {
+    transaction::Snapshot value;
+    ~LocalSnapshot() {
+        for (auto &item : value) for (auto &field : item) crypto::wipe(field.second);
+    }
+};
 
-    struct LocalSnapshot {
-        transaction::Snapshot value;
-        ~LocalSnapshot() {
-            for (auto &item : value) for (auto &field : item) crypto::wipe(field.second);
-        }
-    } local{mounted->snapshot()};
-    const auto result = journal.synchronizeReplica(identity, transport, request.expected, mounted->replica(), local.value, now(),
-        [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
-            if (snapshot != local.value) {
-                if (snapshot.size() > static_cast<std::size_t>(request.maximumItems)) throw BlockedReplicaImport::RowLimit;
-                if (!request.preserveProtectedRows || !request.preserveProtectedRows(local.value, snapshot))
-                    throw BlockedReplicaImport::ProtectedRows;
-            }
-            confirmSource();
-            mounted->updateReplica(replica, snapshot, mounted->generation());
-        }, privateStaging);
-    if (!request.sourcePinned && result == SignedReplicaResult::UpToDate) confirmSource();
-    return result;
+void confirmSource(const SignedReplicaRequest &request) {
+    if (!request.confirmSource || !request.confirmSource()) throw JournalError(JournalCode::Enrollment);
+}
+
+void validateTarget(const SignedReplicaRequest &request, const transaction::Snapshot &before,
+                    const transaction::Snapshot &after) {
+    if (after.size() > static_cast<std::size_t>(request.maximumItems)) throw BlockedReplicaImport::RowLimit;
+    if (!request.preserveProtectedRows || !request.preserveProtectedRows(before, after))
+        throw BlockedReplicaImport::ProtectedRows;
+}
+
+QString deferredImport(BlockedReplicaImport blocked) {
+    return blocked == BlockedReplicaImport::RowLimit
+        ? QObject::tr("The verified history exceeds the CopyQ item limit. The local copy was retained.")
+        : QObject::tr("The verified history would change pinned or locked items, or exceeds the local tag policy. The local copy was retained.");
 }
 } // namespace
+
+trust::SignedReplicaResult synchronizeSignedReplica(trust::TrustJournal &journal, const trust::Identity &identity,
+    const storage::Directory &transport, trust::SignedJoinCheckpoint &checkpoint, const SignedReplicaRequest &request,
+    const std::filesystem::path &privateStaging, const std::function<bool()> &canProceed) {
+    if (canProceed && (!canProceed() || !request.sourcePinned)) throw JournalError(JournalCode::Enrollment);
+    auto mounted = checkpoint.mount(request.expected);
+    if (request.sourcePinned) confirmSource(request);
+    else if (mounted->replica().pending) throw JournalError(JournalCode::Enrollment);
+    const LocalSnapshot local{mounted->snapshot()};
+    std::function<bool()> guard;
+    if (canProceed) guard = [&] { return canProceed() && request.confirmSource && request.confirmSource(); };
+    const auto result = journal.synchronizeReplica(identity, transport, request.expected, mounted->replica(), local.value, now(),
+        [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
+            confirmSource(request);
+            mounted->updateReplica(replica, snapshot, mounted->generation());
+        }, privateStaging, [&](const auto &before, const auto &after) { validateTarget(request, before, after); }, guard);
+    if (!request.sourcePinned && result == SignedReplicaResult::UpToDate) confirmSource(request);
+    return result;
+}
 
 void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity &identity,
                          const storage::Directory &transport, SignedJoinCheckpoint &checkpoint,
                          const std::string &profileBinding, const SyncKey *publishKey,
                          const std::filesystem::path &privateStaging, const std::function<bool()> &stillCurrent,
                          const std::function<bool(const JoinActivation &)> &activate,
-                         const QString &replicaSource, const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica) {
+                         const QString &replicaSource, const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica,
+                         const std::function<bool()> &startBackground) {
     // The preferences widget can be deleted by the host while a modal dialog
     // runs. The wizard is stack-owned so that its worker can always be joined.
     QDialog wizard;
@@ -453,14 +468,11 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
             // Do not dispatch CopyQ commands or preference changes between
             // authorization and a potentially irrevocable publication.
             result = std::async(std::launch::async, [&] {
-                return synchronize(journal, identity, transport, checkpoint, *request, privateStaging);
+                return synchronizeSignedReplica(journal, identity, transport, checkpoint, *request, privateStaging);
             }).get();
             checkCurrent();
         } catch (BlockedReplicaImport blocked) {
-            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"),
-                blocked == BlockedReplicaImport::RowLimit
-                    ? QObject::tr("The verified history exceeds the CopyQ item limit. The local copy was retained.")
-                    : QObject::tr("The verified history would change pinned or locked items. The local copy was retained."));
+            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"), deferredImport(blocked));
             return;
         }
         QString message;
@@ -473,6 +485,164 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
             break;
         }
         QMessageBox::information(&wizard, QObject::tr("Secure Sync"), message);
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Resolve signed conflict"), [&] {
+        const auto request = prepareReplica();
+        if (!request) throw JournalError(JournalCode::Enrollment);
+        const auto review = run([&] {
+            const auto mounted = checkpoint.mount(request->expected);
+            if (request->sourcePinned) confirmSource(*request);
+            return journal.reviewReplicaConflict(identity, transport, request->expected,
+                mounted->replica(), mounted->snapshot(), now());
+        });
+        if (!review) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("No signed conflict requires a decision."));
+            return;
+        }
+        QStringList choices{QObject::tr("Keep this device's encrypted local copy")};
+        for (const auto &tip : review->tips)
+            choices.append(QObject::tr("Use signed version %1 (%2)").arg(QString::fromStdString(tip.id), hex(tip.digest)));
+        bool accepted = false;
+        const auto choice = QInputDialog::getItem(&wizard, QObject::tr("Secure Sync — resolve signed conflict"),
+            QObject::tr("Choose the content to publish. All reviewed signed branches remain in history."), choices, 0, false, &accepted);
+        const auto index = choices.indexOf(choice);
+        if (!accepted || index < 0) return;
+        QStringList parents;
+        for (const auto &tip : review->tips) parents.append(QString::fromStdString(tip.id) + "  " + hex(tip.digest));
+        QMessageBox confirmation(QMessageBox::Question, QObject::tr("Secure Sync — confirm signed resolution"),
+            QObject::tr("Publish the selected content against these exact signed versions?\n\n%1\n\n"
+                        "Choosing a signed version preserves the current local copy in an encrypted conflict backup.")
+                .arg(parents.join('\n')), QMessageBox::Yes | QMessageBox::No, &wizard);
+        confirmation.setTextFormat(Qt::PlainText);
+        confirmation.setDefaultButton(QMessageBox::No);
+        if (confirmation.exec() != QMessageBox::Yes) return;
+        checkCurrent();
+        try {
+            const auto result = std::async(std::launch::async, [&] {
+                auto mounted = checkpoint.mount(request->expected);
+                const LocalSnapshot local{mounted->snapshot()};
+                const auto selected = index ? review->tips.at(std::size_t(index - 1)).id : std::string{};
+                if (request->sourcePinned) confirmSource(*request);
+                return journal.resolveReplicaConflict(identity, transport, request->expected, mounted->replica(), local.value,
+                    *review, selected, now(), [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
+                        confirmSource(*request);
+                        mounted->updateReplica(replica, snapshot, mounted->generation());
+                    }, privateStaging, [&](const auto &before, const auto &after) {
+                        validateTarget(*request, before, after);
+                        if (!mounted->replica().pending && before != after) mounted->checkConflictBackupCapacity(after);
+                    });
+            }).get();
+            checkCurrent();
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"),
+                result == SignedReplicaResult::Published
+                    ? QObject::tr("The signed resolution was published. Reopen signed_sync to see the local copy.")
+                    : QObject::tr("Signed history changed. Local data and verified branches were retained. Review the conflict again."));
+        } catch (BlockedReplicaImport blocked) {
+            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"), deferredImport(blocked));
+        }
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Recover pending publication after key rotation"), [&] {
+        const auto request = prepareReplica();
+        if (!request || !request->sourcePinned) throw JournalError(JournalCode::Enrollment);
+        if (QMessageBox::question(&wizard, QObject::tr("Secure Sync — recover after key rotation"),
+                QObject::tr("Retire the matching old-generation reservation locally? The working copy stays encrypted. "
+                            "This does not publish an event or activate synchronization under the new key."),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        checkCurrent();
+        const auto result = std::async(std::launch::async, [&] {
+            confirmSource(*request);
+            auto mounted = checkpoint.mount(request->expected);
+            const LocalSnapshot local{mounted->snapshot()};
+            return journal.recoverRotatedReplica(identity, request->expected, mounted->replica(), local.value, now(),
+                [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
+                    mounted->updateReplica(replica, snapshot, mounted->generation());
+                });
+        }).get();
+        checkCurrent();
+        QString message;
+        switch (result) {
+        case SignedReplicaRecovery::NothingPending: message = QObject::tr("There is no matching pending publication."); break;
+        case SignedReplicaRecovery::RetiredUnattempted:
+            message = QObject::tr("The old reservation was retired before any publication attempt. Local edits were retained."); break;
+        case SignedReplicaRecovery::RetiredPossiblyPublished:
+            message = QObject::tr("The old reservation was retired. An earlier publication may have reached transport. Local edits were retained."); break;
+        case SignedReplicaRecovery::RetiredConfirmedPublished:
+            message = QObject::tr("The journal confirms an earlier transport write. Local recovery is complete and local edits were retained."); break;
+        }
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync"), message);
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Manage encrypted conflict backups"), [&] {
+        const auto request = prepareReplica();
+        if (!request || !request->sourcePinned) throw JournalError(JournalCode::Enrollment);
+        const auto listed = run([&] {
+            confirmSource(*request);
+            const auto mounted = checkpoint.mount(request->expected);
+            std::vector<std::size_t> counts;
+            for (std::size_t i = 0; i < mounted->conflictBackupCount(); ++i)
+                counts.push_back(mounted->conflictBackup(i).size());
+            return std::make_pair(mounted->generation(), counts);
+        });
+        QStringList choices;
+        for (std::size_t i = 0; i < listed.second.size(); ++i)
+            choices.append(QObject::tr("Backup %1 (%2 items)").arg(qulonglong(i + 1)).arg(qulonglong(listed.second[i])));
+        if (choices.isEmpty()) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("There are no encrypted conflict backups."));
+            return;
+        }
+        bool accepted = false;
+        const auto selected = QInputDialog::getItem(&wizard, QObject::tr("Secure Sync — encrypted backups"),
+            QObject::tr("Choose an encrypted local backup."), choices, int(choices.size()) - 1, false, &accepted);
+        const auto index = choices.indexOf(selected);
+        if (!accepted || index < 0) return;
+        QMessageBox action(QMessageBox::Question, QObject::tr("Secure Sync — backup action"),
+            QObject::tr("Restore this backup and keep the current copy as a backup, or remove the selected backup from this checkpoint?"),
+            QMessageBox::Cancel, &wizard);
+        const auto restore = action.addButton(QObject::tr("Restore"), QMessageBox::AcceptRole);
+        const auto discard = action.addButton(QObject::tr("Remove backup"), QMessageBox::DestructiveRole);
+        action.setDefaultButton(QMessageBox::Cancel);
+        action.exec();
+        if (action.clickedButton() != restore && action.clickedButton() != discard) return;
+        const bool restoring = action.clickedButton() == restore;
+        if (!restoring && QMessageBox::question(&wizard, QObject::tr("Secure Sync — confirm backup removal"),
+                QObject::tr("Remove only the selected backup from the encrypted checkpoint?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        checkCurrent();
+        try {
+            std::async(std::launch::async, [&] {
+                confirmSource(*request);
+                auto mounted = checkpoint.mount(request->expected);
+                if (mounted->generation() != listed.first) throw JournalError(JournalCode::HistoryChanged);
+                if (restoring) {
+                    validateTarget(*request, mounted->snapshot(), mounted->conflictBackup(std::size_t(index)));
+                    mounted->restoreConflictBackup(std::size_t(index), listed.first);
+                } else {
+                    mounted->discardConflictBackup(std::size_t(index), listed.first);
+                }
+            }).get();
+            checkCurrent();
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), restoring
+                ? QObject::tr("The encrypted backup is now the local working copy. Reopen signed_sync to see it.")
+                : QObject::tr("The selected backup was removed from the encrypted checkpoint."));
+        } catch (BlockedReplicaImport blocked) {
+            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"), deferredImport(blocked));
+        }
+    });
+    if (startBackground) addAction(wizard, *applicantActions, QObject::tr("Start signed background synchronization"), [&] {
+        QMessageBox confirmation(QMessageBox::Question, QObject::tr("Secure Sync — signed background synchronization"),
+            QObject::tr("Allow this CopyQ session to send local edits as encrypted signed updates and fetch verified changes "
+                        "while signed_sync is unloaded?\n\n%1\n\n"
+                        "The session stops on conflicts or errors and can be stopped in Preferences.").arg(replicaSource),
+            QMessageBox::Yes | QMessageBox::No, &wizard);
+        confirmation.setTextFormat(Qt::PlainText);
+        confirmation.setDefaultButton(QMessageBox::No);
+        if (confirmation.exec() != QMessageBox::Yes) return;
+        checkCurrent();
+        if (!startBackground()) {
+            QMessageBox::warning(&wizard, QObject::tr("Secure Sync — background synchronization refused"),
+                QObject::tr("Activate and unload signed_sync, and verify the pinned source by synchronizing manually first."));
+            return;
+        }
+        wizard.accept();
     });
     applicantActions->addStretch();
     memberActions->addStretch();

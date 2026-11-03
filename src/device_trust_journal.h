@@ -74,13 +74,24 @@ struct SignedReplicaCursor {
 struct SignedReplicaIntent {
     std::uint64_t sequence;
     Token payload{};
+    std::vector<SignedEventParent> mergeParents = {};
+    Token localBefore{};
+    std::string selectedTip = {};
 };
 struct SignedReplicaState {
     SignedReplicaCursor cursor;
     std::optional<SignedReplicaIntent> pending;
 };
 enum class SignedReplicaResult { UpToDate, Pulled, Published, Conflict };
+enum class SignedReplicaRecovery { NothingPending, RetiredUnattempted, RetiredPossiblyPublished, RetiredConfirmedPublished };
 using SignedReplicaWriter = std::function<void(const SignedReplicaState &, const transaction::Snapshot &)>;
+using SignedReplicaTargetValidator = std::function<void(const transaction::Snapshot &, const transaction::Snapshot &)>;
+struct SignedReplicaConflict {
+    std::vector<SignedEventParent> tips;
+    SignedReplicaCursor cursor;
+    Token localDigest{};
+    std::string profileBinding;
+};
 struct SignedEventHistory {
     std::vector<events::Event> events;
     history::Graph graph;
@@ -100,7 +111,7 @@ public:
     static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxJournalBytes = MaxControlBytes + MaxClipboardEventBytes +
-                                                   94 + 77 * history::MaxEvents + Token{}.size();
+                                                   96 + 77 * history::MaxEvents + 2 * Token{}.size() + sizeof(std::uint64_t);
     TrustJournal(transaction::Store &store, Genesis genesis, Member local);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
@@ -143,7 +154,26 @@ public:
     SignedReplicaResult synchronizeReplica(const Identity &identity, const storage::Directory &transport,
         const JoinActivation &activation, SignedReplicaState replica, const transaction::Snapshot &local,
         std::uint64_t trustedNow, const SignedReplicaWriter &write,
-        const std::filesystem::path &privateStaging = {});
+        const std::filesystem::path &privateStaging = {}, const SignedReplicaTargetValidator &validateTarget = {},
+        const std::function<bool()> &canProceed = {});
+    // Review the exact witnessed tips without returning clipboard contents.
+    // History with more than two tips cannot be resolved by this wire version.
+    std::optional<SignedReplicaConflict> reviewReplicaConflict(const Identity &identity,
+        const storage::Directory &transport, const JoinActivation &activation, const SignedReplicaState &replica,
+        const transaction::Snapshot &local, std::uint64_t trustedNow);
+    // An empty selectedTip means keep the reviewed local snapshot. A remote
+    // choice requires the writer to archive the prior local snapshot together
+    // with the intent before the coordinator is allowed to publish.
+    SignedReplicaResult resolveReplicaConflict(const Identity &identity, const storage::Directory &transport,
+        const JoinActivation &activation, SignedReplicaState replica, const transaction::Snapshot &local,
+        const SignedReplicaConflict &review, const std::string &selectedTip, std::uint64_t trustedNow,
+        const SignedReplicaWriter &write, const std::filesystem::path &privateStaging = {},
+        const SignedReplicaTargetValidator &validateTarget = {});
+    // Retire only the old replica's exact reservation. This performs no
+    // transport I/O and leaves the old cursor and current local snapshot intact.
+    SignedReplicaRecovery recoverRotatedReplica(const Identity &identity, const JoinActivation &activation,
+        SignedReplicaState replica, const transaction::Snapshot &local, std::uint64_t trustedNow,
+        const SignedReplicaWriter &write);
     ObserveResult observe(const Certificate &certificate, std::uint64_t trustedNow);
     // Prepare one exact ciphertext for an authorized recipient at the accepted
     // head. Retry returns the stored bytes. A transport publisher must recheck
@@ -202,6 +232,11 @@ public:
                                          std::uint64_t trustedNow, events::Limits limits = {});
 private:
     struct ReplicaPublication;
+    struct ReplicaResolution;
+    SignedReplicaResult synchronizeReplicaImpl(const Identity &, const storage::Directory &, const JoinActivation &,
+        SignedReplicaState, const transaction::Snapshot &, std::uint64_t, const SignedReplicaWriter &,
+        const std::filesystem::path &, const SignedReplicaTargetValidator &, const std::function<bool()> &,
+        const ReplicaResolution *);
     JoinActivation verifyJoinActivation(const Identity &, const storage::Directory &, std::string,
                                         std::uint64_t, const JoinActivation *, const JoinActivationWriter &);
     PreparedClipboardEvent prepareClipboardEventLocked(const Identity &author, const SyncKey &key,

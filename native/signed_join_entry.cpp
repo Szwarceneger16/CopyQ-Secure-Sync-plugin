@@ -84,12 +84,29 @@ struct Key {
     ~Key() { crypto::wipe(bytes); }
 };
 
+struct ReplicaBackend {
+    std::unique_ptr<trust::Identity> identity;
+    state::FileStore journalStore;
+    trust::TrustJournal journal;
+    storage::Directory transport;
+    trust::SignedJoinCheckpoint checkpoint;
+
+    ReplicaBackend(std::unique_ptr<trust::Identity> localIdentity, const trust::Genesis &genesis,
+        const trust::Member &local, const std::string &journalBinding, const std::string &binding,
+        const QString &journalPath, const QString &transportPath, const QString &checkpointPath,
+        const Key &journalCredential, const Key &checkpointCredential)
+        : identity(std::move(localIdentity)), journalStore(path(journalPath), journalBinding, journalCredential.bytes),
+          journal(journalStore, genesis, local), transport(path(transportPath)),
+          checkpoint(path(checkpointPath), checkpointCredential.bytes, binding) {}
+};
+
 } // namespace
 
 void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Profile &legacy,
                          const std::function<bool()> &stillCurrent,
                          const ActivateSignedTab &activate,
-                         const PrepareSignedReplica &prepareReplica) {
+                         const PrepareSignedReplica &prepareReplica,
+                         const ArmSignedReplica &armReplica) {
     const QPointer<QWidget> owner(parent);
     const QPointer<QDialog> dialog(new QDialog(parent));
     const auto close = qScopeGuard([dialog] { delete dialog.data(); });
@@ -164,24 +181,30 @@ void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Pro
             publisherCredential.bytes == journalCredential.bytes || publisherCredential.bytes == checkpointCredential.bytes)
             refuse();
         const trust::Membership genesisState(genesis.group, genesis.founder, genesis.recovery, genesis.initialKeyCommitment);
-        const auto identity = trust::IdentityVault::load(path(vault), {genesis.group, genesisState.current().root, local},
+        auto identity = trust::IdentityVault::load(path(vault), {genesis.group, genesisState.current().root, local},
                                                          identityCredential.bytes);
         crypto::wipe(identityCredential.bytes);
         const auto journalBinding = trust::TrustJournal::binding(genesis, local);
-        state::FileStore journalStore(path(journalPath), journalBinding, journalCredential.bytes);
-        crypto::wipe(journalCredential.bytes);
-        trust::TrustJournal journal(journalStore, genesis, local);
-        const storage::Directory transport(path(transportPath));
         const auto binding = signedTabBinding(settings, checkpointPath, journalBinding);
-        trust::SignedJoinCheckpoint checkpoint(path(checkpointPath), checkpointCredential.bytes, binding);
+        auto backend = std::make_shared<ReplicaBackend>(std::move(identity), genesis, local, journalBinding, binding,
+            journalPath, transportPath, checkpointPath, journalCredential, checkpointCredential);
+        crypto::wipe(journalCredential.bytes);
         crypto::wipe(checkpointCredential.bytes);
         const auto groupKey = publisherKey.isEmpty() ? nullptr : trust::SyncKey::import(publisherCredential.bytes);
         crypto::wipe(publisherCredential.bytes);
-        if (owner && stillCurrent()) runSignedJoinWizard(owner, journal, *identity, transport, checkpoint, binding,
-            groupKey.get(), path(staging), stillCurrent, [&](const trust::JoinActivation &expected) {
-                return activate({checkpointPath, checkpointKey, expected}, journalBinding, {transportPath, journalPath});
+        const SignedReplicaSource source{transportPath, journalPath};
+        const auto stagingPath = path(staging);
+        if (owner && stillCurrent()) runSignedJoinWizard(owner, backend->journal, *backend->identity, backend->transport,
+            backend->checkpoint, binding, groupKey.get(), stagingPath, stillCurrent, [&](const trust::JoinActivation &expected) {
+                return activate({checkpointPath, checkpointKey, expected}, journalBinding, source);
             }, transportPath, [&] {
-                return prepareReplica(checkpointPath, checkpointKey, journalBinding, {transportPath, journalPath});
+                return prepareReplica(checkpointPath, checkpointKey, journalBinding, source);
+            }, [&] {
+                return armReplica(checkpointPath, checkpointKey, journalBinding, source,
+                    [backend, stagingPath](const SignedReplicaRequest &request, const std::function<bool()> &canProceed) {
+                        return synchronizeSignedReplica(backend->journal, *backend->identity, backend->transport,
+                            backend->checkpoint, request, stagingPath, canProceed);
+                    });
             });
     } catch (const std::exception &) {
         if (owner) QMessageBox::warning(owner, QString::fromLatin1(Caption),

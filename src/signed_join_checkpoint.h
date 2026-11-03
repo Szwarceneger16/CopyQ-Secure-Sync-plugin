@@ -2,6 +2,7 @@
 #pragma once
 
 #include "device_trust_journal.h"
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -32,6 +33,15 @@ public:
         // This update atomically stores the cursor, intent and local view.
         void updateReplica(const SignedReplicaState &replica, const transaction::Snapshot &snapshot,
                            std::uint64_t expectedGeneration);
+        // Preflight the post-resolution record before reserving any packet.
+        // The first remote-selection intent also commits the backup atomically.
+        void checkConflictBackupCapacity(const transaction::Snapshot &target) const;
+        std::size_t conflictBackupCount() const noexcept;
+        const transaction::Snapshot &conflictBackup(std::size_t index) const;
+        // Restore swaps the selected backup and current local snapshot.
+        // Neither operation changes the signed cursor or works during a pending publication.
+        void restoreConflictBackup(std::size_t index, std::uint64_t expectedGeneration);
+        void discardConflictBackup(std::size_t index, std::uint64_t expectedGeneration);
 
     private:
         friend class SignedJoinCheckpoint;

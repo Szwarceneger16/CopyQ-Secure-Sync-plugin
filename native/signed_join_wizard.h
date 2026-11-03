@@ -25,6 +25,13 @@ struct SignedReplicaRequest {
     std::function<bool()> confirmSource;
     std::function<bool(const transaction::Snapshot &, const transaction::Snapshot &)> preserveProtectedRows;
 };
+using SignedReplicaTask = std::function<trust::SignedReplicaResult(
+    const SignedReplicaRequest &, const std::function<bool()> &)>;
+
+trust::SignedReplicaResult synchronizeSignedReplica(trust::TrustJournal &, const trust::Identity &,
+    const storage::Directory &, trust::SignedJoinCheckpoint &, const SignedReplicaRequest &,
+    const std::filesystem::path &privateStaging, const std::function<bool()> &canProceed = {});
+
 // The caller owns the locally provisioned backend for the lifetime of this
 // modal wizard. The optional publishing key stays guarded outside the UI.
 void runSignedJoinWizard(QWidget *parent, trust::TrustJournal &journal, const trust::Identity &identity,
@@ -34,5 +41,6 @@ void runSignedJoinWizard(QWidget *parent, trust::TrustJournal &journal, const tr
                          const std::function<bool()> &stillCurrent = {},
                          const std::function<bool(const trust::JoinActivation &)> &activate = {},
                          const QString &replicaSource = {},
-                         const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica = {});
+                         const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica = {},
+                         const std::function<bool()> &startBackground = {});
 } // namespace cqs::native

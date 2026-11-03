@@ -28,7 +28,9 @@
 #include "signed_join_wizard.h"
 #include <QAbstractButton>
 #include <QApplication>
+#include <QComboBox>
 #include <QDialog>
+#include <QInputDialog>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QTimer>
@@ -137,12 +139,14 @@ public:
             fault = std::exchange(failure, Fault::None);
         if (fault == Fault::Before) throw st::Error(st::ErrorCode::Io, "Injected before commit");
         record = replacement;
+        if (onCommit) onCommit();
         if (fault == Fault::After) throw st::Error(st::ErrorCode::CommitUnconfirmed, "Injected after commit");
     }
 
     tx::Record record;
     Fault failure = Fault::None;
     unsigned deferredCommits = 0;
+    std::function<void()> onCommit;
 
 private:
     struct Held final : Lease {
@@ -320,7 +324,8 @@ struct JoinedReplica {
             });
     }
 
-    SignedReplicaResult sync(const SignedReplicaWriter &beforeWrite = {})
+    SignedReplicaResult sync(const SignedReplicaWriter &beforeWrite = {},
+                             const std::function<bool()> &canProceed = {})
     {
         auto mounted = checkpoint.mount(activation);
         const auto local = mounted->snapshot();
@@ -328,6 +333,40 @@ struct JoinedReplica {
             activation, mounted->replica(), local, Now,
             [&](const SignedReplicaState &state, const tx::Snapshot &snapshot) {
                 rejects<JournalError>(JournalCode::Busy, [&] { (void)fixture.journal(member).inspect(); });
+                if (beforeWrite) beforeWrite(state, snapshot);
+                mounted->updateReplica(state, snapshot, mounted->generation());
+            }, {}, {}, canProceed);
+    }
+
+    std::optional<SignedReplicaConflict> reviewConflict()
+    {
+        const auto mounted = mount();
+        return fixture.journal(member).reviewReplicaConflict(*fixture.identities[member], transport.directory(),
+            activation, mounted->replica(), mounted->snapshot(), Now);
+    }
+
+    SignedReplicaResult resolveConflict(const SignedReplicaConflict &review, const std::string &selected,
+        const SignedReplicaWriter &beforeWrite = {}, const SignedReplicaTargetValidator &validate = {})
+    {
+        auto mounted = mount();
+        const auto local = mounted->snapshot();
+        return fixture.journal(member).resolveReplicaConflict(*fixture.identities[member], transport.directory(),
+            activation, mounted->replica(), local, review, selected, Now,
+            [&](const SignedReplicaState &state, const tx::Snapshot &snapshot) {
+                if (beforeWrite) beforeWrite(state, snapshot);
+                mounted->updateReplica(state, snapshot, mounted->generation());
+            }, {}, [&](const tx::Snapshot &before, const tx::Snapshot &after) {
+                if (validate) validate(before, after);
+                if (!mounted->replica().pending) mounted->checkConflictBackupCapacity(after);
+            });
+    }
+
+    SignedReplicaRecovery recoverRotation(const SignedReplicaWriter &beforeWrite = {})
+    {
+        auto mounted = checkpoint.mount(activation);
+        const auto local = mounted->snapshot();
+        return fixture.journal(member).recoverRotatedReplica(*fixture.identities[member], activation,
+            mounted->replica(), local, Now, [&](const SignedReplicaState &state, const tx::Snapshot &snapshot) {
                 if (beforeWrite) beforeWrite(state, snapshot);
                 mounted->updateReplica(state, snapshot, mounted->generation());
             });
@@ -361,6 +400,21 @@ struct ReplicaPair {
     }
 };
 
+void rotateReplicaKey(ReplicaPair &pair, std::size_t removed)
+{
+    auto &fixture = pair.fixture;
+    const auto rotated = SyncKey::generate();
+    const auto proposal = fixture.journal(0).propose(Operation::Remove, fixture.member(removed), token(31), token(32),
+        Now, Expires, rotated->commitment(fixture.genesis.group, 1));
+    Certificate removal{proposal, {}};
+    for (std::size_t signer : {0u, removed == 1 ? 2u : 1u}) {
+        removal.approvals.push_back(fixture.journal(signer).approve(proposal, *fixture.identities[signer],
+            verificationDigest(proposal, fixture.member(signer)), Now));
+    }
+    CHECK(fixture.journal(1).observe(removal, Now) == ObserveResult::Applied);
+    CHECK(fixture.journal(1).inspect().state.keyGeneration == 1);
+}
+
 const storage::SignedEventPacket &packet(const std::vector<storage::SignedEventPacket> &packets,
                                          const std::string &id)
 {
@@ -371,6 +425,64 @@ const storage::SignedEventPacket &packet(const std::vector<storage::SignedEventP
 
 #ifdef CQS_TEST_NATIVE_SIGNED_JOIN
 enum class WizardActivation { NoCallback, Accept, Decline, AdvanceTip };
+
+void exerciseNativeConflictWizard()
+{
+    ReplicaPair pair;
+    const auto local = textSnapshot("local version retained in an encrypted backup");
+    const auto remote = textSnapshot("explicitly selected signed remote version");
+    pair.first.edit(local);
+    pair.second.edit(remote);
+    CHECK(pair.second.sync() == SignedReplicaResult::Published);
+    bool selected = false;
+    bool confirmed = false;
+    bool completed = false;
+    QTimer::singleShot(0, [&] {
+        auto *wizard = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        CHECK(wizard);
+        const auto buttons = wizard->findChildren<QPushButton *>();
+        const auto resolve = std::find_if(buttons.begin(), buttons.end(), [](const auto *button) {
+            return button->text() == QStringLiteral("Resolve signed conflict");
+        });
+        CHECK(resolve != buttons.end());
+        QTimer respond;
+        QObject::connect(&respond, &QTimer::timeout, [&] {
+            auto *active = QApplication::activeModalWidget();
+            if (auto *input = qobject_cast<QInputDialog *>(active)) {
+                CHECK(!selected && !confirmed);
+                auto *choices = input->findChild<QComboBox *>();
+                CHECK(choices && choices->count() == 2);
+                choices->setCurrentIndex(1);
+                selected = true;
+                input->accept();
+            } else if (auto *message = qobject_cast<QMessageBox *>(active)) {
+                CHECK(selected && !completed);
+                if (auto *yes = message->button(QMessageBox::Yes)) {
+                    CHECK(!confirmed && message->text().contains(QStringLiteral("exact signed versions")));
+                    confirmed = true;
+                    yes->click();
+                    return;
+                }
+                CHECK(confirmed && message->text().startsWith(QStringLiteral("The signed resolution was published.")));
+                completed = true;
+                message->accept();
+            }
+        });
+        respond.start(2);
+        (*resolve)->click();
+        wizard->reject();
+    });
+    const auto prepare = [&]() -> std::optional<cqs::native::SignedReplicaRequest> {
+        return cqs::native::SignedReplicaRequest{pair.first.activation, 100, true, [] { return true; },
+            [&](const auto &before, const auto &after) { return before == local && after == remote; }};
+    };
+    cqs::native::runSignedJoinWizard(nullptr, pair.fixture.journal(1), *pair.fixture.identities[1],
+        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, {}, {}, {}, QStringLiteral("synthetic"), prepare);
+    CHECK(selected && confirmed && completed);
+    const auto mounted = pair.first.mount();
+    CHECK(mounted->snapshot() == remote && mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
+    CHECK(pair.packets().size() == 3 && !mounted->replica().pending);
+}
 
 void exerciseNativeWizard(WizardActivation choice)
 {
@@ -528,6 +640,82 @@ void exerciseNativeReplicaWizard(JoinedReplica &replica, const tx::Snapshot &loc
         });
     CHECK(confirmed && completed && prepared == 1 && protectionChecks == 1);
     CHECK(sourceChecks == (allowImport ? 2u : 1u));
+}
+
+void clickNativeWizardAction(const QString &name, const std::function<void(QMessageBox &)> &respond)
+{
+    auto *wizard = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+    CHECK(wizard);
+    const auto buttons = wizard->findChildren<QPushButton *>();
+    const auto button = std::find_if(buttons.begin(), buttons.end(), [&](const QPushButton *candidate) {
+        return candidate->text() == name;
+    });
+    CHECK(button != buttons.end());
+    QTimer timer;
+    QObject::connect(&timer, &QTimer::timeout, [&] {
+        if (auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget())) respond(*message);
+    });
+    timer.start(2);
+    (*button)->click();
+    if (wizard->isVisible()) wizard->reject();
+}
+
+void exerciseNativeBackgroundConsent(ReplicaPair &pair, bool accept)
+{
+    const auto source = QString::fromStdString(pair.transport.root.string());
+    bool prompted = false;
+    unsigned armCalls = 0;
+    QTimer::singleShot(0, [&] {
+        clickNativeWizardAction(QStringLiteral("Start signed background synchronization"), [&](QMessageBox &message) {
+            CHECK(!prompted && armCalls == 0 && message.icon() == QMessageBox::Question);
+            CHECK(message.textFormat() == Qt::PlainText && message.text().contains(source));
+            CHECK(message.text().contains(QStringLiteral("while signed_sync is unloaded")));
+            CHECK(message.defaultButton() == message.button(QMessageBox::No));
+            prompted = true;
+            auto *answer = message.button(accept ? QMessageBox::Yes : QMessageBox::No);
+            CHECK(answer);
+            answer->click();
+        });
+    });
+    cqs::native::runSignedJoinWizard(nullptr, pair.fixture.journal(1), *pair.fixture.identities[1],
+        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, {}, {}, {}, source, {}, [&] {
+            CHECK(accept && prompted && armCalls == 0);
+            ++armCalls;
+            return true;
+        });
+    CHECK(prompted && armCalls == (accept ? 1u : 0u));
+}
+
+void exerciseNativeRotationRecovery(ReplicaPair &pair)
+{
+    bool confirmed = false;
+    bool completed = false;
+    unsigned sourceChecks = 0;
+    QTimer::singleShot(0, [&] {
+        clickNativeWizardAction(QStringLiteral("Recover pending publication after key rotation"), [&](QMessageBox &message) {
+            if (auto *yes = message.button(QMessageBox::Yes)) {
+                CHECK(!confirmed && !completed && sourceChecks == 0);
+                CHECK(message.defaultButton() == message.button(QMessageBox::No));
+                CHECK(message.text().contains(QStringLiteral("working copy stays encrypted")));
+                confirmed = true;
+                yes->click();
+                return;
+            }
+            CHECK(confirmed && !completed && sourceChecks == 1);
+            CHECK(message.icon() == QMessageBox::Information);
+            CHECK(message.text().contains(QStringLiteral("An earlier publication may have reached transport")));
+            completed = true;
+            message.accept();
+        });
+    });
+    cqs::native::runSignedJoinWizard(nullptr, pair.fixture.journal(1), *pair.fixture.identities[1],
+        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, {}, {}, {},
+        QString::fromStdString(pair.transport.root.string()), [&]() -> std::optional<cqs::native::SignedReplicaRequest> {
+            CHECK(!confirmed && !completed);
+            return cqs::native::SignedReplicaRequest{pair.first.activation, 100, true,
+                [&] { CHECK(confirmed); ++sourceChecks; return true; }, {}};
+        });
+    CHECK(confirmed && completed && sourceChecks == 1);
 }
 #endif
 #endif
@@ -959,6 +1147,144 @@ int main(int argc, char **argv)
         CHECK(first->generation() == firstGeneration && first->snapshot() == firstEdit);
         CHECK(pair.packets().size() == 3);
     });
+    test("a reviewed remote choice archives local changes before publishing the exact signed resolution", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("local draft kept in private backup");
+        const auto remote = textSnapshot("reviewed remote version");
+        CHECK(!pair.first.reviewConflict());
+        pair.first.edit(local);
+        pair.second.edit(remote);
+        CHECK(pair.second.sync() == SignedReplicaResult::Published);
+        const auto review = pair.first.reviewConflict();
+        CHECK(review && review->tips.size() == 1);
+        const auto selected = review->tips.front().id;
+        bool checkedPolicy = false;
+        rejects<st::Error>(st::ErrorCode::InvalidRecord, [&] {
+            pair.first.resolveConflict(*review, selected, {}, [&](const auto &before, const auto &after) {
+                checkedPolicy = true;
+                CHECK(before == local && after == remote);
+                throw st::Error(st::ErrorCode::InvalidRecord, "Synthetic protected-item refusal");
+            });
+        });
+        CHECK(checkedPolicy && pair.packets().size() == 2 && !pair.first.mount()->replica().pending);
+        CHECK(pair.first.resolveConflict(*review, selected) == SignedReplicaResult::Published);
+        const auto mounted = pair.first.mount();
+        CHECK(mounted->snapshot() == remote && mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
+        CHECK(!mounted->replica().pending);
+        const auto files = pair.packets();
+        CHECK(files.size() == 3);
+        const auto header = SignedEventCodec::inspect(packet(files, mounted->replica().cursor.id).wire);
+        CHECK(header.parents.size() == 1 && header.parents[0].id == selected &&
+              header.parents[0].digest == review->tips.front().digest);
+        CHECK(pair.second.sync() == SignedReplicaResult::Pulled && pair.second.mount()->snapshot() == remote);
+    });
+    test("an explicit local resolution signs both exact fork parents and retains all branch packets", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("chosen local fork resolution");
+        pair.first.edit(local);
+        CHECK(pair.first.sync() == SignedReplicaResult::Published);
+        auto &founder = pair.fixture.journal(0);
+        const auto sibling = founder.prepareClipboardEvent(*pair.fixture.identities[0], *pair.fixture.key,
+            {{pair.initialTip, pair.first.activation.tipDigest}}, ValidItems, Now);
+        CHECK(!founder.publishClipboardEvent(sibling.sequence, *pair.fixture.key, pair.transport.directory(), Now).empty());
+        const auto before = pair.packets();
+        const auto review = pair.first.reviewConflict();
+        CHECK(review && review->tips.size() == 2 && before.size() == 3);
+        auto substituted = *review;
+        substituted.tips.front().digest.front() ^= 1;
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] { pair.first.resolveConflict(substituted, {}); });
+        CHECK(pair.packets().size() == 3);
+        CHECK(pair.first.resolveConflict(*review, {}) == SignedReplicaResult::Published);
+        const auto mounted = pair.first.mount();
+        CHECK(mounted->snapshot() == local && mounted->conflictBackupCount() == 0 && !mounted->replica().pending);
+        const auto after = pair.packets();
+        CHECK(after.size() == before.size() + 1);
+        for (const auto &file : before) CHECK(packet(after, file.id).wire == file.wire);
+        const auto header = SignedEventCodec::inspect(packet(after, mounted->replica().cursor.id).wire);
+        CHECK(header.parents.size() == review->tips.size());
+        for (std::size_t i = 0; i < header.parents.size(); ++i) {
+            CHECK(header.parents[i].id == review->tips[i].id && header.parents[i].digest == review->tips[i].digest);
+        }
+        CHECK(pair.second.sync() == SignedReplicaResult::Pulled && pair.second.mount()->snapshot() == local);
+    });
+    test("a changed local review or a peer append during resolution cannot authorize a stale publication", [] {
+        ReplicaPair pair;
+        const auto original = textSnapshot("original reviewed local");
+        const auto newer = textSnapshot("new local edit after review");
+        pair.first.edit(original);
+        pair.second.edit(textSnapshot("remote edit"));
+        CHECK(pair.second.sync() == SignedReplicaResult::Published);
+        const auto stale = pair.first.reviewConflict();
+        CHECK(stale && stale->tips.size() == 1);
+        pair.first.edit(newer);
+        rejects<JournalError>(JournalCode::HistoryChanged, [&] { pair.first.resolveConflict(*stale, {}); });
+        CHECK(pair.packets().size() == 2);
+        const auto review = pair.first.reviewConflict();
+        CHECK(review);
+        bool advanced = false;
+        CHECK(pair.first.resolveConflict(*review, {}, [&](const SignedReplicaState &state, const tx::Snapshot &) {
+            if (!state.pending) return;
+            CHECK(!advanced);
+            advanced = true;
+            pair.second.edit(textSnapshot("peer edit after intent"));
+            CHECK(pair.second.sync() == SignedReplicaResult::Published);
+        }) == SignedReplicaResult::Conflict);
+        const auto mounted = pair.first.mount();
+        CHECK(advanced && pair.packets().size() == 3);
+        CHECK(mounted->snapshot() == newer && !mounted->replica().pending);
+        CHECK(!pair.fixture.journal(1).inspect().pendingEvent);
+    });
+    test("a resolved packet interrupted before checkpoint finalization preserves later local edits", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("initial backup");
+        const auto remote = textSnapshot("chosen branch");
+        const auto later = textSnapshot("newer local edit");
+        pair.first.edit(local);
+        pair.second.edit(remote);
+        CHECK(pair.second.sync() == SignedReplicaResult::Published);
+        const auto review = pair.first.reviewConflict();
+        CHECK(review);
+        rejects<st::Error>(st::ErrorCode::Io, [&] {
+            pair.first.resolveConflict(*review, review->tips.front().id, [&](const auto &state, const auto &) {
+                if (!state.pending) throw st::Error(st::ErrorCode::Io, "Injected before resolution checkpoint commit");
+            });
+        });
+        const auto pending = pair.first.mount()->replica().pending;
+        CHECK(pending && pending->mergeParents.size() == 1 && pair.first.mount()->conflictBackupCount() == 1);
+        const auto files = pair.packets();
+        CHECK(files.size() == 3);
+        pair.first.edit(later);
+        rejects<JournalError>(JournalCode::EventPending, [&] { pair.first.sync({}, [] { return true; }); });
+        CHECK(pair.first.sync() == SignedReplicaResult::Published);
+        const auto mounted = pair.first.mount();
+        CHECK(mounted->snapshot() == later && !mounted->replica().pending);
+        CHECK(mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
+        CHECK(pair.packets().size() == 3 && packet(pair.packets(), mounted->replica().cursor.id).wire ==
+              packet(files, mounted->replica().cursor.id).wire);
+    });
+    test("background cancellation at the last journal barrier preserves the unsent slot for explicit recovery", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("authorized automatic payload");
+        pair.first.edit(local);
+        auto &store = pair.fixture.store(1);
+        bool allow = true;
+        unsigned commits = 0;
+        rejects<JournalError>(JournalCode::EventPublication, [&] {
+            pair.first.sync([&](const auto &state, const auto &) {
+                CHECK(state.pending);
+                store.onCommit = [&] { if (++commits == 3) allow = false; };
+            }, [&] { return allow; });
+        });
+        store.onCommit = {};
+        CHECK(!allow && commits == 4 && pair.packets().size() == 1);
+        const auto pending = pair.fixture.journal(1).inspect().pendingEvent;
+        CHECK(pending && !pending->publicationAttempted && pending->ready);
+        rejects<JournalError>(JournalCode::EventPending, [&] { pair.first.sync({}, [] { return true; }); });
+        const auto later = textSnapshot("newer edit replaces the definitely unsent slot");
+        pair.first.edit(later);
+        CHECK(pair.first.sync() == SignedReplicaResult::Published && pair.packets().size() == 2);
+        CHECK(pair.second.sync() == SignedReplicaResult::Pulled && pair.second.mount()->snapshot() == later);
+    });
     test("a peer advancing during reservation prevents an unattempted first append", [] {
         ReplicaPair pair;
         const auto local = textSnapshot("local edit stays private");
@@ -1149,28 +1475,183 @@ int main(int argc, char **argv)
         CHECK(mounted->generation() == checkpointGeneration && mounted->snapshot() == local);
         CHECK(pair.packets().size() == 1);
     });
+    test("post-rotation recovery retires the exact intent without writing the old transport", [] {
+        for (const unsigned barrier : {0u, 1u, 2u, 3u, 4u, 5u}) {
+            ReplicaPair pair;
+            const auto original = textSnapshot("old pending contents");
+            const auto latest = textSnapshot("keep these newer local edits after rotation");
+            pair.first.edit(original);
+            auto &store = pair.fixture.store(1);
+            const bool beforeCommit = barrier == 0 || barrier == 5;
+            rejects<st::Error>(beforeCommit ? st::ErrorCode::Io : st::ErrorCode::CommitUnconfirmed, [&] {
+                pair.first.sync([&](const SignedReplicaState &state, const tx::Snapshot &) {
+                    CHECK(state.pending);
+                    store.deferredCommits = barrier == 5 ? 3 : (barrier ? barrier - 1 : 0);
+                    store.failure = beforeCommit ? MemoryStore::Fault::Before : MemoryStore::Fault::After;
+                });
+            });
+            pair.fixture.reopen(1);
+            const auto reserved = pair.fixture.journal(1).inspect();
+            CHECK(reserved.allocatedEventSequence == (barrier ? 1u : 0u));
+            CHECK(pair.first.mount()->replica().pending);
+            pair.first.edit(latest);
+            rotateReplicaKey(pair, 2);
+            pair.fixture.reopen(1);
+            const auto files = pair.packets();
+            CHECK(files.size() == (barrier >= 4 ? 2u : 1u));
+
+            if (reserved.pendingEvent) {
+                const auto mounted = pair.first.mount();
+                auto substituted = mounted->replica();
+                substituted.pending->payload.front() ^= 1;
+                rejects<JournalError>(JournalCode::EventReservation, [&] {
+                    pair.fixture.journal(1).recoverRotatedReplica(*pair.fixture.identities[1], pair.first.activation,
+                        substituted, latest, Now, [](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); });
+                });
+            }
+            if (reserved.pendingEvent) {
+                store.failure = MemoryStore::Fault::After;
+                rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] { pair.first.recoverRotation(); });
+                pair.fixture.reopen(1);
+                const auto mounted = pair.first.mount();
+                auto substituted = mounted->replica();
+                substituted.pending->payload.front() ^= 1;
+                rejects<JournalError>(JournalCode::EventReservation, [&] {
+                    pair.fixture.journal(1).recoverRotatedReplica(*pair.fixture.identities[1], pair.first.activation,
+                        substituted, latest, Now, [](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); });
+                });
+            }
+            rejects<st::Error>(st::ErrorCode::Io, [&] {
+                pair.first.recoverRotation([&](const SignedReplicaState &state, const tx::Snapshot &snapshot) {
+                    CHECK(!state.pending && snapshot == latest && state.cursor.id == pair.initialTip);
+                    throw st::Error(st::ErrorCode::Io, "Injected before checkpoint retirement");
+                });
+            });
+            CHECK(pair.first.mount()->replica().pending);
+            const auto expected = barrier < 3 ? SignedReplicaRecovery::RetiredUnattempted :
+                (barrier == 4 ? SignedReplicaRecovery::RetiredConfirmedPublished : SignedReplicaRecovery::RetiredPossiblyPublished);
+            CHECK(pair.first.recoverRotation() == expected);
+            CHECK(pair.first.recoverRotation() == SignedReplicaRecovery::NothingPending);
+            {
+                const auto mounted = pair.first.mount();
+                CHECK(mounted->snapshot() == latest && !mounted->replica().pending);
+                CHECK(mounted->replica().cursor.id == pair.initialTip);
+                CHECK(mounted->replica().cursor.digest == pair.first.activation.tipDigest);
+            }
+            const auto recovered = pair.fixture.journal(1).inspect();
+            CHECK(!recovered.pendingEvent && recovered.allocatedEventSequence == reserved.allocatedEventSequence);
+            CHECK(recovered.eventEncryptionAttempts == 0);
+            CHECK(pair.packets().size() == files.size());
+            for (const auto &file : files) CHECK(packet(pair.packets(), file.id).wire == file.wire);
+            refuses([&] { pair.first.sync(); });
+        }
+    });
+    test("post-rotation recovery refuses removed members, membership forks and unrelated slots", [] {
+        {
+            ReplicaPair pair;
+            const auto local = textSnapshot("removed device keeps local data");
+            pair.first.edit(local);
+            auto &store = pair.fixture.store(1);
+            rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+                pair.first.sync([&](const SignedReplicaState &state, const tx::Snapshot &) {
+                    CHECK(state.pending);
+                    store.failure = MemoryStore::Fault::After;
+                });
+            });
+            pair.fixture.reopen(1);
+            rotateReplicaKey(pair, 1);
+            const auto prior = st::serialize(store.record);
+            refuses([&] {
+                pair.first.recoverRotation([](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); });
+            });
+            CHECK(st::serialize(store.record) == prior && pair.packets().size() == 1);
+            const auto mounted = pair.first.mount();
+            CHECK(mounted->snapshot() == local && mounted->replica().pending);
+        }
+        {
+            ReplicaPair pair;
+            auto &fixture = pair.fixture;
+            auto &journal = fixture.journal(1);
+            const auto otherKey = SyncKey::generate();
+            const auto sibling = fixture.journal(0).propose(Operation::Remove, fixture.member(1), token(41), token(42),
+                Now, Expires, otherKey->commitment(fixture.genesis.group, 1));
+            Certificate fork{sibling, {}};
+            for (std::size_t signer : {0u, 2u}) {
+                fork.approvals.push_back({fixture.member(signer).id,
+                    fixture.identities[signer]->sign(approvalBytes(sibling, fixture.member(signer)))});
+            }
+            rotateReplicaKey(pair, 2);
+            CHECK(journal.observe(fork, Now) == ObserveResult::ForkDetected);
+            const auto prior = st::serialize(fixture.store(1).record);
+            refuses([&] {
+                pair.first.recoverRotation([](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); });
+            });
+            CHECK(st::serialize(fixture.store(1).record) == prior && pair.packets().size() == 1);
+        }
+        {
+            ReplicaPair pair;
+            auto &journal = pair.fixture.journal(1);
+            const auto unrelated = journal.prepareClipboardEvent(*pair.fixture.identities[1], *pair.fixture.key,
+                {{pair.initialTip, pair.first.activation.tipDigest}}, ValidItems, Now);
+            rotateReplicaKey(pair, 2);
+            auto mounted = pair.first.mount();
+            auto falseIntent = mounted->replica();
+            falseIntent.pending = SignedReplicaIntent{unrelated.sequence, token(91)};
+            const auto prior = st::serialize(pair.fixture.store(1).record);
+            rejects<JournalError>(JournalCode::EventReservation, [&] {
+                journal.recoverRotatedReplica(*pair.fixture.identities[1], pair.first.activation, falseIntent,
+                    mounted->snapshot(), Now, [](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); });
+            });
+            CHECK(st::serialize(pair.fixture.store(1).record) == prior && pair.packets().size() == 1);
+        }
+    });
+    test("older rotated journals with no attempt evidence report a possible publication", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("legacy rotated pending data");
+        pair.first.edit(local);
+        auto &store = pair.fixture.store(1);
+        rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+            pair.first.sync([&](const SignedReplicaState &state, const tx::Snapshot &) {
+                CHECK(state.pending);
+                store.deferredCommits = 2;
+                store.failure = MemoryStore::Fault::After;
+            });
+        });
+        pair.fixture.reopen(1);
+        rotateReplicaKey(pair, 2);
+
+        // Reconstruct the v8 shape emitted when older code applied rotation
+        // and discarded the old ledger without saving its attempt evidence.
+        auto &wire = store.record.local->front().begin()->second;
+        constexpr char domain[] = "CopyQ-Secure-Sync-trust-journal-lab-v1";
+        constexpr auto version = sizeof(domain) + 3;
+        constexpr auto evidenceBytes = Token{}.size() + sizeof(std::uint64_t) + 1;
+        const auto flag = wire.size() - evidenceBytes - Token{}.size() - 1;
+        CHECK(wire[version] == 9 && wire[flag] == 1);
+        wire[version] = 8;
+        wire.resize(wire.size() - evidenceBytes);
+        wire.erase(wire.begin() + static_cast<std::ptrdiff_t>(flag));
+        pair.fixture.reopen(1);
+
+        CHECK(pair.first.recoverRotation() == SignedReplicaRecovery::RetiredPossiblyPublished);
+        const auto mounted = pair.first.mount();
+        CHECK(mounted->snapshot() == local && !mounted->replica().pending && pair.packets().size() == 1);
+    });
     test("a locally accepted removal and key rotation stops the old generation", [] {
         ReplicaPair pair;
         const auto local = textSnapshot("stay local after rotation");
         pair.first.edit(local);
         const auto previous = pair.first.mount()->generation();
-        const auto rotated = SyncKey::generate();
-        auto &fixture = pair.fixture;
-        const auto proposal = fixture.journal(0).propose(Operation::Remove, fixture.member(2), token(31), token(32),
-            Now, Expires, rotated->commitment(fixture.genesis.group, 1));
-        Certificate removal{proposal, {}};
-        for (std::size_t signer : {0u, 1u}) {
-            removal.approvals.push_back(fixture.journal(signer).approve(proposal, *fixture.identities[signer],
-                verificationDigest(proposal, fixture.member(signer)), Now));
-        }
-        CHECK(fixture.journal(1).observe(removal, Now) == ObserveResult::Applied);
-        CHECK(fixture.journal(1).inspect().state.keyGeneration == 1);
+        rotateReplicaKey(pair, 2);
         refuses([&] { pair.first.sync(); });
         const auto mounted = pair.first.mount();
         CHECK(mounted->generation() == previous && mounted->snapshot() == local && !mounted->replica().pending);
         CHECK(pair.packets().size() == 1);
     });
 #ifdef CQS_TEST_NATIVE_SIGNED_JOIN
+    test("the native wizard confirms the exact signed conflict choice and archives the previous local copy", [] {
+        exerciseNativeConflictWizard();
+    });
     test("the native wizard confirms and writes the signed checkpoint without a legacy write", [] {
         exerciseNativeWizard(WizardActivation::NoCallback);
     });
@@ -1201,6 +1682,35 @@ int main(int argc, char **argv)
         CHECK(second->generation() == generation + 1 && second->snapshot() == remote);
         CHECK(second->replica().cursor.id == pair.first.mount()->replica().cursor.id);
         CHECK(pair.packets().size() == 2);
+    });
+    test("the native wizard arms signed background synchronization only after explicit consent", [] {
+        ReplicaPair pair;
+        const auto generation = pair.first.mount()->generation();
+        exerciseNativeBackgroundConsent(pair, false);
+        exerciseNativeBackgroundConsent(pair, true);
+        CHECK(pair.first.mount()->generation() == generation && pair.packets().size() == 1);
+    });
+    test("the native wizard reports uncertain old publication and preserves local edits after rotation", [] {
+        ReplicaPair pair;
+        pair.first.edit(textSnapshot("old native pending contents"));
+        auto &store = pair.fixture.store(1);
+        rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+            pair.first.sync([&](const SignedReplicaState &state, const tx::Snapshot &) {
+                CHECK(state.pending);
+                store.deferredCommits = 2;
+                store.failure = MemoryStore::Fault::After;
+            });
+        });
+        pair.fixture.reopen(1);
+        const auto latest = textSnapshot("new local edit before using native recovery");
+        pair.first.edit(latest);
+        rotateReplicaKey(pair, 2);
+        CHECK(pair.first.mount()->replica().pending);
+        exerciseNativeRotationRecovery(pair);
+        const auto mounted = pair.first.mount();
+        CHECK(mounted->snapshot() == latest && !mounted->replica().pending);
+        CHECK(mounted->replica().cursor.id == pair.initialTip && pair.packets().size() == 1);
+        CHECK(!pair.fixture.journal(1).inspect().pendingEvent);
     });
 #endif
 #endif

@@ -315,12 +315,17 @@ current signed history before producing readiness metadata. The
 [experimental native Signed Join](DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
 can open a reviewed checkpoint as an editable local `signed_sync` tab after
 separate confirmation. The explicit synchronization action can publish local
-edits or pull a verified successor while the tab is unloaded. The earlier
-sealed-key storage receipt acknowledges only the sealed key write. Product work
-still includes guided provisioning, durable originator-key preparation, cloud
-discovery, background signed synchronization, signed conflict resolution,
-acknowledged Join, recovery and platform qualification. Full disk/key rollback
-across restarts requires an external monotonic anchor or explicit recovery policy.
+edits or pull a verified successor while the tab is unloaded. A separate
+confirmation authorizes background synchronization for the running CopyQ
+session. Conflict resolution requires a decision over one or two exact signed
+tips and preserves the prior encrypted local copy when adopting a remote
+selection. An authorized device can retire its matching pending publication
+locally after key rotation. The old checkpoint remains bound to its generation.
+The earlier sealed-key storage receipt acknowledges only the sealed key write.
+Product work still includes guided provisioning, durable originator-key
+preparation, cloud discovery, acknowledged Join, cross-generation activation,
+broader recovery and platform qualification. Full disk/key rollback across
+restarts requires an external monotonic anchor or explicit recovery policy.
 G5's signed event migration and G6-G7's installer/platform qualification still
 gate distribution. Advanced settings remain ordinary UI.
 

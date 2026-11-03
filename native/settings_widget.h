@@ -25,12 +25,14 @@ public:
     void setStatus(const QString &text);
     void setRuntimeStatus(const UiContext &, const UiStatus &, bool applied, bool available=true);
     void addSignedJoinAction();
+    void setSignedBackgroundStatus(const QString &, bool armed);
 signals:
     void inspectRequested(cqs::native::Profile profile);
     void initializeStorageRequested(cqs::native::Profile profile);
     void vaultActionRequested(QString action);
     void operationRequested(QString action);
     void signedJoinRequested();
+    void stopSignedBackgroundRequested();
 private:
     QLineEdit *device_, *transport_, *key_, *state_, *vault_, *staging_;
     QLabel *status_, *runtimeStatus_;
@@ -38,6 +40,8 @@ private:
     QPushButton *diagnostics_;
     QString diagnosticsText_;
     QPushButton *inspect_, *initialize_;
+    QLabel *signedBackgroundStatus_ = nullptr;
+    QPushButton *stopSignedBackground_ = nullptr;
     QCheckBox *storage_, *automatic_;
     QWidget *fields_;
     Chooser chooser_;

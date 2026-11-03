@@ -55,6 +55,16 @@ cqs::events::Event event(const JoinActivation &proof, const std::vector<std::str
     return {{proof.tipId, proof.tipId.substr(0, 32), 1, {}}, items, 0};
 }
 
+std::string revision(std::uint64_t sequence) {
+    return cqs::history::makeId(activation().tipId.substr(0, 32), sequence);
+}
+
+SignedReplicaState mergeIntent(SignedReplicaState replica, std::uint64_t sequence) {
+    replica.pending = SignedReplicaIntent{sequence, token(11),
+        {{revision(2), token(12)}, {revision(3), token(13)}}, token(14), revision(3)};
+    return replica;
+}
+
 Bytes disk(const fs::path &directory) {
     std::ifstream input(directory / st::FileStore::RecordName, std::ios::binary);
     CHECK(input.good());
@@ -222,6 +232,91 @@ int main() {
     {
         Temp temp;
         SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
+        checkpoint.apply(proof, tip, snapshot);
+        auto mounted = checkpoint.mount(proof);
+        const tx::Snapshot local{{{"text/plain", Bytes{'l', 'o', 'c', 'a', 'l'}}}};
+        const tx::Snapshot remote{{{"text/plain", Bytes{'r', 'e', 'm', 'o', 't', 'e'}}}};
+        mounted->save(local, 1);
+        const auto pending = mergeIntent(mounted->replica(), 4);
+        const auto before = disk(temp.directory);
+        for (unsigned invalid = 0; invalid != 6; ++invalid) {
+            auto wrong = pending;
+            auto &intent = *wrong.pending;
+            switch (invalid) {
+            case 0: intent.localBefore = {}; break;
+            case 1: intent.selectedTip = revision(8); break;
+            case 2: intent.mergeParents[0].digest = {}; break;
+            case 3: std::swap(intent.mergeParents[0], intent.mergeParents[1]); break;
+            case 4: intent.mergeParents.push_back({revision(4), token(16)}); break;
+            case 5: intent.mergeParents.clear(); break;
+            }
+            rejects(st::ErrorCode::InvalidRecord, [&] { mounted->updateReplica(wrong, local, 2); });
+        }
+        rejects(st::ErrorCode::InvalidRecord, [&] { mounted->updateReplica(pending, remote, 2); });
+        CHECK(disk(temp.directory) == before && mounted->conflictBackupCount() == 0);
+
+        mounted->checkConflictBackupCapacity(remote);
+        CHECK(disk(temp.directory) == before);
+        mounted->updateReplica(pending, local, 2);
+        const auto staged = disk(temp.directory);
+        CHECK(mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
+        rejects(st::ErrorCode::InvalidRecord, [&] { mounted->restoreConflictBackup(0, 3); });
+        rejects(st::ErrorCode::InvalidRecord, [&] { mounted->discardConflictBackup(0, 3); });
+        rejects(st::ErrorCode::InvalidRecord, [&] { mounted->checkConflictBackupCapacity(remote); });
+        CHECK(disk(temp.directory) == staged);
+        mounted.reset();
+
+        mounted = checkpoint.mount(proof);
+        const auto &read = *mounted->replica().pending;
+        CHECK(read.mergeParents.size() == 2 && read.mergeParents[0].id == revision(2) &&
+              read.mergeParents[0].digest == token(12) && read.mergeParents[1].id == revision(3) &&
+              read.mergeParents[1].digest == token(13) && read.localBefore == token(14) &&
+              read.selectedTip == revision(3));
+        mounted->updateReplica(pending, local, 3);
+        CHECK(mounted->generation() == 3 && disk(temp.directory) == staged);
+        const SignedReplicaState published{{revision(4), token(17)}, {}};
+        mounted->updateReplica(published, remote, 3);
+        CHECK(mounted->snapshot() == remote && mounted->conflictBackupCount() == 1);
+        rejects(st::ErrorCode::Stale, [&] { mounted->restoreConflictBackup(0, 3); });
+        mounted->restoreConflictBackup(0, 4);
+        CHECK(mounted->snapshot() == local && mounted->conflictBackup(0) == remote);
+        CHECK(mounted->replica().cursor.id == revision(4));
+        mounted.reset();
+
+        CHECK(checkpoint.read(proof) == snapshot);
+        checkpoint.apply(proof, tip, snapshot);
+        mounted = checkpoint.mount(proof);
+        CHECK(mounted->snapshot() == local && mounted->conflictBackup(0) == remote);
+        rejects(st::ErrorCode::InvalidRecord, [&] { (void)mounted->conflictBackup(1); });
+        mounted->discardConflictBackup(0, mounted->generation());
+        CHECK(mounted->snapshot() == local && mounted->conflictBackupCount() == 0);
+    }
+    {
+        Temp temp;
+        SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
+        checkpoint.apply(proof, tip, snapshot);
+        auto mounted = checkpoint.mount(proof);
+        for (std::uint64_t i = 4; i != 7; ++i) {
+            const auto pending = mergeIntent(mounted->replica(), i);
+            const tx::Snapshot next{{{"text/plain", Bytes{static_cast<std::uint8_t>(i)}}}};
+            mounted->checkConflictBackupCapacity(next);
+            mounted->updateReplica(pending, mounted->snapshot(), mounted->generation());
+            mounted->updateReplica({{revision(i), token(18)}, {}}, next, mounted->generation());
+        }
+        CHECK(mounted->conflictBackupCount() == 3);
+        const auto full = disk(temp.directory);
+        rejects(st::ErrorCode::SizeLimit, [&] { mounted->checkConflictBackupCapacity(snapshot); });
+        const auto fourth = mergeIntent(mounted->replica(), 7);
+        rejects(st::ErrorCode::SizeLimit, [&] {
+            mounted->updateReplica(fourth, mounted->snapshot(), mounted->generation());
+        });
+        CHECK(disk(temp.directory) == full && !mounted->replica().pending);
+        mounted->discardConflictBackup(0, mounted->generation());
+        mounted->checkConflictBackupCapacity(snapshot);
+    }
+    {
+        Temp temp;
+        SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
         const tx::Snapshot empty;
         checkpoint.apply(proof, event(proof, {}), empty);
         CHECK(checkpoint.read(proof).empty());
@@ -246,6 +341,27 @@ int main() {
         CHECK(!fs::exists(temp.directory / st::FileStore::RecordName));
     }
 #ifdef CQS_STATE_TESTING
+    {
+        Temp temp;
+        SignedJoinCheckpoint checkpoint(temp.directory, key, profile);
+        checkpoint.apply(proof, tip, snapshot);
+        auto mounted = checkpoint.mount(proof);
+        const auto pending = mergeIntent(mounted->replica(), 4);
+        mounted->checkConflictBackupCapacity(snapshot);
+        st::testing::hook = [](st::testing::Point point) {
+            if (point == st::testing::Point::Published) throw std::runtime_error("Interrupted backup commit");
+        };
+        rejects(st::ErrorCode::CommitUnconfirmed, [&] { mounted->updateReplica(pending, snapshot, 1); });
+        st::testing::hook = {};
+        CHECK(!mounted->replica().pending && mounted->conflictBackupCount() == 0);
+        mounted.reset();
+
+        mounted = checkpoint.mount(proof);
+        CHECK(mounted->replica().pending && mounted->conflictBackupCount() == 1);
+        CHECK(mounted->conflictBackup(0) == snapshot && mounted->generation() == 2);
+        mounted->updateReplica(pending, snapshot, 2);
+        CHECK(mounted->conflictBackupCount() == 1 && mounted->generation() == 2);
+    }
     {
         Temp temp;
         SignedJoinCheckpoint checkpoint(temp.directory, key, profile);

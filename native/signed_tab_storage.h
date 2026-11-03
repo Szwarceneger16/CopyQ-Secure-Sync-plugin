@@ -25,6 +25,7 @@ public:
 
     void setConfiguration(std::optional<SignedTabConfiguration> configuration);
     void setGuard(std::function<bool()> guard);
+    void setSnapshotValidator(std::function<void(const transaction::Snapshot &)> validator);
     bool canSave(const QString &tab) const;
     static bool recognizes(QIODevice *file);
     ItemSaverPtr initialize(const QString &tab, QAbstractItemModel *model, int maximum);
@@ -42,6 +43,7 @@ private:
 
     std::optional<SignedTabConfiguration> configuration_;
     std::function<bool()> guard_;
+    std::function<void(const transaction::Snapshot &)> validateSnapshot_;
     std::weak_ptr<Saver> active_;
     bool restoring_ = false;
 };

@@ -26,6 +26,8 @@ constexpr unsigned InitialSchema = 3;
 constexpr unsigned EditableSchema = 5;
 constexpr unsigned ReplicaSchema = 6;
 constexpr std::size_t ReplicaIdBytes = 45;
+constexpr std::size_t MaxArchives = 4; // Includes the immutable Join snapshot.
+constexpr std::size_t MaxMergeParents = 2;
 
 [[noreturn]] void refuse() {
     throw state::Error(state::ErrorCode::InvalidRecord, "Signed Join checkpoint does not match the confirmed profile and tip");
@@ -95,21 +97,61 @@ Bytes replicaDescriptor(const SignedReplicaState &replica) {
     append(bytes, replica.cursor.id);
     append(bytes, replica.cursor.digest);
     appendNumber(bytes, replica.pending ? replica.pending->sequence : 0);
-    if (replica.pending) append(bytes, replica.pending->payload);
+    if (!replica.pending) return bytes;
+    const auto &intent = *replica.pending;
+    append(bytes, intent.payload);
+    if (intent.mergeParents.empty()) {
+        if (intent.localBefore != Token{} || !intent.selectedTip.empty()) refuse();
+        return bytes;
+    }
+    if (intent.mergeParents.size() > MaxMergeParents || intent.localBefore == Token{}) refuse();
+    bytes.push_back(static_cast<std::uint8_t>(intent.mergeParents.size()));
+    std::uint8_t selection = 0;
+    std::string_view previous;
+    for (std::size_t i = 0; i < intent.mergeParents.size(); ++i) {
+        const auto &parent = intent.mergeParents[i];
+        if (!storage::validSignedEventId(parent.id) || parent.digest == Token{} || parent.id <= previous) refuse();
+        append(bytes, parent.id);
+        append(bytes, parent.digest);
+        previous = parent.id;
+        if (parent.id == intent.selectedTip) selection = static_cast<std::uint8_t>(i + 1);
+    }
+    if (!intent.selectedTip.empty() && !selection) refuse();
+    append(bytes, intent.localBefore);
+    bytes.push_back(selection);
     return bytes;
 }
 
 SignedReplicaState decodeReplica(const Bytes &bytes) {
     constexpr auto tokenBytes = Token{}.size();
     constexpr auto baseSize = ReplicaIdBytes + tokenBytes + sizeof(std::uint64_t);
-    if (bytes.size() != baseSize && bytes.size() != baseSize + tokenBytes) refuse();
+    constexpr auto pendingSize = baseSize + tokenBytes;
+    if (bytes.size() < baseSize) refuse();
     SignedReplicaState replica{{std::string(bytes.begin(), bytes.begin() + ReplicaIdBytes), {}}, {}};
     std::copy_n(bytes.begin() + ReplicaIdBytes, tokenBytes, replica.cursor.digest.begin());
     std::uint64_t sequence = 0;
     for (auto i = ReplicaIdBytes + tokenBytes; i < baseSize; ++i) sequence = (sequence << 8) | bytes[i];
     if (bytes.size() != baseSize) {
+        if (bytes.size() < pendingSize) refuse();
         replica.pending = SignedReplicaIntent{sequence, {}};
         std::copy_n(bytes.begin() + baseSize, tokenBytes, replica.pending->payload.begin());
+        if (bytes.size() != pendingSize) {
+            auto &intent = *replica.pending;
+            const auto parents = bytes[pendingSize];
+            if (!parents || parents > MaxMergeParents ||
+                bytes.size() != pendingSize + 1 + parents * (ReplicaIdBytes + tokenBytes) + tokenBytes + 1) refuse();
+            auto current = bytes.begin() + pendingSize + 1;
+            for (std::size_t i = 0; i < parents; ++i) {
+                SignedEventParent parent{std::string(current, current + ReplicaIdBytes), {}};
+                std::copy_n(current + ReplicaIdBytes, tokenBytes, parent.digest.begin());
+                current += ReplicaIdBytes + tokenBytes;
+                intent.mergeParents.push_back(std::move(parent));
+            }
+            std::copy_n(current, tokenBytes, intent.localBefore.begin());
+            const auto selection = bytes.back();
+            if (selection > parents) refuse();
+            if (selection) intent.selectedTip = intent.mergeParents[selection - 1].id;
+        }
     }
     if (replicaDescriptor(replica) != bytes) refuse();
     return replica;
@@ -129,6 +171,11 @@ void wipe(transaction::Head &head) noexcept {
 struct WipedSnapshot {
     Snapshot value;
     ~WipedSnapshot() { wipe(value); }
+};
+
+struct WipedBytes {
+    Bytes value;
+    ~WipedBytes() { crypto::wipe(value); }
 };
 
 struct WipedRecord {
@@ -160,21 +207,24 @@ std::unique_ptr<transaction::Store::Lease> lock(state::FileStore &store) {
 SignedReplicaState checkRecord(const Record &record, const std::string &binding, const Bytes &proof,
                                const JoinActivation &expected) {
     const bool initial = record.schema == InitialSchema && record.archives.empty();
-    const bool edited = (record.schema == EditableSchema || record.schema == ReplicaSchema) &&
-                        record.archives.size() == 1 && record.generation >= 2;
+    const bool replicated = record.schema == ReplicaSchema;
+    const bool edited = record.generation >= 2 && !record.archives.empty() &&
+        ((record.schema == EditableSchema && record.archives.size() == 1) ||
+         (replicated && record.archives.size() <= MaxArchives));
     if ((!initial && !edited) || record.binding != binding || !record.generation || !record.local ||
         record.keyIdentity != digestHex(proof) || !record.preserved || record.preserved->size() != 1 ||
         record.head || record.pending ||
         record.allocatedSequence || record.publication || record.resolution || !record.witnessed.empty()) refuse();
     const auto &metadata = record.preserved->front();
-    const bool replicated = record.schema == ReplicaSchema;
     const auto descriptor = metadata.find(DescriptorMime);
     if (metadata.size() != (replicated ? 2u : 1u) || descriptor == metadata.end() ||
         descriptor->second != proof) refuse();
     if (!replicated) return {{expected.tipId, expected.tipDigest}, {}};
     const auto replica = metadata.find(ReplicaMime);
     if (replica == metadata.end()) refuse();
-    return decodeReplica(replica->second);
+    auto decoded = decodeReplica(replica->second);
+    if (decoded.pending && !decoded.pending->selectedTip.empty() && record.archives.size() < 2) refuse();
+    return decoded;
 }
 
 Snapshot &originalSnapshot(Record &record) {
@@ -209,6 +259,11 @@ WipedRecord confirm(state::FileStore &store, const Record &wanted) {
     }
     unconfirmed();
 }
+
+void checkArchiveCapacity(const Record &record) {
+    if (record.archives.size() >= MaxArchives)
+        throw state::Error(state::ErrorCode::SizeLimit, "Encrypted conflict backup limit reached");
+}
 } // namespace
 
 struct SignedJoinCheckpoint::Backing {
@@ -234,6 +289,26 @@ struct SignedJoinCheckpoint::Mounted::Impl {
     Impl(std::shared_ptr<Backing> storage, std::unique_ptr<transaction::Store::Lease> lease,
          WipedRecord record, SignedReplicaState state)
         : backing(std::move(storage)), session(std::move(lease)), checkpoint(std::move(record)), replica(std::move(state)) {}
+
+    void requireGeneration(std::uint64_t expected) const {
+        if (uncertain) unconfirmed();
+        if (checkpoint.value.generation != expected)
+            throw state::Error(state::ErrorCode::Stale, "Signed Join checkpoint mount generation changed");
+    }
+
+    void commit(const Record &wanted) {
+        auto &store = backing->store;
+        try {
+            store.commit(checkpoint.value, wanted);
+        } catch (const state::Error &error) {
+            if (error.code() == state::ErrorCode::CommitUnconfirmed) uncertain = true;
+            throw;
+        }
+        uncertain = true;
+        auto actual = confirm(store, wanted);
+        std::swap(checkpoint.value, actual.value);
+        uncertain = false;
+    }
 };
 
 SignedJoinCheckpoint::SignedJoinCheckpoint(const std::filesystem::path &privateDirectory,
@@ -294,7 +369,7 @@ std::unique_ptr<SignedJoinCheckpoint::Mounted> SignedJoinCheckpoint::mount(const
     WipedRecord actual{backing.store.load()};
     auto replica = checkRecord(actual.value, backing.binding, proofBytes, expected);
     packed::validateSnapshot(*actual.value.local, {});
-    if (!actual.value.archives.empty()) packed::validateSnapshot(actual.value.archives.front(), {});
+    for (const auto &archive : actual.value.archives) packed::validateSnapshot(archive, {});
     return std::unique_ptr<Mounted>(new Mounted(
         std::make_unique<Mounted::Impl>(backing_, std::move(session), std::move(actual), std::move(replica))));
 }
@@ -321,13 +396,18 @@ void SignedJoinCheckpoint::Mounted::save(const Snapshot &snapshot, std::uint64_t
 
 void SignedJoinCheckpoint::Mounted::updateReplica(const SignedReplicaState &replica, const Snapshot &snapshot,
                                                    std::uint64_t expectedGeneration) {
-    if (impl_->uncertain) unconfirmed();
+    impl_->requireGeneration(expectedGeneration);
     auto &cached = impl_->checkpoint.value;
-    if (expectedGeneration != cached.generation)
-        throw state::Error(state::ErrorCode::Stale, "Signed Join checkpoint mount generation changed");
     packed::validateSnapshot(snapshot, {});
     auto replicaBytes = replicaDescriptor(replica);
     const bool replicaChanged = replicaBytes != replicaDescriptor(impl_->replica);
+    const bool remoteSelection = replica.pending && !replica.pending->selectedTip.empty();
+    const bool backupRequired = remoteSelection && !impl_->replica.pending;
+    if (remoteSelection && replicaChanged) {
+        if (!backupRequired || snapshot != *cached.local || replica.cursor.id != impl_->replica.cursor.id ||
+            replica.cursor.digest != impl_->replica.cursor.digest) refuse();
+        checkArchiveCapacity(cached);
+    }
     auto &store = impl_->backing->store;
     const auto lease = lock(store);
     if (!replicaChanged && snapshot == *cached.local) {
@@ -343,17 +423,61 @@ void SignedJoinCheckpoint::Mounted::updateReplica(const SignedReplicaState &repl
                          nextGeneration(cached.generation), {}, {}, snapshot, cached.keyIdentity}};
     wanted.value.preserved = cached.preserved;
     if (replicated) wanted.value.preserved->front()[ReplicaMime] = std::move(replicaBytes);
-    wanted.value.archives.push_back(originalSnapshot(cached));
-    try {
-        store.commit(cached, wanted.value);
-    } catch (const state::Error &error) {
-        if (error.code() == state::ErrorCode::CommitUnconfirmed) impl_->uncertain = true;
-        throw;
-    }
-    impl_->uncertain = true;
-    auto actual = confirm(store, wanted.value);
-    std::swap(cached, actual.value);
+    wanted.value.archives = cached.archives;
+    if (wanted.value.archives.empty()) wanted.value.archives.push_back(originalSnapshot(cached));
+    if (backupRequired) wanted.value.archives.push_back(*cached.local);
+    impl_->commit(wanted.value);
     std::swap(impl_->replica, accepted);
-    impl_->uncertain = false;
+}
+
+void SignedJoinCheckpoint::Mounted::checkConflictBackupCapacity(const Snapshot &target) const {
+    if (impl_->uncertain) unconfirmed();
+    if (impl_->replica.pending) refuse();
+    packed::validateSnapshot(target, {});
+    auto &cached = impl_->checkpoint.value;
+    checkArchiveCapacity(cached);
+    WipedRecord wanted{cached};
+    wanted.value.schema = ReplicaSchema;
+    // Ensure there is room for both the intent and the final checkpoint generation.
+    wanted.value.generation = nextGeneration(nextGeneration(cached.generation));
+    wanted.value.preserved->front()[ReplicaMime] = replicaDescriptor(impl_->replica);
+    if (wanted.value.archives.empty()) wanted.value.archives.push_back(originalSnapshot(cached));
+    wanted.value.archives.push_back(*cached.local);
+    wipe(*wanted.value.local);
+    wanted.value.local = target;
+    const WipedBytes check{state::serialize(wanted.value)};
+}
+
+std::size_t SignedJoinCheckpoint::Mounted::conflictBackupCount() const noexcept {
+    const auto count = impl_->checkpoint.value.archives.size();
+    return count ? count - 1 : 0;
+}
+
+const Snapshot &SignedJoinCheckpoint::Mounted::conflictBackup(std::size_t index) const {
+    if (impl_->uncertain) unconfirmed();
+    if (index >= conflictBackupCount()) refuse();
+    return impl_->checkpoint.value.archives[index + 1];
+}
+
+void SignedJoinCheckpoint::Mounted::restoreConflictBackup(std::size_t index, std::uint64_t expectedGeneration) {
+    impl_->requireGeneration(expectedGeneration);
+    if (impl_->replica.pending || index >= conflictBackupCount()) refuse();
+    WipedRecord wanted{impl_->checkpoint.value};
+    wanted.value.generation = nextGeneration(expectedGeneration);
+    std::swap(*wanted.value.local, wanted.value.archives[index + 1]);
+    const auto lease = lock(impl_->backing->store);
+    impl_->commit(wanted.value);
+}
+
+void SignedJoinCheckpoint::Mounted::discardConflictBackup(std::size_t index, std::uint64_t expectedGeneration) {
+    impl_->requireGeneration(expectedGeneration);
+    if (impl_->replica.pending || index >= conflictBackupCount()) refuse();
+    WipedRecord wanted{impl_->checkpoint.value};
+    wanted.value.generation = nextGeneration(expectedGeneration);
+    auto &archives = wanted.value.archives;
+    wipe(archives[index + 1]);
+    archives.erase(archives.begin() + index + 1);
+    const auto lease = lock(impl_->backing->store);
+    impl_->commit(wanted.value);
 }
 } // namespace cqs::trust

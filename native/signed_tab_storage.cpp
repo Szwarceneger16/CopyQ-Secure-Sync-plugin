@@ -168,6 +168,7 @@ public:
         const auto &snapshot = mounted->snapshot();
         if (snapshot.size() > std::size_t(maximum)) refuse(ModelErrorCode::Changed);
         packed::validateSnapshot(snapshot, {});
+        if (owner_ && owner_->validateSnapshot_) owner_->validateSnapshot_(snapshot);
         std::vector<QVariantMap> rows;
         rows.reserve(snapshot.size());
         for (const auto &item : snapshot) {
@@ -246,6 +247,9 @@ void SignedTabStorage::setConfiguration(std::optional<SignedTabConfiguration> co
 }
 
 void SignedTabStorage::setGuard(std::function<bool()> guard) { guard_ = std::move(guard); }
+void SignedTabStorage::setSnapshotValidator(std::function<void(const transaction::Snapshot &)> validator) {
+    validateSnapshot_ = std::move(validator);
+}
 
 bool SignedTabStorage::authorized(const SignedTabConfiguration &configuration) const {
     if (!guiThread(this) || !configuration_ || !sameConfiguration(*configuration_, configuration) || !guard_)

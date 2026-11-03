@@ -67,11 +67,15 @@ requires Encrypt Tabs and a compatible plugin configuration. The tab keeps
 local edits in its private encrypted checkpoint. With the tab unloaded, the
 wizard's explicit [Synchronize signed_sync](docs/DEVICE-TRUST-COORDINATOR.md#manual-signed-tab-synchronization)
 action can download verified history into a clean checkpoint or publish local
-edits as an encrypted signed packet. Divergent history is preserved for
-review. Legacy tabs and synchronization remain separate.
+edits as an encrypted signed packet. The wizard also offers
+[explicit conflict resolution and encrypted backups](docs/DEVICE-TRUST-COORDINATOR.md#review-and-resolve-signed-conflicts),
+[session-only background synchronization](docs/DEVICE-TRUST-COORDINATOR.md#signed-background-synchronization)
+while the tab is unloaded, and
+[local recovery of a pending publication after key rotation](docs/DEVICE-TRUST-COORDINATOR.md#recover-pending-publication-after-key-rotation).
+Legacy tabs and synchronization remain separate.
 Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
-Guided provisioning, background signed synchronization, signed conflict
-resolution and platform qualification remain outside this experiment.
+Guided provisioning, founder activation, cross-generation activation and
+platform qualification remain outside this experiment.
 
 ## Build and test pipeline
 

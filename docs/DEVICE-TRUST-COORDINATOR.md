@@ -9,9 +9,11 @@ activation preflight. Build them with
 The tests use disposable directories and synthetic keys. The separate
 [native experiment](#experimental-native-signed-join) can open a verified Join
 checkpoint in an editable CopyQ tab and
-[synchronize it on demand](#manual-signed-tab-synchronization) while it is
-unloaded. Guided provisioning, background signed synchronization, cloud
-delivery and recovery remain product integration work.
+[synchronize it on demand](#manual-signed-tab-synchronization) or
+[during an explicitly enabled CopyQ session](#signed-background-synchronization)
+while it is unloaded. It supports explicit signed conflict decisions and local
+retirement of pending publications after key rotation. Guided provisioning,
+cloud delivery and cross-generation activation remain product integration work.
 The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
@@ -269,7 +271,8 @@ packet was stored cannot be resumed or re-encrypted. A sealing error after
 the first commit leaves the same empty reservation. Use
 `discardClipboardEvent()` with the matching sequence to retire a reservation
 before a publication attempt. The sequence and any counted attempt remain
-allocated.
+allocated. Tagged replica reservations require the corresponding authenticated
+checkpoint intent and are handled by the signed tab workflow below.
 
 A same-generation Add permits resume for an author still active at the
 current head and preserves the attempt counter and witnesses. An authenticated
@@ -556,9 +559,79 @@ Synchronization uses the last locally accepted trust state. Membership
 certificates and key packages are exchanged and installed through the
 separate explicit workflow. An observed membership fork, removal of the
 local device or change in key generation stops the current profile from
-synchronizing. An interrupted publication across a key rotation remains
-encrypted and requires a later recovery workflow. Conflict resolution,
-background synchronization and founder activation remain separate work.
+synchronizing. An eligible device can explicitly retire a matching
+old-generation reservation locally after key rotation.
+
+### Review and resolve signed conflicts
+
+1. Leave the activated tab unloaded. Open Signed Join and select **Resolve
+   signed conflict**. The wizard presents one or two authenticated signed
+   versions and shows their full revision IDs and packet digests. Conflicts
+   with more than two signed tips are refused by this wire version.
+2. Choose **Keep this device's encrypted local copy** or select an exact
+   signed revision. Confirm the displayed versions. The journal revalidates
+   the reviewed local copy and exact signed tip set before publication.
+3. The resolution is a signed update referencing every reviewed tip. The
+   existing signed packets remain in history. A remote selection archives the
+   prior local copy inside the encrypted checkpoint before publication. If
+   another signed branch appears, review the current state before attempting
+   another resolution. For a pending publication, use **Synchronize signed_sync**
+   with the same profile and transport to reconcile the existing intent.
+
+The checkpoint supports up to three encrypted conflict backups, subject to
+private-record capacity. A remote selection is refused if the backup cannot be
+retained. Use **Manage encrypted conflict backups** to review their item
+counts. **Restore** swaps the selected backup with the current working copy
+and leaves the signed cursor in place. Restoring a copy is a local edit.
+**Remove backup** requires confirmation and removes only the selected backup
+from the active checkpoint. Older filesystem blocks, storage snapshots or
+independent copies may still contain it. Both actions require the checkpoint
+generation to match the reviewed list and are refused during a pending
+publication. CopyQ item limits and protected rows also apply to restored or
+selected remote content.
+
+### Signed background synchronization
+
+Activate and unload `signed_sync`, and use manual synchronization to verify
+the source if it has no pin yet. In Signed Join, select **Start signed
+background synchronization**, review the source and confirm that the current
+CopyQ session may send encrypted signed updates and fetch verified changes.
+The wizard closes and the background action checks again at 30-second intervals.
+It uses the same authenticated history and checkpoint rules as the manual
+action. The tab must remain activated in the current profile, and background
+work runs only while it is unloaded.
+
+Opening the tab cancels or waits for the active operation to release the
+checkpoint and defers further work while the tab is loaded. Applying or
+reloading settings, disabling the plugin, opening Signed Join again or exiting
+CopyQ stops the background session. Use **Stop signed background
+synchronization** in Preferences to stop it explicitly. Stopping waits for an
+already-started publication to finish or return an error. Any durable pending
+intent remains available for manual review. Conflicts, pending work and
+synchronization errors stop the session, with status shown in Preferences.
+The user must review and reconcile pending work manually.
+
+Authorization and the unlocked backend are held in memory for this CopyQ
+process. Stopping releases the background backend and its credentials. Each
+new CopyQ process requires a fresh opt-in.
+
+### Recover pending publication after key rotation
+
+After the private journal accepts a newer key generation, a device that
+remains an authorized member can select **Recover pending publication after
+key rotation** in Signed Join with the same activated profile and source.
+Review the prompt and confirm local retirement. The operation matches the
+old reservation to the encrypted checkpoint intent, keeps the working copy
+and its old cursor, and does no transport I/O. The result distinguishes
+an unattempted publication, a confirmed earlier transport write, and an
+earlier publication that may have reached transport when the journal cannot
+confirm its outcome. Existing transport history remains available.
+
+The checkpoint remains bound to the original key generation. Activation
+under the new generation requires separate authenticated setup. A membership
+fork, removed device or mismatched reservation blocks this recovery.
+Current readers can open earlier private records. Older builds can refuse
+records written with conflict backups, merge intents or rotation evidence.
 
 ## Clock and rollback limits
 
@@ -611,9 +684,10 @@ certificate retry and signed-history preflight with synthetic clipboard
 data. The signed checkpoint suite exercises encrypted reopen, exact retry,
 immutable baseline retention and refusal of changed or stale data. Native
 builds with testing enabled include the Qt comparison dialog test. The opt-in
-native build also includes `native-signed-tab-storage` and exercises marker
-handling in `native-loader`. These focused tests do not qualify the installed
-CopyQ GUI or sandboxed packages.
+native build also includes `native-signed-tab-storage`,
+`native-signed-replica-background` and marker handling in `native-loader`.
+These focused tests do not qualify the installed CopyQ GUI or sandboxed
+packages.
 Exact results belong to the implementing PR and current test run.
 
 Qualification still requires Windows/NTFS and Flatpak, physical power-loss
