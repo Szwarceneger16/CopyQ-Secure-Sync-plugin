@@ -83,6 +83,10 @@ public:
     Membership(const Token &group, const Member &founder, const Token &recovery,
                const Token &initialKeyCommitment);
     const State &current() const noexcept { return states_.back(); }
+    const State *acceptedState(const Token &digest) const {
+        const auto found = stateIndex_.find(digest);
+        return found == stateIndex_.end() ? nullptr : &states_[found->second];
+    }
     bool forked() const noexcept { return forked_; }
     std::size_t stateCount() const noexcept { return states_.size(); }
     std::size_t reservationCount() const noexcept { return reservations_.size(); }

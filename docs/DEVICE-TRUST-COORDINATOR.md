@@ -203,10 +203,33 @@ private staging directory on the same fixed NTFS volume. Keep that directory
 outside the transport.
 
 The file transport exercises the control exchange in isolated directories.
-Address discovery, cloud-client delivery, profile activation and signed clipboard
-events remain product integration work. A file sync service can withhold packets
+Address discovery, cloud-client delivery, profile activation and signed event
+publication remain product integration work. A file sync service can withhold packets
 or membership changes, and control headers and receipts expose public protocol
 metadata to observers of the transport.
+
+## Signed clipboard history
+
+The [signed event format](DEVICE-TRUST-PROTOCOL.md#signed-clipboard-event-format)
+authenticates the full author ID, accepted membership head, key generation,
+revision identity, exact parent packet digests and ciphertext. The signature is
+verified before AES-GCM decryption. Packed items remain subject to CopyQ's
+semantic import checks when a runtime adapter consumes them.
+
+The journal encodes under its current authorized state and checks the key
+commitment and reuse policy. Batch reads verify under one journal lease and
+accept only the current generation. An earlier accepted head within that
+generation is eligible when the signer was a member at that head and is still
+active. The graph checks exact parent packet bytes, parent membership epochs,
+unique revision IDs and monotonic author sequences along every ancestor path.
+The input order is independent of graph order. Both wire and plaintext budgets
+apply to the entire batch.
+
+The isolated encoder and reader form a pre-publication boundary. Runtime use
+requires durable sequence and exact wire reservation, immutable publication,
+history witnesses across scans, generation-specific storage and explicit legacy
+archive migration. An empty or incomplete batch grants no authority to seed a
+history. A reader can enforce membership history and events it has observed.
 
 ## Clock and rollback limits
 
@@ -238,7 +261,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,

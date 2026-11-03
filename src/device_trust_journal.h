@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "device_trust.h"
+#include "device_signed_event.h"
 #include "state_store.h"
 #include <atomic>
 
@@ -33,6 +34,11 @@ struct JournalStatus {
     std::vector<crypto::Bytes> certificates;
     bool installedKey = false;
     std::vector<Token> confirmedDeliveries;
+};
+struct SignedEventHistory {
+    std::vector<events::Event> events;
+    history::Graph graph;
+    std::map<std::string, Token> wireDigests;
 };
 
 // Test-only control-plane coordinator. A dedicated encrypted FileStore outside
@@ -89,6 +95,16 @@ public:
     // barrier, then published under the same lease. Returns its packet address.
     std::string publishReceipt(const Identity &recipient, const storage::Directory &transport,
                                std::uint64_t trustedNow, const std::filesystem::path &privateStaging = {});
+    // Laboratory encoder. A future publisher must reserve the sequence and
+    // exact output durably before any external release.
+    crypto::Bytes signClipboardEvent(const Identity &author, const SyncKey &key, std::uint64_t sequence,
+                                     const std::vector<SignedEventParent> &parents,
+                                     const std::vector<std::string> &packedItems,
+                                     std::uint64_t trustedNow, events::Limits limits = {});
+    // Read-only current-generation snapshot. Input identities come from the
+    // caller's checked file mapping. An empty result grants no Seed authority.
+    SignedEventHistory readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
+                                         std::uint64_t trustedNow, events::Limits limits = {});
 private:
     crypto::Bytes prepare(const Token &recipient, const Identity &sender, const SyncKey &key,
                          std::uint64_t now, KeyScope scope);

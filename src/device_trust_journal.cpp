@@ -4,8 +4,10 @@
 #include "device_key_envelope.h"
 #include "device_key_receipt.h"
 #include "storage.h"
+#include <sodium.h>
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <utility>
 
 namespace cqs::trust {
@@ -270,6 +272,68 @@ void add(Log &log, Kind kind, std::uint64_t now, Bytes bytes) {
     log.entries.push_back({kind, now, std::move(bytes)});
     log.watermark = std::max(log.watermark, now);
 }
+SignedEventContext eventContext(const State &state, const Token &author) {
+    return {state.group, state.root, state.digest, state.keyCommitment, author, state.keyGeneration};
+}
+void checkEventKey(const Log &log, const Genesis &genesis, const State &state, const SyncKey &key) {
+    if (key.commitment(state.group, state.keyGeneration) != state.keyCommitment)
+        throw EnvelopeError(EnvelopeCode::KeyMismatch);
+    checkPriorKeys(log, genesis, state, key);
+}
+std::map<Token, std::size_t> eventAuthors(const State &state) {
+    std::map<Token, std::size_t> authors;
+    std::set<std::string> names;
+    for (const auto &member : state.members) {
+        if (!names.insert(SignedEventCodec::deviceName(member.id)).second) throw Error(ErrorCode::Invalid);
+        authors.emplace(member.id, authors.size());
+    }
+    return authors;
+}
+struct EventEvidence {
+    std::vector<SignedEventParent> parents;
+    std::uint64_t epoch;
+    std::size_t author;
+};
+history::Graph checkedSignedGraph(const std::vector<history::Revision> &revisions,
+                                  const std::vector<EventEvidence> &evidence,
+                                  const std::map<std::string, std::size_t> &positions,
+                                  const std::map<std::string, Token> &digests) {
+    std::vector<std::array<std::uint64_t, MaxMembers>> ancestors(revisions.size());
+    std::vector<std::vector<std::size_t>> children(revisions.size());
+    std::vector<std::size_t> remaining, ready;
+    remaining.reserve(revisions.size()); ready.reserve(revisions.size());
+    for (std::size_t index = 0; index < evidence.size(); ++index) {
+        const auto &event = evidence[index];
+        remaining.push_back(event.parents.size());
+        if (event.parents.empty()) ready.push_back(index);
+        for (const auto &parent : event.parents) {
+            // Report contradictions among present parents even when another
+            // parent has not yet arrived. The Graph handles absent parents.
+            const auto found = positions.find(parent.id);
+            if (found == positions.end()) continue;
+            const auto prior = found->second;
+            if (digests.at(parent.id) != parent.digest || evidence[prior].epoch > event.epoch)
+                throw Error(ErrorCode::Invalid);
+            children[prior].push_back(index);
+        }
+    }
+    history::Graph graph(revisions);
+    for (std::size_t cursor = 0; cursor < ready.size(); ++cursor) {
+        const auto index = ready[cursor];
+        auto &witness = ancestors[index];
+        const auto author = evidence[index].author;
+        const auto sequence = revisions[index].sequence;
+        if (sequence <= witness[author])
+            throw history::Error(history::ErrorCode::NonmonotonicParent, "Signed event refers to its author's future");
+        witness[author] = sequence;
+        for (const auto child : children[index]) {
+            for (std::size_t slot = 0; slot < witness.size(); ++slot)
+                ancestors[child][slot] = std::max(ancestors[child][slot], witness[slot]);
+            if (--remaining[child] == 0) ready.push_back(child);
+        }
+    }
+    return graph;
+}
 } // namespace
 
 JournalError::JournalError(JournalCode code) : std::runtime_error("Device trust journal refused"), code_(code) {}
@@ -501,5 +565,86 @@ std::string TrustJournal::publishReceipt(const Identity &recipient, const storag
     const auto id = storage::controlPacketId(wire);
     transport.publishControl(wire, privateStaging);
     return id;
+}
+
+Bytes TrustJournal::signClipboardEvent(const Identity &author, const SyncKey &key, std::uint64_t sequence,
+                                      const std::vector<SignedEventParent> &parents,
+                                      const std::vector<std::string> &packedItems,
+                                      std::uint64_t now, events::Limits limits) {
+    const auto lease = lock(); const auto record = load();
+    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    if (author.member() != local_) fail(JournalCode::WrongPins);
+    clock(log, now);
+    const auto &state = membership.current();
+    if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
+    (void)eventAuthors(state);
+    checkEventKey(log, genesis_, state, key);
+    return SignedEventCodec::seal(eventContext(state, local_.id), author, key, sequence, parents, packedItems, limits);
+}
+
+SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
+                                                  std::uint64_t now, events::Limits limits) {
+    SignedEventCodec::validateLimits(limits);
+    if (input.size() > limits.events) throw Error(ErrorCode::Limit);
+    std::size_t remainingWire = limits.historyBytes;
+    for (const auto &wire : input) {
+        if (wire.bytes.size() > limits.eventBytes || wire.bytes.size() > remainingWire)
+            throw Error(ErrorCode::Limit);
+        remainingWire -= wire.bytes.size();
+    }
+    const auto lease = lock(); const auto record = load();
+    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto membership = replay(log, genesis_, local_);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    clock(log, now);
+    const auto &state = membership.current();
+    if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
+    const auto authors = eventAuthors(state);
+    checkEventKey(log, genesis_, state, key);
+    std::vector<events::Event> decoded;
+    struct WipeOnFailure {
+        std::vector<events::Event> &events;
+        bool released = false;
+        ~WipeOnFailure() {
+            if (!released) for (auto &event : events)
+                for (auto &item : event.items) if (!item.empty()) sodium_memzero(item.data(), item.size());
+        }
+    } wipe{decoded};
+    std::vector<history::Revision> revisions;
+    std::vector<EventEvidence> evidence;
+    std::map<std::string, std::size_t> positions;
+    std::map<std::string, Token> digests;
+    decoded.reserve(input.size()); revisions.reserve(input.size()); evidence.reserve(input.size());
+    std::size_t remainingPlain = limits.historyPlaintextBytes;
+    for (const auto &wire : input) {
+        auto header = SignedEventCodec::inspect(wire.bytes, limits);
+        const auto &claimed = header.context;
+        if (claimed.group != state.group || claimed.root != state.root) throw Error(ErrorCode::WrongGroup);
+        if (claimed.generation != state.keyGeneration || claimed.commitment != state.keyCommitment)
+            throw Error(ErrorCode::Stale);
+        const auto *head = membership.acceptedState(claimed.head);
+        if (!head) throw Error(ErrorCode::MissingParent);
+        if (head->keyGeneration != state.keyGeneration || head->keyCommitment != state.keyCommitment)
+            throw Error(ErrorCode::Stale);
+        const auto &author = member(*head, claimed.author);
+        if (member(state, claimed.author) != author) throw Error(ErrorCode::NotMember);
+        if (!remainingPlain) throw Error(ErrorCode::Limit);
+        auto perEvent = limits;
+        perEvent.plaintextBytes = std::min(limits.plaintextBytes, remainingPlain);
+        decoded.push_back(SignedEventCodec::open(wire, eventContext(*head, author.id), author, key, perEvent));
+        const auto &event = decoded.back();
+        if (event.plaintextBytes > remainingPlain) throw Error(ErrorCode::Limit);
+        remainingPlain -= event.plaintextBytes;
+        if (!positions.emplace(event.revision.id, revisions.size()).second)
+            throw history::Error(history::ErrorCode::DuplicateRevision, "Duplicate signed revision ID");
+        digests.emplace(event.revision.id, SignedEventCodec::digest(wire.bytes));
+        revisions.push_back(event.revision);
+        evidence.push_back({std::move(header.parents), head->epoch, authors.at(author.id)});
+    }
+    auto graph = checkedSignedGraph(revisions, evidence, positions, digests);
+    wipe.released = true;
+    return {std::move(decoded), std::move(graph), std::move(digests)};
 }
 } // namespace cqs::trust

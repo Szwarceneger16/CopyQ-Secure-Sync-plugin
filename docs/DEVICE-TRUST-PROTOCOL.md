@@ -227,6 +227,38 @@ CopyQ Join has succeeded.
 A removed member keeps any earlier key it obtained. A later generation uses a
 fresh key and survivor-specific delivery.
 
+## Signed clipboard event format
+
+The laboratory packet starts with `CopyQ-Secure-Sync-signed-event-lab-v1`
+including NUL and version `1` as `u32BE`. Its header contains, in order,
+`group32 || root32 || head32 || commitment32 || author32`, generation and
+sequence as `u64BE`, the 45-byte ASCII revision ID and parent count as `u8`.
+Zero to two parents follow in sorted revision-ID order. Each consists of its
+45-byte revision ID and SHA-256 of the full parent packet. The file identity
+must independently match the signed revision ID. The device component starts
+with `d` followed by the first 31 lowercase base32 characters of the full
+author ID's SHA-256 digest. The journal refuses collisions among active devices.
+
+The remaining header is a random 12-byte nonce and the ciphertext-with-tag
+length as `u32BE`. AES-256-GCM authenticates the exact header as AAD. The key
+is HMAC-SHA256 with the generation secret as key and the domain
+`CopyQ-Secure-Sync-signed-event-aes-gcm-key-lab-v1` including NUL, then
+`group32 || root32 || generation-u64BE` as input. The encrypted payload has
+domain `CopyQ-Secure-Sync-signed-event-payload-lab-v1` including NUL, item count
+as `u32BE` and canonical base64 packed items with `u32BE` byte lengths.
+The derived key is shared across authors in the same generation. Before
+enabling publication, enforce a lifetime encryption budget for random GCM
+nonces across all authors, including packets discarded before publication.
+
+The final 64 bytes are the author's Ed25519 signature over the domain
+`CopyQ-Secure-Sync-signed-event-signature-lab-v1` including NUL and SHA-256 of
+the exact header and ciphertext-with-tag. The reader authenticates that
+signature before opening the payload. Current-generation history rejects
+packets from old generations and forks, while allowing verified ancestors from
+earlier accepted heads in the same generation. Signed history uses a separate
+format and derived key from the legacy archive. Product migration must preserve
+that archive and establish an explicit successor history.
+
 ## Independent recovery credential
 
 The proposed first recovery format uses a generated 256-bit random recovery
