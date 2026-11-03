@@ -70,10 +70,11 @@ int main() { return 0; }" CQS_SODIUM_HEADERS_SUPPORTED)
     endif()
     add_library(cqs-device-control STATIC
       src/device_identity.cpp src/device_identity_vault.cpp src/device_trust_journal.cpp
-      src/device_key_envelope.cpp)
+      src/device_key_envelope.cpp src/device_key_receipt.cpp)
     target_include_directories(cqs-device-control PRIVATE "${CQS_SODIUM_INCLUDE_DIR}")
     target_link_libraries(cqs-device-control PUBLIC cqs-device-trust "${CQS_SODIUM_LIBRARY}")
-    foreach(kind device_identity device_identity_vault device_trust_journal device_key_envelope device_key_delivery)
+    foreach(kind device_identity device_identity_vault device_trust_journal device_key_envelope
+                 device_key_delivery device_key_receipt device_key_lifecycle)
       add_executable(cqs-${kind}-test tests/${kind}_test.cpp)
       target_include_directories(cqs-${kind}-test PRIVATE "${CQS_SODIUM_INCLUDE_DIR}")
       target_link_libraries(cqs-${kind}-test PRIVATE cqs-device-control)

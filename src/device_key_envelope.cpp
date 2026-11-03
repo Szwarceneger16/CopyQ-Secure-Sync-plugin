@@ -63,7 +63,8 @@ bool zero(const Token &token) {
 
 void validate(const KeyEnvelopeContext &context) {
     if (zero(context.group) || zero(context.root) || zero(context.successor) || zero(context.proposal) ||
-        zero(context.sender) || zero(context.commitment) || context.scope != KeyScope::CurrentGeneration ||
+        zero(context.sender) || zero(context.commitment) ||
+        (context.scope != KeyScope::CurrentGeneration && context.scope != KeyScope::CatchUp) ||
         !SodiumVerifier::validMember(context.recipient)) {
         fail(EnvelopeCode::Invalid);
     }

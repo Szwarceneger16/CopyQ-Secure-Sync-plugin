@@ -421,7 +421,7 @@ int main()
         f.reopen(0);
         const auto wire = f.prepare(0, 1, *f.initialKey);
         CHECK(contains(durable, wire));
-        CHECK(f.store(0).commits == commits);
+        CHECK(f.store(0).commits == commits + 1);
         CHECK(f.receive(1, wire)->sameKey(*f.initialKey));
     });
     test("version 1 journal retains prior vote and accepted head when adding an outbox", [] {

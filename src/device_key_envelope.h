@@ -3,7 +3,7 @@
 #include "device_identity.h"
 
 namespace cqs::trust {
-enum class KeyScope : std::uint8_t { CurrentGeneration = 1 };
+enum class KeyScope : std::uint8_t { CurrentGeneration = 1, CatchUp = 2 };
 
 struct KeyEnvelopeContext {
     Token group{}, root{}, successor{}, proposal{};

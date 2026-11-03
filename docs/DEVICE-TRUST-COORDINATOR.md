@@ -1,11 +1,11 @@
 # Device identities, durable approvals and key delivery
 
 The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
-with real signatures, a local identity vault, durable approvals and signed key
-envelopes. Build them with `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
+with real signatures, a local identity vault, durable approvals, signed key
+envelopes and durable recipient storage. Build them with `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. Product integration
-requires peer verification, transport publication, installation of the received
-key, acknowledged Join and recovery. The [protocol design](DEVICE-TRUST-PROTOCOL.md)
+requires peer verification, transport publication, CopyQ profile activation,
+authenticated Join and recovery. The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
 
@@ -120,31 +120,57 @@ there is no automatic branch winner or quorum downgrade.
 
 `prepareDelivery()` holds the journal lease through replay, authorization,
 encryption and commit. An Add authorizes delivery from an existing member to the
-new member. A Remove authorizes delivery between two distinct survivors. Both
-operations use the exact current successor and proposal digests. Peers with
-different valid quorum subsets for the same proposal can therefore interoperate.
-The sender proves possession of the accepted generation key by matching its
-commitment. Both sides recompute candidate commitments for retained earlier
-generations and reject known raw-key reuse.
+new member. A Remove authorizes delivery between two distinct survivors.
+`prepareCatchUp()` is a separate local operation for an earlier member who is
+still active at a later Add. It creates a fresh envelope for the current head.
+The Add newcomer and Remove survivors use the ordinary delivery scope. All
+packages bind the exact current successor and proposal digests. Peers with
+different valid quorum subsets for the same proposal can interoperate.
+The sender must match the accepted generation commitment. Both sides recompute
+candidate commitments for retained earlier generations to detect raw-key reuse.
 
-One envelope per recipient is staged in the encrypted journal. Version 1 records
-remain readable. Version 2 appends a nonempty, recipient-sorted table of at most
-32 entries. Each entry is `recipient32 || length-u32BE || envelope`, following a
-`count-u32BE`. Entries use the existing 4,096-byte field and 2 MiB journal limits.
-Reopen verifies each saved envelope's exact context and sender signature. An
-exact retry returns the same ciphertext. A commit error suppresses the result
-and requires reopening. Advancing the head or observing a fork clears the old
-outbox while retaining the membership evidence.
+The sender stages one envelope per recipient. Reopening verifies every staged
+envelope against current membership and the sender's pinned identity. A retry
+commits the same bytes again before returning them, including when the prior
+commit reported an uncertain result. Advancing the head or observing a fork
+clears staged envelopes and their receipts while retaining membership evidence.
+Publication must recheck the head under a live guard because a returned package
+can outlive the lease. A peer can enforce the revocations and forks it observes.
 
-`receiveDelivery()` verifies local pins, current authorization and the signature
-before opening the sealed payload. It compares the inner and outer context and
-the key commitment before returning a guarded key. An accepted envelope grants
-access to records encrypted with that generation, including its existing
-history. A newer accepted head invalidates packages tied to the older head.
-Production needs an authorized catch-up or a rule that coordinates head changes
-with delivery completion. Publication must recheck the head under a live guard
-because prepared bytes can outlive the journal lease. A peer can enforce only
-the revocations and forks it has already observed.
+## Recipient installation and receipts
+
+`installDelivery()` authenticates a current envelope and checks its opened key
+before committing the exact sealed package into the recipient journal. It signs
+the storage receipt only after that commit returns successfully. Retrying after
+an uncertain write requires a fresh open and successful durability barrier. A
+different valid envelope for the same head may replace the installed package
+only through the same checks and commit. The generation commitment binds both
+packages to the same key.
+
+`loadInstalledKey()` verifies the saved envelope against the historical accepted
+state in which it arrived and checks the current recipient, generation and
+commitment before opening it. This preserves the installed key across an Add
+with the same generation and commitment. Rotation or a detected fork discards
+the installed package. The journal stores the sealed package, and opening it
+requires the local identity. Originating genesis and rotation keys require their
+own durable preparation path.
+
+`recordReceipt()` verifies the recipient signature against the exact package
+already staged for it. The signed receipt commits to the envelope digest, both
+endpoints, the membership transition, generation, commitment and scope. The
+sender persists that receipt alongside the package until the head advances.
+Repeating a valid receipt for the same package is idempotent. A receipt is the
+authenticated recipient's assertion of storage. The honest implementation signs
+it after persistence. Authenticated CopyQ Join is a separate product milestone.
+
+Version 1 and 2 journal records remain readable. When delivery fields exist,
+version 3 writes the usual event log followed by an outbound count (`u32BE`),
+then recipient-sorted entries `recipient32 || envelopeField || receiptField`,
+then `installedEnvelopeField`. A field is its length (`u32BE`) and exact bytes.
+Zero length represents an absent receipt or installed package. Outbound
+entries require nonempty envelopes and at most 32 recipients. A version 3
+record requires at least one outbound envelope or an installed package. Each
+field is bounded to 4,096 bytes and the entire journal to 2 MiB.
 
 ## Clock and rollback limits
 
@@ -176,7 +202,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,
@@ -188,7 +214,9 @@ commit acknowledgement. Its Linux disk case uses disposable private directories
 to test encrypted FileStore creation and reopen. No user keys or profiles are
 loaded. The vault, envelope and delivery suites cover authenticated reopen,
 recipient and context substitution, key commitment checks and durable ciphertext
-retry. Exact results belong to the implementing PR and current test run.
+retry. The receipt and lifecycle suites cover commit-before-sign, receipt
+substitution, catch-up, rotation, historical replay and encrypted disk reopen.
+Exact results belong to the implementing PR and current test run.
 
 Qualification still requires Windows/NTFS and Flatpak, physical power-loss
 behavior, human peer verification and production transport. Enable the optional

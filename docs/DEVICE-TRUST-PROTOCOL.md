@@ -16,8 +16,9 @@ each signature against exact bytes and the parent's signing public key.
 
 The optional [control-plane laboratory](DEVICE-TRUST-COORDINATOR.md) adds real
 libsodium signatures, an encrypted identity vault, durable approval coordination
-and signed key envelopes. It replays pinned history, commits reservations before
-signing and durably stages the exact ciphertext for each authorized recipient.
+and signed key envelopes and storage receipts. It replays pinned history,
+commits reservations before signing and durably stages the exact ciphertext
+for each authorized recipient.
 The acceptance gates cover integration with a running CopyQ profile.
 
 ## Cryptographic suite selected for integration
@@ -186,7 +187,7 @@ The context is 301 bytes in this order.
 | Sender | member ID, 32 bytes |
 | Key generation | u64BE |
 | Key commitment | 32 bytes |
-| Scope | u8, value 1 for current generation |
+| Scope | u8, 1 for ordinary delivery or 2 for catch-up after a later Add |
 
 The sealed payload is `CopyQ-Secure-Sync-key-envelope-plaintext-lab-v1` including
 NUL, the identical context and `key32`. Its sealed-box encoding adds 48 bytes to
@@ -197,18 +198,28 @@ inner context and recomputes the commitment before returning the guarded key.
 Independent fixtures exercise the byte layout and detached signature.
 
 The [coordinator](DEVICE-TRUST-COORDINATOR.md#key-delivery-at-the-accepted-head)
-stages at most one exact ciphertext per current recipient and invalidates that
-outbox on a head change or fork. The archive retains both authenticated fork
-certificates. Scope 1 delivers the current generation key, with access to all
+stages one exact ciphertext per recipient and discards its outbox on a head
+change or fork. Both scopes deliver the current generation key, with access to
 records encrypted under it. Membership is authorized by the accepted intent,
 so different valid certificate signature sets can yield the same envelope context.
+Scope 2 permits an explicit catch-up at a later Add for a recipient admitted
+before that Add. The new member and Remove survivors use scope 1.
+
+A storage receipt is 442 bytes. Its signed prefix is the domain
+`CopyQ-Secure-Sync-key-storage-receipt-lab-v1` including NUL, version `u32BE` value
+1, `group32 || root32 || successor32 || proposal32 || sender32 || Member96`
+for the recipient, `generation-u64BE || commitment32 || envelopeDigest32 || scope-u8`.
+The digest is SHA-256 of the exact full envelope. The final 64 bytes are the
+recipient's detached Ed25519 signature over the 378-byte prefix. The recipient
+signs after its sealed package is durably stored. The sender verifies the receipt
+against the staged package and current head before saving it. Historical
+validated packages can supply the installed key only while the recipient,
+generation and commitment remain current and the journal is free of forks.
 
 Product integration must durably prepare the random rotation secret before
-soliciting approvals, install a received key only for its validated generation,
-recheck membership at immutable publication and specify how an eligible peer
-catches up if delivery missed the accepted head. After authenticated Join, the
-recipient signs a stage-specific acknowledgement bound to group, successor,
-request and package digest. Show completion only after that acknowledgement.
+soliciting approvals and recheck membership at immutable publication. Use the
+validated installed key to start authenticated CopyQ Join. The product must
+publish its separate completion acknowledgement after Join has succeeded.
 A removed member keeps any earlier key it obtained. A later generation uses a
 fresh key and survivor-specific delivery.
 
@@ -247,9 +258,9 @@ prompt; they must not silently weaken the trust policy or CopyQ encryption.
 
 G1-G4 now have concrete choices and isolated implementations for membership,
 identity storage, signing, approvals and key envelopes. Remaining product work
-includes trusted-screen verification, durable generation-key installation and
-rotation preparation, publication and acknowledgement, recovery and platform
-qualification. Full disk/key rollback across restarts requires an external
+includes trusted-screen verification, durable originator-key preparation,
+production transport and CopyQ profile activation, acknowledged Join, recovery
+and platform qualification. Full disk/key rollback across restarts requires an external
 monotonic anchor or explicit recovery policy. G5's signed event migration and
 G6-G7's installer/platform qualification still gate distribution. Advanced
 settings remain ordinary UI.

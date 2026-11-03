@@ -45,11 +45,13 @@ decisions and remaining integration gates. It is not active in the plugin and
 does not yet provide a working pairing wizard or installer.
 
 The [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) exercises
-Ed25519 approvals, a local identity vault and signed key envelopes for authorized
-recipients. The encrypted journal commits approval intent before signing and
-stores the exact envelope before returning it for delivery. Build the isolated
-tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer. Product use
-requires guided setup, transport and authenticated key installation.
+Ed25519 approvals, a local identity vault and signed key envelopes. A recipient
+can store its sealed package durably, reopen the current key after restart and
+sign a storage receipt. An explicit catch-up operation can deliver a fresh
+package to an earlier active member at a later accepted head. Build these tests
+with `CQS_TEST_DEVICE_CRYPTO=ON` and
+libsodium 1.0.22 or newer. Product use requires guided setup, guarded transport
+and integration with the CopyQ profile.
 
 ## Build and test pipeline
 

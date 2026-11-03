@@ -7,13 +7,14 @@
 namespace cqs::trust {
 class Identity;
 class SyncKey;
+enum class KeyScope : std::uint8_t;
 struct Genesis {
     Token group{};
     Member founder;
     Token recovery{}, initialKeyCommitment{};
 };
 enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy,
-                         Delivery, KeyReuse };
+                         Delivery, KeyReuse, MissingKey };
 class JournalError final : public std::runtime_error {
 public:
     explicit JournalError(JournalCode code);
@@ -28,6 +29,8 @@ struct JournalStatus {
     std::size_t operations = 0, reservations = 0;
     // Full authenticated accepted and conflicting certificates, in observation order.
     std::vector<crypto::Bytes> certificates;
+    bool installedKey = false;
+    std::vector<Token> confirmedDeliveries;
 };
 
 // Test-only control-plane coordinator. A dedicated encrypted FileStore outside
@@ -64,11 +67,22 @@ public:
     // authorization under its live guard before releasing the prepared bytes.
     crypto::Bytes prepareDelivery(const Token &recipient, const Identity &sender,
                                   const SyncKey &key, std::uint64_t trustedNow);
+    // Explicit catch-up after a later Add for a member who was already admitted.
+    crypto::Bytes prepareCatchUp(const Token &recipient, const Identity &sender,
+                                const SyncKey &key, std::uint64_t trustedNow);
     // Authenticates against the current pinned head before opening. The returned
     // key remains guarded. Installing it in a CopyQ profile is a separate step.
     std::unique_ptr<SyncKey> receiveDelivery(const crypto::Bytes &wire, const Identity &recipient,
                                              std::uint64_t trustedNow);
+    // Store the authenticated sealed package before signing the storage receipt.
+    crypto::Bytes installDelivery(const crypto::Bytes &wire, const Identity &recipient,
+                                  std::uint64_t trustedNow);
+    std::unique_ptr<SyncKey> loadInstalledKey(const Identity &recipient, std::uint64_t trustedNow);
+    // True when a verified storage receipt was added to the current outbox.
+    bool recordReceipt(const crypto::Bytes &receipt, std::uint64_t trustedNow);
 private:
+    crypto::Bytes prepare(const Token &recipient, const Identity &sender, const SyncKey &key,
+                         std::uint64_t now, KeyScope scope);
     std::unique_ptr<transaction::Store::Lease> lock();
     transaction::Record load();
     void save(const transaction::Record &expected, transaction::Record replacement);
