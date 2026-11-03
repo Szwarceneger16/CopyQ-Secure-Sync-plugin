@@ -414,6 +414,60 @@ preflight does not open the native profile or inspect its local tab. Native
 activation still requires a guarded profile write and a live CopyQ Join
 acknowledgement. The terminal adapter is separate from CopyQ's settings UI.
 
+## Experimental native Signed Join
+
+Build the native module with `CQS_BUILD_NATIVE_PLUGIN=ON`, `BUILD_TESTING=ON`,
+`CQS_TEST_DEVICE_CRYPTO=ON` and `CQS_BUILD_SIGNED_JOIN=ON`. Use the Qt SDK and
+pinned CopyQ source checkout required by the native build. Link a trusted
+libsodium 1.0.22-or-newer development installation using its shared library
+or a static library built with position-independent code where the module
+linker requires it. The experimental option defaults to off.
+
+On a disposable CopyQ profile, enable Encrypt Tabs and open **Preferences →
+Devices and recovery → Signed Join (experimental)**. The dialog opens a
+previously provisioned identity vault and trust journal. Supply these pins
+from trusted local setup, encoded as contiguous hex in field order.
+
+| Field | Bytes in order | Hex digits |
+| --- | --- | --- |
+| Genesis pins | Group ID, founder device ID, founder Ed25519 public key, founder X25519 public key, public recovery binding, initial key commitment | 384 |
+| Local identity pins | Local device ID, local Ed25519 public key, local X25519 public key | 192 |
+
+Select existing, separate private directories for the identity vault, trust
+journal and signed checkpoint. Keep the private directories and key files
+outside the synchronization root. Supply independent raw 32-byte credential
+files for the vault, journal and checkpoint. A publisher can optionally
+supply a separately provisioned group key file when its journal has no
+installed key. Windows publication uses a separate private staging
+directory on the same NTFS volume as the transport. The shared root needs
+its `events/` directory for the transport layout, a provisioned `control/`
+directory and the current signed generation directory. Checkpoint creation
+requires an available signed history.
+
+1. The applicant creates or reopens a request. An existing device prepares
+   an Add proposal for that request. Exchange these public messages.
+2. The applicant previews the proposal and intended approvers. Each approver
+   checks the full comparison value on an independent trusted screen or
+   authenticated channel before signing. The applicant assembles the public
+   approvals and verifies the full value for each actual signer.
+3. Existing devices verify the resulting membership certificate. A current
+   member publishes a sealed key for the intended recipient, who installs
+   it using the immutable packet address. The storage receipt acknowledges
+   the sealed key write.
+4. The applicant reviews the verified signed tip and explicitly confirms the
+   encrypted checkpoint. The journal rechecks the accepted membership,
+   installed key, history and exact reviewed tip under its trust lease.
+   The destination FileStore uses an exclusive session lease and a record
+   lease to create the encrypted checkpoint and verify readback. An
+   interrupted write can be retried with the same profile binding, signed
+   provenance and snapshot. A conflicting existing destination is refused.
+
+The checkpoint uses a separate record binding and contains the verified MIME
+snapshot and signed provenance. This workflow preserves Encrypt Tabs settings
+and leaves live tab activation, automatic synchronization and installer
+integration for later work. Signed verification refuses legacy packets and
+uses the signed generation scope throughout.
+
 ## Clock and rollback limits
 
 The encrypted record retains a high-watermark policy time. Fresh signing and
@@ -446,7 +500,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration|device_join)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration|device_join|signed_join_checkpoint)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,
@@ -461,8 +515,10 @@ recipient and context substitution, key commitment checks and durable ciphertext
 retry. The receipt and lifecycle suites cover commit-before-sign, receipt
 substitution, catch-up, rotation, historical replay and encrypted disk reopen.
 The Join suite covers request durability, full peer comparisons, exact
-certificate retry, and signed-history preflight with synthetic clipboard
-data.
+certificate retry and signed-history preflight with synthetic clipboard
+data. The signed checkpoint suite exercises encrypted reopen, exact retry
+and refusal of changed data. Native builds with testing enabled include
+the Qt comparison dialog test.
 Exact results belong to the implementing PR and current test run.
 
 Qualification still requires Windows/NTFS and Flatpak, physical power-loss

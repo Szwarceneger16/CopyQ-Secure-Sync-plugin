@@ -4,6 +4,7 @@
 #include "device_key_receipt.h"
 #include "device_trust_journal.h"
 #include "packed_items.h"
+#include "signed_join_checkpoint.h"
 #include "storage.h"
 #include "test_check.h"
 
@@ -11,14 +12,25 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <utility>
 #ifdef __linux__
 #include <unistd.h>
+#endif
+#ifdef CQS_TEST_NATIVE_SIGNED_JOIN
+#include "signed_join_wizard.h"
+#include <QAbstractButton>
+#include <QApplication>
+#include <QDialog>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QTimer>
 #endif
 
 using namespace cqs::trust;
@@ -252,11 +264,32 @@ Bytes install(Fixture &f)
     CHECK(f.journal(0).recordReceipt(receipt, Now));
     return receipt;
 }
+
+std::filesystem::path privateCheckpoint(const Transport &transport)
+{
+    const auto path = transport.root.parent_path() / "signed-checkpoint";
+    CHECK(std::filesystem::create_directory(path));
+    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+    return path;
+}
+
+std::string readCheckpointBytes(const std::filesystem::path &path)
+{
+    std::ifstream input(path, std::ios::binary);
+    CHECK(input.is_open());
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
 #endif
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+#ifdef CQS_TEST_NATIVE_SIGNED_JOIN
+    QApplication app(argc, argv);
+#else
+    (void)argc;
+    (void)argv;
+#endif
     test("join challenges are per applicant, durable, and never returned before the commit barrier", [] {
         Fixture f;
         refuses([&] { f.journal(1).beginJoin(*f.identities[2], Now); });
@@ -512,6 +545,150 @@ int main()
         refuses([&] { f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now); });
         CHECK(f.journal(1).inspect().eventWitnesses == 0);
     });
+    test("reviewed activation commits an encrypted checkpoint and retries the exact verified snapshot", [] {
+        Fixture f;
+        f.enrollFirst();
+        Transport transport(f.journal(0).inspect().state);
+        const auto tip = seed(f, transport);
+        CHECK(!install(f).empty());
+        const auto directory = privateCheckpoint(transport);
+        const auto record = directory / st::FileStore::RecordName;
+        const Bytes credential(32, 0x42);
+        const auto expected = f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
+        CHECK(expected.tipId == tip && !std::filesystem::exists(record));
+        unsigned calls = 0;
+        const auto apply = [&](SignedJoinCheckpoint &checkpoint) {
+            f.journal(1).applyJoinActivation(*f.identities[1], transport.directory(), expected, Now,
+                [&](const JoinActivation &verified, const cqs::events::Event &event, const tx::Snapshot &snapshot) {
+                    ++calls;
+                    rejects<JournalError>(JournalCode::Busy, [&] { (void)f.journal(1).inspect(); });
+                    CHECK(verified.tipDigest == expected.tipDigest && event.revision.id == tip);
+                    CHECK(snapshot == cqs::packed::decode(ValidItems));
+                    checkpoint.apply(verified, event, snapshot);
+                });
+        };
+        {
+            SignedJoinCheckpoint checkpoint(directory, credential, Binding);
+            f.store(1).failure = MemoryStore::Fault::After;
+            rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] { apply(checkpoint); });
+            CHECK(calls == 0 && !std::filesystem::exists(record));
+            f.reopen(1);
+            apply(checkpoint);
+            CHECK(checkpoint.read(expected) == cqs::packed::decode(ValidItems));
+        }
+        CHECK(calls == 1);
+        f.reopen(1);
+        SignedJoinCheckpoint reopened(directory, credential, Binding);
+        apply(reopened);
+        CHECK(calls == 2 && reopened.read(expected) == cqs::packed::decode(ValidItems));
+        CHECK(std::filesystem::is_empty(transport.root / "events"));
+        st::FileStore legacy(directory, Binding, credential);
+        refuses([&] { (void)legacy.load(); });
+    });
+    test("activation rechecks both the reviewed tip and membership before calling the writer", [] {
+        for (const bool advanceTip : {false, true}) {
+            Fixture f;
+            f.enrollFirst();
+            Transport transport(f.journal(0).inspect().state);
+            const auto tip = seed(f, transport);
+            CHECK(!install(f).empty());
+            const auto expected = f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
+            if (advanceTip) {
+                const std::vector<SignedEventParent> parents{{tip, expected.tipDigest}};
+                const auto prepared = f.journal(0).prepareClipboardEvent(*f.identities[0], *f.key, parents, ValidItems, Now);
+                CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now).empty());
+            } else {
+                const auto later = f.certificate(f.proposal(f.request(2)), {0, 1});
+                CHECK(f.journal(1).observe(later, Now) == ObserveResult::Applied);
+            }
+            bool called = false;
+            rejects<JournalError>(JournalCode::HistoryChanged, [&] {
+                f.journal(1).applyJoinActivation(*f.identities[1], transport.directory(), expected, Now,
+                    [&](const JoinActivation &, const cqs::events::Event &, const tx::Snapshot &) { called = true; });
+            });
+            CHECK(!called);
+        }
+    });
+    test("a busy or tampered checkpoint cannot be replaced by a revalidated signed Join", [] {
+        Fixture f;
+        f.enrollFirst();
+        Transport transport(f.journal(0).inspect().state);
+        CHECK(!seed(f, transport).empty() && !install(f).empty());
+        const auto directory = privateCheckpoint(transport);
+        const auto record = directory / st::FileStore::RecordName;
+        const Bytes credential(32, 0x43);
+        const auto expected = f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
+        SignedJoinCheckpoint checkpoint(directory, credential, Binding);
+        const auto apply = [&] {
+            f.journal(1).applyJoinActivation(*f.identities[1], transport.directory(), expected, Now,
+                [&](const JoinActivation &verified, const cqs::events::Event &event, const tx::Snapshot &snapshot) {
+                    checkpoint.apply(verified, event, snapshot);
+                });
+        };
+        {
+            st::FileStore session(directory, Binding, Bytes(32), {}, st::Protection::Key, st::LeaseKind::Session);
+            const auto lease = session.lock();
+            CHECK(lease);
+            rejects<st::Error>(st::ErrorCode::Busy, apply);
+            CHECK(!std::filesystem::exists(record));
+        }
+        apply();
+        auto damaged = readCheckpointBytes(record);
+        CHECK(!damaged.empty());
+        damaged.back() ^= 1;
+        {
+            std::ofstream output(record, std::ios::binary | std::ios::trunc);
+            output.write(damaged.data(), static_cast<std::streamsize>(damaged.size()));
+            output.close();
+            CHECK(output);
+        }
+        rejects<st::Error>(st::ErrorCode::AuthenticationFailed, apply);
+        CHECK(readCheckpointBytes(record) == damaged);
+    });
+#ifdef CQS_TEST_NATIVE_SIGNED_JOIN
+    test("the native wizard confirms and writes the signed checkpoint without a legacy write", [] {
+        Fixture f;
+        f.enrollFirst();
+        Transport transport(f.journal(0).inspect().state);
+        CHECK(!seed(f, transport).empty() && !install(f).empty());
+        const auto directory = privateCheckpoint(transport);
+        const auto expected = f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
+        SignedJoinCheckpoint checkpoint(directory, Bytes(32, 0x44), Binding);
+        bool confirmed = false;
+        bool completed = false;
+        QTimer::singleShot(0, [&] {
+            auto *wizard = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            CHECK(wizard);
+            const auto buttons = wizard->findChildren<QPushButton *>();
+            const auto write = std::find_if(buttons.begin(), buttons.end(), [](const QPushButton *button) {
+                return button->text().startsWith(QStringLiteral("5. "));
+            });
+            CHECK(write != buttons.end());
+            QTimer respond;
+            QObject::connect(&respond, &QTimer::timeout, [&] {
+                auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                if (!message) return;
+                if (auto *yes = message->button(QMessageBox::Yes)) {
+                    CHECK(!confirmed);
+                    confirmed = true;
+                    yes->click();
+                } else {
+                    CHECK(confirmed && message->text() == QStringLiteral("Encrypted signed checkpoint verified."));
+                    completed = true;
+                    message->accept();
+                }
+            });
+            respond.start(2);
+            (*write)->click();
+            wizard->reject();
+        });
+        cqs::native::runSignedJoinWizard(nullptr, f.journal(1), *f.identities[1], transport.directory(),
+                                         checkpoint, Binding);
+        CHECK(confirmed && completed);
+        CHECK(checkpoint.read(expected) == cqs::packed::decode(ValidItems));
+        CHECK(std::filesystem::is_empty(transport.root / "events"));
+    });
+#endif
 #endif
     std::cout << cases << " device Join test cases passed\n";
 }

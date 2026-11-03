@@ -53,6 +53,9 @@ private:
     QString settingsFile_;
     bool automaticEnabled_ = false, runtimeBusy_ = false, resolving_ = false;
     bool closing_ = false;
+#ifdef CQS_BUILD_SIGNED_JOIN
+    bool signedJoinOpen_ = false;
+#endif
     QTimer supervisor_;
     QElapsedTimer heartbeat_;
     QElapsedTimer scheduleClock_;

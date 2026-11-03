@@ -154,6 +154,12 @@ void SettingsWidget::setProfile(const Profile &p) {
     staging_->setText(p.publicationStaging);
 }
 void SettingsWidget::setBusy(bool busy) { fields_->setEnabled(!busy); inspect_->setEnabled(!busy); initialize_->setEnabled(!busy); }
+void SettingsWidget::addSignedJoinAction() {
+    auto *button = new QPushButton(tr("Signed Join (experimental)…"), operations_);
+    button->setObjectName(QStringLiteral("cqsSignedJoin"));
+    operations_->layout()->addWidget(button);
+    connect(button, &QPushButton::clicked, this, &SettingsWidget::signedJoinRequested);
+}
 void SettingsWidget::setStatus(const QString &text) { status_->setText(text); }
 void SettingsWidget::setRuntimeStatus(const UiContext &context,const UiStatus &status,bool applied,bool available) {
     runtimeStatus_->setText(status.text()+(applied?QString{}:tr("\nApply the current profile before device, key or recovery actions.")));

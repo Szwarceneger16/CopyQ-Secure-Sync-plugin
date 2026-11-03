@@ -26,6 +26,9 @@
 #include "gui_clipboard.h"
 #include "ui_actions.h"
 #include "history_transition.h"
+#ifdef CQS_BUILD_SIGNED_JOIN
+#include "signed_join_entry.h"
+#endif
 
 struct SecureSyncJob {
     cqs::native::StorageConfiguration configuration;
@@ -1105,6 +1108,33 @@ QWidget *SecureSyncPlugin::createSettingsWidget(QWidget *parent) {
     auto *uiTimer=new QTimer(widget);uiTimer->setInterval(500);
     connect(uiTimer,&QTimer::timeout,this,&SecureSyncPlugin::refreshPanel);uiTimer->start();
     connect(widget,&cqs::native::SettingsWidget::operationRequested,this,&SecureSyncPlugin::runPanelAction);
+#ifdef CQS_BUILD_SIGNED_JOIN
+    widget->addSignedJoinAction();
+    connect(widget, &cqs::native::SettingsWidget::signedJoinRequested, this, [this, widget] {
+        if (signedJoinOpen_ || closing_ || runtimeBusy_ || !isEnabled() || widget->profile() != profile_) return;
+        const QPointer<cqs::native::SettingsWidget> panel(widget);
+        const auto settings = settingsFile_;
+        const auto profile = profile_;
+        const auto epoch = settingsEpoch_;
+        const auto control = controlEpoch_;
+        const QPointer<SecureSyncPlugin> owner(this);
+        const auto stillCurrent = [this, owner, panel, settings, profile, epoch, control] {
+            if (!owner || !panel || panel != panel_ || closing_ || runtimeBusy_ || !isEnabled() ||
+                settings.isEmpty() || settings != settingsFile_ || profile != profile_ ||
+                epoch != settingsEpoch_ || control != controlEpoch_ || panel->profile() != profile) return false;
+            QSettings configuration(settings, QSettings::IniFormat);
+            return configuration.value(QStringLiteral("Options/encrypt_tabs"), false).toBool() &&
+                   configuration.status() == QSettings::NoError;
+        };
+        if (!stillCurrent()) {
+            widget->setStatus(tr("Apply the profile and enable Encrypt Tabs before opening signed Join."));
+            return;
+        }
+        signedJoinOpen_ = true;
+        const auto reset = qScopeGuard([owner] { if (owner) owner->signedJoinOpen_ = false; });
+        cqs::native::openSignedJoinSetup(widget, settings, profile, stillCurrent);
+    });
+#endif
     connect(widget, &cqs::native::SettingsWidget::inspectRequested, this,
             [this, widget](const cqs::native::Profile &p) {
         if (!isEnabled() || inspector_.busy() || runtimeBusy_ || panelClient_ || panel_ != widget) return;

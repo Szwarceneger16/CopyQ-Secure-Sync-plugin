@@ -1095,6 +1095,18 @@ SignedEventHistory TrustJournal::scanClipboardEvents(const SyncKey &key, const s
 
 JoinActivation TrustJournal::preflightJoinActivation(const Identity &applicant, const storage::Directory &transport,
                                                       std::string profileBinding, std::uint64_t now) {
+    return verifyJoinActivation(applicant, transport, std::move(profileBinding), now, nullptr, {});
+}
+
+void TrustJournal::applyJoinActivation(const Identity &applicant, const storage::Directory &transport,
+                                       const JoinActivation &expected, std::uint64_t now,
+                                       const JoinActivationWriter &write) {
+    if (!write) fail(JournalCode::Enrollment);
+    (void)verifyJoinActivation(applicant, transport, expected.profileBinding, now, &expected, write);
+}
+
+JoinActivation TrustJournal::verifyJoinActivation(const Identity &applicant, const storage::Directory &transport,
+    std::string profileBinding, std::uint64_t now, const JoinActivation *expected, const JoinActivationWriter &write) {
     state::validateBinding(profileBinding);
     const auto lease = lock(); const auto record = load(); const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins);
@@ -1117,15 +1129,23 @@ JoinActivation TrustJournal::preflightJoinActivation(const Identity &applicant, 
     const auto tip = std::find_if(verified.events.begin(), verified.events.end(),
                                   [&](const auto &event) { return event.revision.id == id; });
     if (tip == verified.events.end()) fail(JournalCode::Invalid);
-    auto snapshot = packed::decode(tip->items);
-    for (auto &item : snapshot) for (auto &field : item) crypto::wipe(field.second);
     JoinActivation result{std::move(profileBinding), state.group, state.root, state.digest, local_.id,
                           verified.wireDigests.at(id), state.keyGeneration, id};
+    if (expected && (result.group != expected->group || result.root != expected->root ||
+        result.head != expected->head || result.member != expected->member || result.tipDigest != expected->tipDigest ||
+        result.generation != expected->generation || result.tipId != expected->tipId))
+        fail(JournalCode::HistoryChanged);
+    auto snapshot = packed::decode(tip->items);
+    struct WipeSnapshot {
+        transaction::Snapshot &snapshot;
+        ~WipeSnapshot() { for (auto &item : snapshot) for (auto &field : item) crypto::wipe(field.second); }
+    } wipeSnapshot{snapshot};
     ledger.witnesses = std::move(verified.wireDigests);
     log.watermark = now;
     auto replacement = record;
     storeLog(replacement, log, pins);
     save(record, replacement);
+    if (write) write(result, *tip, snapshot);
     return result;
 }
 

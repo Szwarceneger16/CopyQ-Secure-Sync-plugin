@@ -4,10 +4,12 @@
 #include "cqs-version.h"
 #include <QJsonObject>
 #include <QApplication>
+#include <QDialog>
 #include <QPluginLoader>
 #include <QPushButton>
 #include <QSettings>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QWidget>
 #include <memory>
 #include <iostream>
@@ -34,10 +36,36 @@ int main(int argc,char **argv) {
         CHECK(!panel->findChild<QPushButton*>("cqsInspect")->isEnabled());
         plugin->setEnabled(true);
         CHECK(panel->findChild<QPushButton*>("cqsInspect")->isEnabled());
+#ifdef CQS_BUILD_SIGNED_JOIN
+        auto *signedJoin = panel->findChild<QPushButton *>("cqsSignedJoin");
+        CHECK(signedJoin);
+        const auto beforeJoin = s.allKeys(); // setEnabled(false) persists automatic_enabled.
+        signedJoin->click(); // Encrypt Tabs is off in this disposable profile.
+        CHECK(!QApplication::activeModalWidget());
+        CHECK(s.allKeys() == beforeJoin);
+        s.endGroup();
+        s.setValue(QStringLiteral("Options/encrypt_tabs"), true);
+        s.sync();
+        s.beginGroup("Plugins/securesync");
+        bool setupOpened = false;
+        QTimer::singleShot(0, [&] {
+            auto *setup = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            CHECK(setup && setup->objectName() == QStringLiteral("cqsSignedJoinSetup"));
+            setupOpened = true;
+            setup->reject();
+        });
+        signedJoin->click();
+        CHECK(setupOpened && s.allKeys() == beforeJoin);
+#else
+        CHECK(!panel->findChild<QPushButton *>("cqsSignedJoin"));
+#endif
         plugin->applySettings(s); CHECK(s.value("profile_schema").toInt()==3);
     }
     // Reopening after QWidget destruction exercises QPointer lifecycle safety.
     std::unique_ptr<QWidget> again(plugin->createSettingsWidget(nullptr)); CHECK(again);
     s.endGroup(); s.sync(); CHECK(s.status()==QSettings::NoError);
+#ifdef CQS_BUILD_SIGNED_JOIN
+    CHECK(s.value(QStringLiteral("Options/encrypt_tabs")).toBool());
+#endif
     std::cout<<"Native plugin loader checks passed\n";
 }

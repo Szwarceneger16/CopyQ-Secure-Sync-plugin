@@ -58,10 +58,14 @@ can seed a fresh signed group from the verified legacy tip while preserving
 the encrypted legacy state and history in place.
 The [Join laboratory](docs/DEVICE-TRUST-COORDINATOR.md#authenticated-join-and-activation-preflight)
 adds trusted terminal prompts for full peer comparison and an activation
-preflight over the installed key package and signed history. The preflight
-returns readiness metadata for a future profile integration.
+preflight over the installed key package and signed history. The
+[experimental native Signed Join](docs/DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
+adds a Preferences workflow for provisioned devices, from peer comparison
+through creation of a separate encrypted checkpoint. The checkpoint is
+independent of live CopyQ tabs and automatic synchronization.
 Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
-Product use requires native guided setup and guarded CopyQ profile activation.
+Product use still requires guided provisioning, guarded profile activation and
+platform qualification.
 
 ## Build and test pipeline
 

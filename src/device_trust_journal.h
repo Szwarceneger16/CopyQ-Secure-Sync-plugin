@@ -5,6 +5,7 @@
 #include "device_signed_event.h"
 #include "state_store.h"
 #include <atomic>
+#include <functional>
 
 namespace cqs::storage { class Directory; }
 
@@ -64,6 +65,8 @@ struct JoinActivation {
     std::uint64_t generation;
     std::string tipId;
 };
+using JoinActivationWriter = std::function<void(const JoinActivation &, const events::Event &,
+                                                 const transaction::Snapshot &)>;
 struct SignedEventHistory {
     std::vector<events::Event> events;
     history::Graph graph;
@@ -114,6 +117,11 @@ public:
     // contains no key or clipboard data and does not authorize a later write.
     JoinActivation preflightJoinActivation(const Identity &applicant, const storage::Directory &transport,
                                            std::string profileBinding, std::uint64_t trustedNow);
+    // Revalidate the exact reviewed checkpoint. The detached writer runs under
+    // the trust lease and must own the destination session through persistence.
+    void applyJoinActivation(const Identity &applicant, const storage::Directory &transport,
+                             const JoinActivation &expected, std::uint64_t trustedNow,
+                             const JoinActivationWriter &write);
     ObserveResult observe(const Certificate &certificate, std::uint64_t trustedNow);
     // Prepare one exact ciphertext for an authorized recipient at the accepted
     // head. Retry returns the stored bytes. A transport publisher must recheck
@@ -171,6 +179,8 @@ public:
     SignedEventHistory readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
                                          std::uint64_t trustedNow, events::Limits limits = {});
 private:
+    JoinActivation verifyJoinActivation(const Identity &, const storage::Directory &, std::string,
+                                        std::uint64_t, const JoinActivation *, const JoinActivationWriter &);
     PreparedClipboardEvent prepareClipboardEventLocked(const Identity &author, const SyncKey &key,
         const std::vector<SignedEventParent> &parents, const std::vector<std::string> &packedItems,
         std::uint64_t now, events::Limits limits, const Token *migration = nullptr);

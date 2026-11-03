@@ -24,11 +24,13 @@ public:
     void setBusy(bool busy);
     void setStatus(const QString &text);
     void setRuntimeStatus(const UiContext &, const UiStatus &, bool applied, bool available=true);
+    void addSignedJoinAction();
 signals:
     void inspectRequested(cqs::native::Profile profile);
     void initializeStorageRequested(cqs::native::Profile profile);
     void vaultActionRequested(QString action);
     void operationRequested(QString action);
+    void signedJoinRequested();
 private:
     QLineEdit *device_, *transport_, *key_, *state_, *vault_, *staging_;
     QLabel *status_, *runtimeStatus_;
