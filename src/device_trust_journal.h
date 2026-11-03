@@ -17,13 +17,21 @@ struct Genesis {
     Token recovery{}, initialKeyCommitment{};
 };
 enum class JournalCode { Invalid, WrongPins, Confirmation, ClockRollback, Rollback, Uncertain, Busy,
-                         Delivery, KeyReuse, MissingKey };
+                         Delivery, KeyReuse, MissingKey, EventPending, EventReservation };
 class JournalError final : public std::runtime_error {
 public:
     explicit JournalError(JournalCode code);
     JournalCode code() const noexcept { return code_; }
 private:
     JournalCode code_;
+};
+struct PendingClipboardEvent {
+    std::uint64_t sequence;
+    bool ready;
+};
+struct PreparedClipboardEvent {
+    std::uint64_t sequence;
+    crypto::Bytes wire;
 };
 struct JournalStatus {
     State state;
@@ -34,6 +42,8 @@ struct JournalStatus {
     std::vector<crypto::Bytes> certificates;
     bool installedKey = false;
     std::vector<Token> confirmedDeliveries;
+    std::uint64_t allocatedEventSequence = 0;
+    std::optional<PendingClipboardEvent> pendingEvent;
 };
 struct SignedEventHistory {
     std::vector<events::Event> events;
@@ -41,15 +51,17 @@ struct SignedEventHistory {
     std::map<std::string, Token> wireDigests;
 };
 
-// Test-only control-plane coordinator. A dedicated encrypted FileStore outside
-// transport is required; no user profile or clipboard key is opened here.
+// Test-only coordinator. Use a dedicated encrypted FileStore outside transport
+// with capacity for MaxJournalBytes plus record framing. No user profile is opened.
 // Pins come from trusted local setup, NEVER from the cloud journal being read.
 // The unlocked Identity belongs in a separately qualified private key vault.
 // All public operations retain one Store lease through load/replay/commit/sign.
 class TrustJournal final {
 public:
     static constexpr std::size_t MaxOperations = 2 * MaxStates;
-    static constexpr std::size_t MaxJournalBytes = 2 * 1024 * 1024;
+    static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
+    static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
+    static constexpr std::size_t MaxJournalBytes = MaxControlBytes + 13 + MaxClipboardEventBytes;
     TrustJournal(transaction::Store &store, Genesis genesis, Member local);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
@@ -95,12 +107,16 @@ public:
     // barrier, then published under the same lease. Returns its packet address.
     std::string publishReceipt(const Identity &recipient, const storage::Directory &transport,
                                std::uint64_t trustedNow, const std::filesystem::path &privateStaging = {});
-    // Laboratory encoder. A future publisher must reserve the sequence and
-    // exact output durably before any external release.
-    crypto::Bytes signClipboardEvent(const Identity &author, const SyncKey &key, std::uint64_t sequence,
-                                     const std::vector<SignedEventParent> &parents,
-                                     const std::vector<std::string> &packedItems,
-                                     std::uint64_t trustedNow, events::Limits limits = {});
+    // Local laboratory outbox. Burns one sequence before sealing and commits
+    // the exact wire before returning it. Never sends to shared storage.
+    PreparedClipboardEvent prepareClipboardEvent(const Identity &author, const SyncKey &key,
+                                                const std::vector<SignedEventParent> &parents,
+                                                const std::vector<std::string> &packedItems,
+                                                std::uint64_t trustedNow, events::Limits limits = {});
+    // Reestablishes the durable barrier for exactly the requested ready slot.
+    PreparedClipboardEvent resumeClipboardEvent(std::uint64_t sequence, std::uint64_t trustedNow);
+    // Explicitly retire a slot without changing its high-water sequence.
+    void discardClipboardEvent(std::uint64_t sequence, std::uint64_t trustedNow);
     // Read-only current-generation snapshot. Input identities come from the
     // caller's checked file mapping. An empty result grants no Seed authority.
     SignedEventHistory readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,
@@ -110,7 +126,7 @@ private:
                          std::uint64_t now, KeyScope scope);
     std::unique_ptr<transaction::Store::Lease> lock();
     transaction::Record load();
-    void save(const transaction::Record &expected, transaction::Record replacement);
+    void save(const transaction::Record &expected, transaction::Record &replacement);
     transaction::Store &store_;
     Genesis genesis_;
     Member local_;

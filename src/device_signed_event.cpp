@@ -223,6 +223,22 @@ Parsed parse(std::string_view wire, events::Limits limits) {
     return value;
 }
 
+Parsed authenticate(const events::Envelope &envelope, const SignedEventContext &expected,
+                    const Member &author, events::Limits limits) {
+    auto parsed = parse(envelope.bytes, limits);
+    if (parsed.header.revision.id != envelope.expectedId || !sameContext(parsed.header.context, expected) ||
+        author.id != expected.author) {
+        fail(EventError::WrongIdentity, "Signed event does not match pinned context or file identity");
+    }
+    const SodiumVerifier verifier;
+    const auto signedWire = envelope.bytes.substr(0, envelope.bytes.size() - SignatureSize);
+    if (!SodiumVerifier::validMember(author) ||
+        !verifier.verify(author.signingKey, signatureMessage(signedWire), parsed.signature)) {
+        fail(EventError::AuthenticationFailed, "Signed event author signature failed");
+    }
+    return parsed;
+}
+
 int sextet(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -373,19 +389,14 @@ Bytes SignedEventCodec::seal(const SignedEventContext &context, const Identity &
     return wire;
 }
 
+void SignedEventCodec::verify(const events::Envelope &envelope, const SignedEventContext &expected,
+                              const Member &author, events::Limits limits) {
+    (void)authenticate(envelope, expected, author, limits);
+}
+
 events::Event SignedEventCodec::open(const events::Envelope &envelope, const SignedEventContext &expected,
                                     const Member &author, const SyncKey &key, events::Limits limits) {
-    auto parsed = parse(envelope.bytes, limits);
-    if (parsed.header.revision.id != envelope.expectedId || !sameContext(parsed.header.context, expected) ||
-        author.id != expected.author) {
-        fail(EventError::WrongIdentity, "Signed event does not match pinned context or file identity");
-    }
-    const SodiumVerifier verifier;
-    const auto signedWire = envelope.bytes.substr(0, envelope.bytes.size() - SignatureSize);
-    if (!SodiumVerifier::validMember(author) ||
-        !verifier.verify(author.signingKey, signatureMessage(signedWire), parsed.signature)) {
-        fail(EventError::AuthenticationFailed, "Signed event author signature failed");
-    }
+    auto parsed = authenticate(envelope, expected, author, limits);
     checkKey(key, expected);
 
     WipedBytes plain;

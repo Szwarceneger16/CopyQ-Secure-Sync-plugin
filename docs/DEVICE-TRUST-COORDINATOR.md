@@ -2,7 +2,8 @@
 
 The isolated control-plane tests extend the [membership model](DEVICE-TRUST-MODEL.md)
 with real signatures, a local identity vault, durable approvals, signed key
-envelopes, durable recipient storage and file transport. Build them with
+envelopes, durable recipient storage, file transport and clipboard event
+staging. Build them with
 `BUILD_TESTING` and `CQS_TEST_DEVICE_CRYPTO` enabled.
 The tests use disposable directories and synthetic keys. Product integration
 requires peer verification, cloud delivery, CopyQ profile activation,
@@ -79,8 +80,9 @@ reserved and is deliberately avoided.
 | Active members | 32 |
 | Retained membership states | 256 |
 | Journal operations | 512 |
-| Individual event payload | 4,096 bytes |
-| Complete journal payload | 2 MiB |
+| Individual control entry payload | 4,096 bytes |
+| Control section | 2 MiB |
+| Reserved clipboard event packet | 2 MiB, plus 13 bytes of reservation metadata |
 
 Reaching a limit refuses growth; no witness or reservation is silently pruned.
 Known certificate retries do not append duplicate evidence. Exact approval retries
@@ -216,20 +218,54 @@ revision identity, exact parent packet digests and ciphertext. The signature is
 verified before AES-GCM decryption. Packed items remain subject to CopyQ's
 semantic import checks when a runtime adapter consumes them.
 
-The journal encodes under its current authorized state and checks the key
-commitment and reuse policy. Batch reads verify under one journal lease and
-accept only the current generation. An earlier accepted head within that
+Batch reads verify under one journal lease and accept only the current
+generation. An earlier accepted head within that
 generation is eligible when the signer was a member at that head and is still
 active. The graph checks exact parent packet bytes, parent membership epochs,
 unique revision IDs and monotonic author sequences along every ancestor path.
 The input order is independent of graph order. Both wire and plaintext budgets
 apply to the entire batch.
 
-The isolated encoder and reader form a pre-publication boundary. Runtime use
-requires durable sequence and exact wire reservation, immutable publication,
-history witnesses across scans, generation-specific storage and explicit legacy
-archive migration. An empty or incomplete batch grants no authority to seed a
-history. A reader can enforce membership history and events it has observed.
+An empty or incomplete batch grants no authority to seed a history.
+
+### Durable event reservation
+
+`prepareClipboardEvent()` checks the pinned local author, current membership,
+key commitment and reuse policy. Under one journal lease it commits the next
+author sequence with an empty reservation, seals the event, then commits the
+exact signed ciphertext before returning the sequence and packet. The journal
+stores neither clipboard plaintext nor a plaintext fingerprint. An occupied
+reservation blocks new preparation.
+
+Existing payload versions 1–3 remain readable. The journal writes version 4
+from the first sequence allocation onward. Version 4 appends the sequence as
+`u64BE`, a one-byte reservation flag, and a `u32BE` packet length followed by
+the exact packet. A clear flag requires zero length. A set flag with zero
+length marks an allocated sequence without a recoverable packet. Replay
+authenticates a staged packet against the pinned author, reserved revision
+and its accepted membership head without decrypting the clipboard payload.
+The packet budget is separate from the control section budget. Use the default
+FileStore limits or provision capacity for the full journal and record framing
+so a staged packet cannot consume space needed by membership changes.
+
+An unconfirmed commit poisons the live coordinator. After reopening,
+`inspect()` reports the allocated sequence and whether a pending packet is
+ready. `resumeClipboardEvent()` takes the matching sequence and recommits
+the stored bytes before returning them. A reservation interrupted before the
+packet was stored cannot be resumed or re-encrypted. A sealing error after
+the first commit leaves the same empty reservation. Use
+`discardClipboardEvent()` with the matching sequence to retire a pending
+reservation explicitly. The sequence remains allocated.
+
+A same-generation Add permits resume for an author still active at the
+current head. A rotation or observed fork preserves a pending reservation
+and blocks resume. The local laboratory returns packets to its caller.
+An eventual publisher must recheck authorization and hold the journal lease
+through the publication barrier. A previous local return grants no authority
+to publish after membership changes. Runtime use still requires immutable
+publication, an aggregate GCM encryption
+budget across authors, history witnesses across scans, generation-specific
+storage and explicit legacy archive migration.
 
 ## Clock and rollback limits
 
@@ -245,8 +281,10 @@ FileStore's whole-record compare-and-swap protects ordinary concurrent updates;
 the lease remains held through signing. This does **not** prevent an attacker or
 backup process from restoring all older valid ciphertext and keys across a
 process restart. Production needs an external monotonic anchor or an explicit
-recovery policy before claiming that broader rollback guarantee. Copying one
-identity to two machines likewise does not create two independent approvers.
+recovery policy before claiming that broader rollback guarantee. Restoring a
+prior journal or running the same identity with independent journals can reuse
+a clipboard event sequence. Cloned identities count as a single membership
+approver.
 
 ## Build and validation
 

@@ -25,6 +25,8 @@ struct Log {
     std::vector<Entry> entries;
     std::map<Token, Outbound> deliveries;
     Bytes installed;
+    std::uint64_t allocatedSequence = 0;
+    std::optional<Bytes> pendingEvent;
 };
 [[noreturn]] void fail(JournalCode code) { throw JournalError(code); }
 template<class Range> void append(Bytes &out, const Range &value) {
@@ -64,14 +66,16 @@ std::string hex(const Token &value) {
 void field(Bytes &out, const Bytes &bytes) {
     if (bytes.size() > MaxEventBytes) fail(JournalCode::Invalid);
     u32(out, static_cast<std::uint32_t>(bytes.size())); append(out, bytes);
-    if (out.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
+    if (out.size() > TrustJournal::MaxControlBytes) fail(JournalCode::Invalid);
 }
 Bytes encode(const Log &log, const Token &pins) {
     if (!log.initial || log.watermark < log.initial || log.entries.size() > TrustJournal::MaxOperations ||
-        log.deliveries.size() > MaxMembers)
+        log.deliveries.size() > MaxMembers || log.allocatedSequence > history::MaxSequence ||
+        (!log.allocatedSequence && log.pendingEvent))
         fail(JournalCode::Invalid);
     const bool lifecycle = !log.deliveries.empty() || !log.installed.empty();
-    Bytes out; domain(out, JournalDomain); u32(out, lifecycle ? 3 : 1); append(out, pins);
+    const auto version = log.allocatedSequence ? 4 : (lifecycle ? 3 : 1);
+    Bytes out; domain(out, JournalDomain); u32(out, version); append(out, pins);
     u64(out, log.initial); u64(out, log.watermark);
     u32(out, static_cast<std::uint32_t>(log.entries.size()));
     for (const auto &entry : log.entries) {
@@ -79,7 +83,7 @@ Bytes encode(const Log &log, const Token &pins) {
         out.push_back(static_cast<std::uint8_t>(entry.kind)); u64(out, entry.now);
         field(out, entry.bytes);
     }
-    if (lifecycle) {
+    if (version >= 3) {
         u32(out, static_cast<std::uint32_t>(log.deliveries.size()));
         for (const auto &delivery : log.deliveries) {
             if (delivery.second.envelope.empty()) fail(JournalCode::Invalid);
@@ -87,6 +91,14 @@ Bytes encode(const Log &log, const Token &pins) {
             field(out, delivery.second.envelope); field(out, delivery.second.receipt);
         }
         field(out, log.installed);
+    }
+    if (version == 4) {
+        u64(out, log.allocatedSequence);
+        out.push_back(log.pendingEvent ? 1 : 0);
+        const auto size = log.pendingEvent ? log.pendingEvent->size() : 0;
+        if (size > TrustJournal::MaxClipboardEventBytes) fail(JournalCode::Invalid);
+        u32(out, static_cast<std::uint32_t>(size));
+        if (log.pendingEvent) append(out, *log.pendingEvent);
     }
     return out;
 }
@@ -105,13 +117,14 @@ public:
         need(32); Token result{};
         std::copy_n(bytes_.begin() + static_cast<std::ptrdiff_t>(pos_), 32, result.begin()); pos_ += 32; return result;
     }
-    Bytes bytes(bool optional = false) {
+    Bytes bytes(bool optional = false, std::size_t limit = MaxEventBytes) {
         const auto count = number32();
         if (!count && optional) return {};
-        if (!count || count > MaxEventBytes) fail(JournalCode::Invalid);
+        if (!count || count > limit) fail(JournalCode::Invalid);
         need(count); const auto start = bytes_.begin() + static_cast<std::ptrdiff_t>(pos_); pos_ += count;
         return {start, start + count};
     }
+    std::size_t consumed() const { return pos_; }
     bool done() const { return pos_ == bytes_.size(); }
 private:
     void need(std::size_t count) { if (count > bytes_.size() - pos_) fail(JournalCode::Invalid); }
@@ -130,7 +143,7 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
     if (bytes.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
     Reader reader(bytes); reader.expect(JournalDomain);
     const auto version = reader.number32();
-    if (version < 1 || version > 3) fail(JournalCode::Invalid);
+    if (version < 1 || version > 4) fail(JournalCode::Invalid);
     if (reader.token() != pins) fail(JournalCode::WrongPins);
     Log log; log.initial = reader.number64(); log.watermark = reader.number64();
     const auto count = reader.number32();
@@ -152,13 +165,23 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
             auto envelope = reader.bytes();
             if (version == 2 && KeyEnvelopeCodec::inspect(envelope).scope != KeyScope::CurrentGeneration)
                 fail(JournalCode::Invalid);
-            log.deliveries.emplace(recipient, Outbound{std::move(envelope), version == 3 ? reader.bytes(true) : Bytes{}});
+            log.deliveries.emplace(recipient, Outbound{std::move(envelope), version >= 3 ? reader.bytes(true) : Bytes{}});
             previous = recipient;
         }
     }
-    if (version == 3) {
+    if (version >= 3) {
         log.installed = reader.bytes(true);
-        if (log.deliveries.empty() && log.installed.empty()) fail(JournalCode::Invalid);
+        if (version == 3 && log.deliveries.empty() && log.installed.empty()) fail(JournalCode::Invalid);
+    }
+    if (reader.consumed() > TrustJournal::MaxControlBytes) fail(JournalCode::Invalid);
+    if (version == 4) {
+        log.allocatedSequence = reader.number64();
+        const auto pending = reader.byte();
+        if (!log.allocatedSequence || log.allocatedSequence > history::MaxSequence || pending > 1)
+            fail(JournalCode::Invalid);
+        auto wire = reader.bytes(true, TrustJournal::MaxClipboardEventBytes);
+        if (pending) log.pendingEvent = std::move(wire);
+        else if (!wire.empty()) fail(JournalCode::Invalid);
     }
     if (!reader.done()) fail(JournalCode::Invalid);
     return log;
@@ -206,8 +229,21 @@ EnvelopeAuthority incoming(const State &state, const Proposal &proposal, const M
     const auto &sender = member(state, claimed.sender);
     return {deliveryContext(state, proposal, sender, local.id, claimed.scope), sender};
 }
+SignedEventContext eventContext(const State &state, const Token &author) {
+    return {state.group, state.root, state.digest, state.keyCommitment, author, state.keyGeneration};
+}
+const State &verifyPendingEvent(const Log &log, const Membership &membership, const Member &local) {
+    const auto &wire = *log.pendingEvent;
+    const std::string_view bytes(reinterpret_cast<const char *>(wire.data()), wire.size());
+    const auto header = SignedEventCodec::inspect(bytes);
+    const auto *state = membership.acceptedState(header.context.head);
+    if (!state || member(*state, local.id) != local) fail(JournalCode::Invalid);
+    const auto id = history::makeId(SignedEventCodec::deviceName(local.id), log.allocatedSequence);
+    SignedEventCodec::verify({id, bytes}, eventContext(*state, local.id), local);
+    return *state;
+}
 Membership replay(const Log &log, const Genesis &g, const Member &local,
-                  std::optional<EnvelopeAuthority> *installed = nullptr) {
+                  std::optional<EnvelopeAuthority> *installed = nullptr, std::uint64_t *pendingGeneration = nullptr) {
     auto membership = model(g); SodiumVerifier verifier;
     const auto claimed = log.installed.empty() ? std::nullopt
         : std::optional<KeyEnvelopeContext>(KeyEnvelopeCodec::inspect(log.installed));
@@ -248,6 +284,10 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
                 KeyReceiptCodec::verify(outbound.receipt, receiptContext(context, outbound.envelope));
         }
     }
+    if (log.pendingEvent && !log.pendingEvent->empty()) {
+        const auto &head = verifyPendingEvent(log, membership, local);
+        if (pendingGeneration) *pendingGeneration = head.keyGeneration;
+    }
     return membership;
 }
 void checkPriorKeys(const Log &log, const Genesis &genesis, const State &state, const SyncKey &key) {
@@ -271,9 +311,6 @@ void add(Log &log, Kind kind, std::uint64_t now, Bytes bytes) {
     if (log.entries.size() >= TrustJournal::MaxOperations) throw Error(ErrorCode::Limit);
     log.entries.push_back({kind, now, std::move(bytes)});
     log.watermark = std::max(log.watermark, now);
-}
-SignedEventContext eventContext(const State &state, const Token &author) {
-    return {state.group, state.root, state.digest, state.keyCommitment, author, state.keyGeneration};
 }
 void checkEventKey(const Log &log, const Genesis &genesis, const State &state, const SyncKey &key) {
     if (key.commitment(state.group, state.keyGeneration) != state.keyCommitment)
@@ -342,7 +379,7 @@ transaction::Record TrustJournal::initialRecord(const Genesis &g, const Member &
     if (!now) fail(JournalCode::ClockRollback);
     const auto pins = pin(g, local);
     transaction::Record record; record.schema = 2; record.binding = binding(g, local);
-    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}}, pins); return record;
+    record.keyIdentity = hex(pins); storeLog(record, {now, now, {}, {}, {}, 0, {}}, pins); return record;
 }
 void TrustJournal::initialize(state::FileStore &store, const Genesis &g, const Member &local, std::uint64_t now) {
     auto lease = store.lock(); if (!lease) fail(JournalCode::Busy);
@@ -371,7 +408,7 @@ transaction::Record TrustJournal::load() {
     seenGeneration_ = record.generation; seenRecord_ = digest;
     return record;
 }
-void TrustJournal::save(const transaction::Record &expected, transaction::Record replacement) {
+void TrustJournal::save(const transaction::Record &expected, transaction::Record &replacement) {
     if (expected.generation == std::numeric_limits<std::uint64_t>::max()) throw Error(ErrorCode::Overflow);
     replacement.generation = expected.generation + 1;
     const auto hash = crypto::sha256(replacement.local->front().begin()->second);
@@ -389,7 +426,10 @@ JournalStatus TrustJournal::inspect() {
     const auto log = decode(record, binding_, pin(genesis_, local_));
     const auto membership = replay(log, genesis_, local_);
     JournalStatus result{membership.current(), membership.forked(), log.watermark,
-                         log.entries.size(), membership.reservationCount(), {}, !log.installed.empty(), {}};
+                         log.entries.size(), membership.reservationCount(), {}, !log.installed.empty(), {},
+                         log.allocatedSequence, {}};
+    if (log.pendingEvent)
+        result.pendingEvent = PendingClipboardEvent{log.allocatedSequence, !log.pendingEvent->empty()};
     for (const auto &entry : log.entries) if (entry.kind == Kind::Observe) result.certificates.push_back(entry.bytes);
     for (const auto &entry : log.deliveries)
         if (!entry.second.receipt.empty()) result.confirmedDeliveries.push_back(entry.first);
@@ -417,7 +457,7 @@ Approval TrustJournal::approve(const Proposal &proposal, const Identity &identit
     log.watermark = now;
     auto replacement = record; storeLog(replacement, log, pins);
     // No signing adapter is called until a successful durability barrier.
-    save(record, std::move(replacement));
+    save(record, replacement);
     return {local_.id, identity.sign(approvalBytes(proposal, local_))};
 }
 ObserveResult TrustJournal::observe(const Certificate &certificate, std::uint64_t now) {
@@ -433,7 +473,7 @@ ObserveResult TrustJournal::observe(const Certificate &certificate, std::uint64_
     log.deliveries.clear();
     if (membership.forked() || previousGeneration != membership.current().keyGeneration)
         log.installed.clear();
-    auto replacement = record; storeLog(replacement, log, pins); save(record, std::move(replacement)); return result;
+    auto replacement = record; storeLog(replacement, log, pins); save(record, replacement); return result;
 }
 Bytes TrustJournal::prepareDelivery(const Token &recipient, const Identity &sender, const SyncKey &key,
                                     std::uint64_t now) {
@@ -460,7 +500,7 @@ Bytes TrustJournal::prepare(const Token &recipient, const Identity &sender, cons
     // Reopening after an unconfirmed fsync can expose the replacement bytes.
     // Recommit the exact saved package before returning it on retry.
     log.watermark = now;
-    auto replacement = record; storeLog(replacement, log, pins); save(record, std::move(replacement));
+    auto replacement = record; storeLog(replacement, log, pins); save(record, replacement);
     return wire;
 }
 std::unique_ptr<SyncKey> TrustJournal::receiveDelivery(const Bytes &wire, const Identity &recipient,
@@ -490,7 +530,7 @@ Bytes TrustJournal::installDelivery(const Bytes &wire, const Identity &recipient
     const auto receipt = receiptContext(authority.context, wire);
     log.installed = wire; log.watermark = now;
     auto replacement = record; storeLog(replacement, log, pins);
-    save(record, std::move(replacement));
+    save(record, replacement);
     return KeyReceiptCodec::sign(receipt, recipient);
 }
 std::unique_ptr<SyncKey> TrustJournal::loadInstalledKey(const Identity &recipient, std::uint64_t now) {
@@ -520,7 +560,7 @@ bool TrustJournal::recordReceipt(const Bytes &receipt, std::uint64_t now) {
     KeyReceiptCodec::verify(receipt, receiptContext(envelope, delivery.envelope));
     if (!delivery.receipt.empty()) return false;
     delivery.receipt = receipt; log.watermark = now;
-    auto replacement = record; storeLog(replacement, log, pins); save(record, std::move(replacement));
+    auto replacement = record; storeLog(replacement, log, pins); save(record, replacement);
     return true;
 }
 
@@ -538,7 +578,7 @@ std::string TrustJournal::publishDelivery(const Token &recipient, const storage:
     // the same lease through the local and transport durability barriers.
     log.watermark = now;
     auto replacement = record; storeLog(replacement, log, pins);
-    save(record, std::move(replacement));
+    save(record, replacement);
     transport.publishControl(wire, privateStaging);
     return id;
 }
@@ -560,19 +600,22 @@ std::string TrustJournal::publishReceipt(const Identity &recipient, const storag
     const auto receipt = receiptContext(proof->context, log.installed);
     log.watermark = now;
     auto replacement = record; storeLog(replacement, log, pins);
-    save(record, std::move(replacement));
+    save(record, replacement);
     const auto wire = KeyReceiptCodec::sign(receipt, recipient);
     const auto id = storage::controlPacketId(wire);
     transport.publishControl(wire, privateStaging);
     return id;
 }
 
-Bytes TrustJournal::signClipboardEvent(const Identity &author, const SyncKey &key, std::uint64_t sequence,
-                                      const std::vector<SignedEventParent> &parents,
-                                      const std::vector<std::string> &packedItems,
-                                      std::uint64_t now, events::Limits limits) {
+PreparedClipboardEvent TrustJournal::prepareClipboardEvent(const Identity &author, const SyncKey &key,
+                                                            const std::vector<SignedEventParent> &parents,
+                                                            const std::vector<std::string> &packedItems,
+                                                            std::uint64_t now, events::Limits limits) {
+    SignedEventCodec::validateLimits(limits);
+    limits.eventBytes = std::min(limits.eventBytes, MaxClipboardEventBytes);
     const auto lease = lock(); const auto record = load();
-    const auto log = decode(record, binding_, pin(genesis_, local_));
+    const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
     const auto membership = replay(log, genesis_, local_);
     if (membership.forked()) throw Error(ErrorCode::Forked);
     if (author.member() != local_) fail(JournalCode::WrongPins);
@@ -581,7 +624,64 @@ Bytes TrustJournal::signClipboardEvent(const Identity &author, const SyncKey &ke
     if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
     (void)eventAuthors(state);
     checkEventKey(log, genesis_, state, key);
-    return SignedEventCodec::seal(eventContext(state, local_.id), author, key, sequence, parents, packedItems, limits);
+    if (log.pendingEvent) fail(JournalCode::EventPending);
+    // Leave room for both commits, a recovery barrier, and explicit retirement.
+    if (log.allocatedSequence == history::MaxSequence ||
+        record.generation > std::numeric_limits<std::uint64_t>::max() - 4) throw Error(ErrorCode::Overflow);
+
+    const auto sequence = ++log.allocatedSequence;
+    log.pendingEvent.emplace();
+    log.watermark = now;
+    auto burned = record;
+    storeLog(burned, log, pins);
+    save(record, burned);
+    // Keep the first committed generation for the next CAS. If sealing or
+    // either barrier fails, there is no way to reuse a durably burned sequence.
+    *log.pendingEvent = SignedEventCodec::seal(eventContext(state, local_.id), author, key, sequence,
+                                              parents, packedItems, limits);
+    auto ready = burned;
+    storeLog(ready, log, pins);
+    save(burned, ready);
+    return {sequence, std::move(*log.pendingEvent)};
+}
+
+PreparedClipboardEvent TrustJournal::resumeClipboardEvent(std::uint64_t sequence, std::uint64_t now) {
+    const auto lease = lock(); const auto record = load();
+    const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    std::uint64_t pendingGeneration = 0;
+    const auto membership = replay(log, genesis_, local_, nullptr, &pendingGeneration);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    clock(log, now);
+    const auto &state = membership.current();
+    if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
+    if (!log.pendingEvent || log.pendingEvent->empty() || sequence != log.allocatedSequence)
+        fail(JournalCode::EventReservation);
+    if (pendingGeneration != state.keyGeneration) throw Error(ErrorCode::Stale);
+    (void)eventAuthors(state);
+    if (record.generation >= std::numeric_limits<std::uint64_t>::max() - 1) throw Error(ErrorCode::Overflow);
+
+    // A reopened record may have survived an unconfirmed prior commit.
+    // Reestablish the local barrier before returning its exact bytes.
+    log.watermark = now;
+    auto replacement = record;
+    storeLog(replacement, log, pins);
+    save(record, replacement);
+    return {sequence, std::move(*log.pendingEvent)};
+}
+
+void TrustJournal::discardClipboardEvent(std::uint64_t sequence, std::uint64_t now) {
+    const auto lease = lock(); const auto record = load();
+    const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    (void)replay(log, genesis_, local_);
+    clock(log, now);
+    if (!log.pendingEvent || sequence != log.allocatedSequence) fail(JournalCode::EventReservation);
+    log.pendingEvent.reset();
+    log.watermark = now;
+    auto replacement = record;
+    storeLog(replacement, log, pins);
+    save(record, replacement);
 }
 
 SignedEventHistory TrustJournal::readSignedHistory(const SyncKey &key, const std::vector<events::Envelope> &input,

@@ -28,12 +28,15 @@ public:
     static std::string deviceName(const Token &author);
     static Token digest(std::string_view wire);
 
-    // Bounded public metadata. Authentication and authorization require open().
+    // Bounded public metadata. Use verify() or open() to authenticate it.
     static SignedEventHeader inspect(std::string_view wire, events::Limits limits = {});
 
     static crypto::Bytes seal(const SignedEventContext &context, const Identity &author, const SyncKey &key,
                               std::uint64_t sequence, const std::vector<SignedEventParent> &parents,
                               const std::vector<std::string> &packedItems, events::Limits limits = {});
+    // Authenticate the exact packet without opening its clipboard payload.
+    static void verify(const events::Envelope &envelope, const SignedEventContext &expected,
+                       const Member &author, events::Limits limits = {});
     static events::Event open(const events::Envelope &envelope, const SignedEventContext &expected,
                               const Member &author, const SyncKey &key, events::Limits limits = {});
 };
