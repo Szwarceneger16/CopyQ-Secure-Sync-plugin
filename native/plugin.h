@@ -13,7 +13,15 @@
 #include <QThread>
 #include <QProcess>
 #include <QElapsedTimer>
+#ifdef CQS_BUILD_SIGNED_JOIN
+#include "signed_join_wizard.h"
+#include "signed_replica_background.h"
+#include "signed_tab_storage.h"
+#endif
 struct SecureSyncJob;
+#ifdef CQS_BUILD_SIGNED_JOIN
+namespace cqs::native { struct SignedReplicaSource; }
+#endif
 
 class SecureSyncPlugin final : public QObject, public ItemLoaderInterface {
     Q_OBJECT
@@ -53,6 +61,19 @@ private:
     QString settingsFile_;
     bool automaticEnabled_ = false, runtimeBusy_ = false, resolving_ = false;
     bool closing_ = false;
+#ifdef CQS_BUILD_SIGNED_JOIN
+    bool signedJoinOpen_ = false;
+    bool signedTabClaimed_ = false;
+    QByteArray signedTabSetting_;
+    cqs::native::SignedTabStorage signedTab_;
+    cqs::native::SignedReplicaBackground signedBackground_;
+    QString signedBackgroundStatus_;
+    bool activateSignedTab(const cqs::native::SignedTabConfiguration &, const std::string &, const cqs::native::SignedReplicaSource &);
+    std::optional<cqs::native::SignedReplicaRequest> prepareSignedReplica(
+        const QString &directory, const QString &keyFile, const std::string &journalBinding, const cqs::native::SignedReplicaSource &);
+    bool armSignedReplica(const QString &directory, const QString &keyFile, const std::string &journalBinding,
+                         const cqs::native::SignedReplicaSource &, cqs::native::SignedReplicaTask);
+#endif
     QTimer supervisor_;
     QElapsedTimer heartbeat_;
     QElapsedTimer scheduleClock_;

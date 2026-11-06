@@ -208,6 +208,41 @@ int main(int argc,char **argv) {
         CHECK(!p.protects({{"application/x-copyq-tags",{' ','p','r','i','v','a','t','e'}}}));
         p.definitions={"regex;;;;;;;;secret-[0-9]+;;L"};CHECK(p.protects({{"application/x-copyq-tags",{'s','e','c','r','e','t','-','2'}}}));
     });
+    test("tag metadata is bounded before either snapshot reaches the model", [] {
+        constexpr auto tags = "application/x-copyq-tags";
+        ClipboardModel model;
+        put(model, text("keep"));
+        auto access = allowed();
+        access.protection.tags = true;
+        ModelClipboard adapter(&model, access);
+        const auto before = adapter.capture({});
+        auto oversized = before.snapshot;
+        oversized.front()[tags] = cqs::crypto::Bytes(257, 'a');
+        rejects(ModelErrorCode::ProtectedItems, [&] { adapter.preflight(before, oversized); });
+        CHECK(adapter.capture({}).snapshot == before.snapshot);
+        oversized.front()[tags] = cqs::crypto::Bytes(65, ',');
+        rejects(ModelErrorCode::ProtectedItems, [&] { adapter.replace(before, oversized); });
+        CHECK(adapter.capture({}).snapshot == before.snapshot);
+        rejects(ModelErrorCode::ProtectedItems, [&] { access.protection.validate(oversized, before.snapshot); });
+
+        cqs::crypto::Bytes tagList;
+        for (int i = 0; i < 63; ++i) {
+            tagList.push_back('x');
+            tagList.push_back(',');
+        }
+        tagList.push_back('x');
+        const Snapshot large(257, {{tags, tagList}});
+        rejects(ModelErrorCode::ProtectedItems, [&] { access.protection.validateTags(large); });
+        access.protection.tags = false;
+        rejects(ModelErrorCode::ProtectedItems, [&] { access.protection.validateTags(large); });
+    });
+    test("resource exhaustion in configured tag matching refuses the snapshot", [] {
+        cqs::native::RowProtection protection{false, true, {"lock;;;;;;;;(a|aa)+$;;L"}};
+        cqs::crypto::Bytes name(96, 'a');
+        name.push_back('!');
+        const Snapshot candidate{{{"application/x-copyq-tags", name}}};
+        rejects(ModelErrorCode::ProtectedItems, [&] { protection.validateTags(candidate); });
+    });
     test("frozen ciphertext denies mutation and is cleaned up after conversion", [] {
         QString frozen;const auto result=cqs::native::withFrozenCiphertext(QByteArray("cipher"),[&](const QString &file){
             frozen=file;QFile read(file);if(!read.open(QIODevice::ReadOnly))throw std::runtime_error("Frozen ciphertext Qt read failed: "+read.errorString().toStdString());CHECK(read.readAll()=="cipher");read.close();

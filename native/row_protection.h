@@ -11,6 +11,8 @@ struct RowProtection {
     // Raw public CopyQ itemtags settings, retaining order and regex rules.
     QStringList definitions;
     bool protects(const transaction::Item &) const;
+    // Validate tag metadata before a snapshot reaches the CopyQ model.
+    void validateTags(const transaction::Snapshot &) const;
     std::vector<std::pair<std::size_t,std::size_t>> anchors(const transaction::Snapshot &,const transaction::Snapshot &) const;
     void validate(const transaction::Snapshot &before,const transaction::Snapshot &after) const { anchors(before,after); }
     std::size_t pinnedPrefix(const transaction::Snapshot &) const;

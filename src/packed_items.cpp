@@ -7,6 +7,7 @@
 namespace cqs::packed {
 namespace {
 using crypto::Bytes;
+constexpr std::uint32_t InlineVersion = 0xfffffffeU;
 [[noreturn]] void fail() { throw Error(); }
 void account(std::size_t size, std::size_t &total, std::size_t limit) {
     if (total > limit || size > limit - total) fail();
@@ -99,6 +100,37 @@ std::string expanded(std::string name) {
     if (id < 0) fail();
     return std::string(prefixes[static_cast<std::size_t>(id)]) + name.substr(1);
 }
+
+void append32(Bytes &out, std::uint32_t value) {
+    for (unsigned shift = 32; shift; shift -= 8)
+        out.push_back(static_cast<std::uint8_t>(value >> (shift - 8)));
+}
+
+std::size_t inlineSize(const transaction::Item &item) {
+    // Two u32 header fields. Each MIME entry has two u32 lengths, an
+    // uncompressed flag, the UTF-16BE prefix and name, then the raw value.
+    std::size_t size = 8;
+    for (const auto &field : item)
+        size += 11 + 2 * field.first.size() + field.second.size();
+    return size;
+}
+
+std::string encodeBase64(const Bytes &bytes) {
+    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    result.reserve(4 * ((bytes.size() + 2) / 3));
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const auto remaining = bytes.size() - i;
+        const auto a = static_cast<unsigned>(bytes[i]);
+        const auto b = remaining > 1 ? static_cast<unsigned>(bytes[i + 1]) : 0U;
+        const auto c = remaining > 2 ? static_cast<unsigned>(bytes[i + 2]) : 0U;
+        result.push_back(alphabet[a >> 2]);
+        result.push_back(alphabet[((a & 3) << 4) | (b >> 4)]);
+        result.push_back(remaining > 1 ? alphabet[((b & 15) << 2) | (c >> 6)] : '=');
+        result.push_back(remaining > 2 ? alphabet[c & 63] : '=');
+    }
+    return result;
+}
 } // namespace
 void validateLimits(transaction::Limits limits) {
     const transaction::Limits ceiling;
@@ -119,6 +151,36 @@ void validateSnapshot(const transaction::Snapshot &snapshot, transaction::Limits
         }
     }
 }
+std::vector<std::string> encode(const transaction::Snapshot &snapshot, transaction::Limits limits) {
+    validateSnapshot(snapshot, limits);
+    std::size_t total = 0;
+    for (const auto &item : snapshot)
+        account(4 * ((inlineSize(item) + 2) / 3), total, events::Limits{}.plaintextBytes);
+
+    std::vector<std::string> result;
+    result.reserve(snapshot.size());
+    for (const auto &item : snapshot) {
+        Bytes bytes;
+        struct Wipe { Bytes &bytes; ~Wipe() { crypto::wipe(bytes); } } wipe{bytes};
+        bytes.reserve(inlineSize(item));
+        append32(bytes, InlineVersion);
+        append32(bytes, static_cast<std::uint32_t>(item.size()));
+        for (const auto &field : item) {
+            append32(bytes, static_cast<std::uint32_t>(2 * (field.first.size() + 1)));
+            bytes.push_back(0);
+            bytes.push_back('0'); // MIME name stored in full.
+            for (unsigned char character : field.first) {
+                bytes.push_back(0);
+                bytes.push_back(character);
+            }
+            bytes.push_back(0); // uncompressed
+            append32(bytes, static_cast<std::uint32_t>(field.second.size()));
+            bytes.insert(bytes.end(), field.second.begin(), field.second.end());
+        }
+        result.push_back(encodeBase64(bytes));
+    }
+    return result;
+}
 transaction::Snapshot decode(const std::vector<std::string> &items, transaction::Limits limits) {
     validateLimits(limits);
     if (items.size() > limits.items) fail();
@@ -131,7 +193,7 @@ transaction::Snapshot decode(const std::vector<std::string> &items, transaction:
     for (const auto &text : items) {
         const auto bytes = base64(text); Stream stream(bytes);
         const auto version = stream.u32();
-        const bool v2 = version == 0xfffffffeU;
+        const bool v2 = version == InlineVersion;
         const auto count = v2 ? stream.u32() : version;
         if (count > limits.formatsPerItem) fail(); // Includes -3/unknown versions.
         transaction::Item item;

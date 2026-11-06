@@ -7,6 +7,7 @@
 
 using cqs::crypto::Bytes;
 using cqs::packed::decode;
+using cqs::packed::encode;
 using cqs::transaction::Limits;
 namespace {
 int passed = 0;
@@ -36,6 +37,28 @@ void rejects(const Bytes &bytes, Limits limits = {}) { reject([&] { decode({b64(
 void test(const char *name, const std::function<void()> &body) { std::cout << "RUN " << name << std::endl; body(); ++passed; std::cout << "PASS " << name << std::endl; }
 }
 int main() {
+    test("encode deterministic CopyQ v2 inline data", [] {
+        const cqs::transaction::Snapshot snapshot{
+            {}, {{"image/png", {0, 255, 13, 10}}, {"text/plain", {}}}, {{"text/plain", {42}}},
+            {{"text/plain", {42}}}
+        };
+        const std::vector<std::string> expected{
+            b64(wire({})), b64(wire({{"0image/png", {0, 255, 13, 10}, false}, {"0text/plain", {}, false}})),
+            b64(wire({{"0text/plain", {42}, false}})), b64(wire({{"0text/plain", {42}, false}}))
+        };
+        CHECK(encode({}).empty());
+        CHECK(encode(snapshot) == expected);
+        CHECK(decode(encode(snapshot)) == snapshot);
+    });
+    test("encode rejects dangerous names and over-budget output", [] {
+        reject([] { (void)encode({{{"FILE:text/plain", {1}}}}); });
+        Limits small;
+        small.snapshotBytes = 10;
+        reject([&] { (void)encode({{{"text/plain", {1}}}}, small); });
+        const cqs::transaction::Snapshot oversize{{{"a", Bytes(Limits{}.snapshotBytes - 1)}}};
+        cqs::packed::validateSnapshot(oversize, {});
+        reject([&] { (void)encode(oversize); });
+    });
     test("empty tab differs from one empty item", [] { CHECK(decode({}).empty()); CHECK(decode({b64(wire({}))}).size() == 1); });
     test("alternate MIME prefixes have equal effective data", [] {
         const auto a = decode({b64(wire({{"4", {1, 0, 255}, false}}))});

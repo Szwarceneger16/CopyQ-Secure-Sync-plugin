@@ -16,6 +16,8 @@ using cqs::storage::Directory;
 using cqs::storage::Error;
 using cqs::storage::ErrorCode;
 using cqs::storage::Limits;
+using cqs::storage::MaxControlPacketBytes;
+using cqs::storage::controlPacketId;
 using cqs::storage::testing::Point;
 namespace {
 int passed = 0;
@@ -48,6 +50,10 @@ struct Temp {
     }
     ~Temp() { std::error_code ec; fs::remove_all(base,ec); }
     fs::path events() const { return root/L"events"; }
+    fs::path control() const { return root/L"control"; }
+    fs::path packet(const std::string &address) const {
+        return control() / (std::wstring(address.begin(), address.end()) + L".cqc");
+    }
     fs::path device(const std::wstring &name = L"mint-lab") const { return events()/name; }
     fs::path event() const { return device()/filename; }
     void seeded() { cqs::testing::directory(device()); cqs::testing::write(event(),rootWire); }
@@ -191,6 +197,57 @@ int wmain(int argc, wchar_t **argv) {
             l={}; l.reader.eventBytes=1; rejects(ErrorCode::ScanLimit,[&] { d.scan(key,l); });
             l={}; l.reader.historyBytes=1; rejects(ErrorCode::ScanLimit,[&] { d.scan(key,l); });
         });
+        test("signed event publication is isolated, exact and recoverable", [] {
+            using namespace cqs::storage;
+            Temp t; t.seeded(); const Directory d(t.root);
+            SignedEventScope scope;
+            scope.group[0] = 1; scope.root[0] = 2;
+            const auto folder = t.root / signedEventFolderName(scope);
+            const auto device = "d" + std::string(31, 'a');
+            const auto signedId = device + "/000000000001";
+            const auto file = folder / (device + "-000000000001.cqe");
+            const std::string wire("\0\x80\xff\x42", 4);
+            rejects(ErrorCode::Unavailable, [&] { d.scanSignedEvents(scope); });
+            CHECK(!fs::exists(folder));
+            cqs::testing::directory(folder);
+            CHECK(d.scanSignedEvents(scope).empty());
+            rejects(ErrorCode::InvalidPath, [&] { d.publishSignedEvent(scope, {signedId, wire}); });
+            on(Point::PublishLinked, [] { throw Error(ErrorCode::Io, "Injected signed event barrier failure"); });
+            rejects(ErrorCode::PublishedUnconfirmed, [&] { d.publishSignedEvent(scope, {signedId, wire}, t.stage); });
+            CHECK(read(file) == wire);
+            d.publishSignedEvent(scope, {signedId, wire}, t.stage);
+            rejects(ErrorCode::Changed, [&] { d.publishSignedEvent(scope, {signedId, "swap"}, t.stage); });
+            const auto packets = d.scanSignedEvents(scope);
+            CHECK(packets.size() == 1 && packets[0].id == signedId && packets[0].wire == wire);
+            CHECK(fs::is_empty(t.stage) && d.scan(key).graph().tips() == std::vector<std::string>{id});
+            auto next = scope; ++next.generation;
+            const auto nextFolder = t.root / signedEventFolderName(next);
+            cqs::testing::directory(nextFolder);
+            CHECK(d.scanSignedEvents(next).empty());
+            cqs::testing::write(nextFolder / ("D" + std::string(31, 'a') + "-000000000001.cqe"), wire);
+            rejects(ErrorCode::UnsafeEntry, [&] { d.publishSignedEvent(next, {signedId, wire}, t.stage); });
+            rejects(ErrorCode::UnsafeEntry, [&] { d.scanSignedEvents(next); });
+            on(Point::ScanRead, [&] { cqs::testing::write(folder / "conflict-copy.cqe", "conflict"); });
+            rejects(ErrorCode::Changed, [&] { d.scanSignedEvents(scope); });
+            rejects(ErrorCode::UnsafeEntry, [&] { d.scanSignedEvents(scope); });
+        });
+        test("signed generation stays pinned between scan and publish", [] {
+            using namespace cqs::storage;
+            Temp t;
+            SignedEventScope scope;
+            scope.group[0] = 1; scope.root[0] = 2;
+            const auto folder = t.root / signedEventFolderName(scope);
+            cqs::testing::directory(folder);
+            const auto generation = Directory(t.root).openSignedEvents(scope);
+            CHECK(generation->scan().empty());
+            const auto moved = t.root / L"moved-generation";
+            CHECK(!MoveFileExW(folder.c_str(), moved.c_str(), 0));
+            CHECK(fs::is_directory(folder) && !fs::exists(moved));
+            const auto id = "d" + std::string(31, 'a') + "/000000000001";
+            generation->publish({id, "ciphertext"}, t.stage);
+            const auto packets = generation->scan();
+            CHECK(packets.size() == 1 && packets[0].id == id && packets[0].wire == "ciphertext");
+        });
         test("empty scan validates key and reader limits", [] {
             Temp t; Directory d(t.root); bool badKey=false,badLimits=false;
             try { d.scan({}); } catch (const cqs::events::Error&e) { badKey=e.code()==cqs::events::ErrorCode::InvalidKey; }
@@ -307,6 +364,112 @@ int wmain(int argc, wchar_t **argv) {
             auto wrong=key; wrong[0]^=1;
             for(int i=0;i<200;++i) { bool refused=false; try { d.scan(wrong); } catch(const cqs::events::Error&) { refused=true; } CHECK(refused); }
             CHECK(GetProcessHandleCount(GetCurrentProcess(),&after)); CHECK(before==after);
+        });
+        test("control directory must exist before targeted reads and publication", [] {
+            Temp t; Directory d(t.root);
+            const cqs::crypto::Bytes bytes{0, 0xff, 0x42};
+            const auto address = controlPacketId(bytes);
+            rejects(ErrorCode::Unavailable,[&] { d.readControl(address); });
+            rejects(ErrorCode::Unavailable,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(!fs::exists(t.control()) && fs::is_empty(t.stage));
+            CHECK(d.scan(key).graph().size()==0);
+        });
+        test("control publication requires explicit independent private staging", [] {
+            Temp t; cqs::testing::directory(t.control()); Directory d(t.root);
+            const cqs::crypto::Bytes bytes{1, 2, 3};
+            rejects(ErrorCode::InvalidPath,[&] { d.publishControl(bytes); });
+            for (const auto &path : {t.root, t.control(), t.base})
+                rejects(ErrorCode::InvalidPath,[&] { d.publishControl(bytes,path); });
+            rejects(ErrorCode::Unavailable,[&] { d.publishControl(bytes,t.base/L"missing"); });
+            cqs::testing::WindowsAcl publicRead(L"(A;;FR;;;WD)"); publicRead.apply(t.stage);
+            rejects(ErrorCode::UnsafeEntry,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(fs::is_empty(t.control()) && fs::is_empty(t.stage));
+        });
+        test("bounded control publication reads exact binary bytes and confirms identical retries", [] {
+            Temp t; cqs::testing::directory(t.control()); Directory d(t.root);
+            cqs::crypto::Bytes bytes(MaxControlPacketBytes);
+            for (std::size_t i=0;i<bytes.size();++i) bytes[i]=static_cast<std::uint8_t>(i);
+            const auto address=controlPacketId(bytes); const auto path=t.packet(address);
+            d.publishControl(bytes,t.stage);
+            CHECK(d.readControl(address)==bytes && fs::is_empty(t.stage));
+            const auto written=fs::last_write_time(path);
+            d.publishControl(bytes,t.stage);
+            CHECK(d.readControl(address)==bytes && fs::last_write_time(path)==written);
+            CHECK(fs::is_empty(t.stage) && d.scan(key).graph().size()==0);
+        });
+        test("invalid control addresses, lengths and stored hashes fail closed", [] {
+            Temp t; cqs::testing::directory(t.control()); Directory d(t.root);
+            rejects(ErrorCode::InvalidPath,[&] { d.readControl(std::string(64,'A')); });
+            rejects(ErrorCode::InvalidPath,[&] { d.readControl("../events"); });
+            rejects(ErrorCode::InvalidLimits,[&] { d.publishControl({},t.stage); });
+            rejects(ErrorCode::InvalidLimits,[&] { d.publishControl(cqs::crypto::Bytes(MaxControlPacketBytes+1),t.stage); });
+            const cqs::crypto::Bytes bytes{'o','n','e'};
+            const auto address=controlPacketId(bytes); const auto path=t.packet(address);
+            cqs::testing::write(path,std::string(MaxControlPacketBytes+1,'x'));
+            rejects(ErrorCode::ScanLimit,[&] { d.readControl(address); });
+            cqs::testing::write(path,"");
+            rejects(ErrorCode::ScanLimit,[&] { d.readControl(address); });
+            cqs::testing::write(path,"two");
+            rejects(ErrorCode::Changed,[&] { d.readControl(address); });
+            rejects(ErrorCode::Changed,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(read(path)=="two" && fs::is_empty(t.stage));
+        });
+        test("control rejects reparse directories, symlinks and hardlinks", [] {
+            Temp t, outside; Directory d(t.root);
+            const cqs::crypto::Bytes bytes{'o','n','e'};
+            const auto address=controlPacketId(bytes); const auto path=t.packet(address);
+            symlink(outside.events(),t.control(),true);
+            rejects(ErrorCode::UnsafeEntry,[&] { d.readControl(address); });
+            rejects(ErrorCode::UnsafeEntry,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(fs::remove(t.control())); cqs::testing::directory(t.control());
+            const auto target=outside.base/L"packet"; cqs::testing::write(target,"one");
+            symlink(target,path,false);
+            rejects(ErrorCode::UnsafeEntry,[&] { d.readControl(address); });
+            rejects(ErrorCode::UnsafeEntry,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(fs::remove(path)); CHECK(CreateHardLinkW(path.c_str(),target.c_str(),nullptr));
+            rejects(ErrorCode::UnsafeEntry,[&] { d.readControl(address); });
+            rejects(ErrorCode::UnsafeEntry,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(read(target)=="one" && fs::is_empty(t.stage));
+        });
+        test("control rejects writable public ACLs and noncanonical on-disk spelling", [] {
+            Temp t; cqs::testing::directory(t.control()); Directory d(t.root);
+            const cqs::crypto::Bytes bytes{'o','n','e'};
+            const auto address=controlPacketId(bytes); const auto path=t.packet(address);
+            const auto alias=path.parent_path()/(path.stem().wstring()+L".CQC");
+            cqs::testing::write(alias,"one");
+            rejects(ErrorCode::UnsafeEntry,[&] { d.readControl(address); });
+            rejects(ErrorCode::UnsafeEntry,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(fs::remove(alias));
+            cqs::testing::write(path,"one");
+            cqs::testing::WindowsAcl publicWrite(L"(A;;FA;;;WD)"); publicWrite.apply(path);
+            rejects(ErrorCode::UnsafeEntry,[&] { d.readControl(address); });
+            cqs::testing::WindowsAcl normal; normal.apply(path); publicWrite.apply(t.control());
+            rejects(ErrorCode::UnsafeEntry,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(fs::is_empty(t.stage));
+        });
+        test("racing control publication preserves the exact existing file", [] {
+            for (const auto *existing : {"one", "two"}) {
+                Temp t; cqs::testing::directory(t.control()); Directory d(t.root);
+                const cqs::crypto::Bytes bytes{'o','n','e'};
+                const auto path=t.packet(controlPacketId(bytes));
+                on(Point::PublishReady,[&] { CHECK(!fs::exists(path)); cqs::testing::write(path,existing); });
+                if (std::string_view(existing)=="one") d.publishControl(bytes,t.stage);
+                else rejects(ErrorCode::Changed,[&] { d.publishControl(bytes,t.stage); });
+                CHECK(read(path)==existing && fs::is_empty(t.stage));
+            }
+        });
+        test("interrupted control publication retries the same immutable address", [] {
+            Temp t; cqs::testing::directory(t.control()); Directory d(t.root);
+            const cqs::crypto::Bytes bytes{'o','n','e'};
+            const auto address=controlPacketId(bytes); const auto path=t.packet(address);
+            on(Point::PublishReady,[] { throw Error(ErrorCode::Io,"Injected pre-move failure"); });
+            rejects(ErrorCode::Io,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(!fs::exists(path) && fs::is_empty(t.stage));
+            on(Point::PublishLinked,[] { throw Error(ErrorCode::Io,"Injected post-move failure"); });
+            rejects(ErrorCode::PublishedUnconfirmed,[&] { d.publishControl(bytes,t.stage); });
+            CHECK(read(path)=="one" && fs::is_empty(t.stage));
+            d.publishControl(bytes,t.stage);
+            CHECK(d.readControl(address)==bytes);
         });
         std::cout << passed << " native Windows transport scenarios passed\n"; return 0;
     } catch(const std::exception&e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

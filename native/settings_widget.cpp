@@ -154,11 +154,34 @@ void SettingsWidget::setProfile(const Profile &p) {
     staging_->setText(p.publicationStaging);
 }
 void SettingsWidget::setBusy(bool busy) { fields_->setEnabled(!busy); inspect_->setEnabled(!busy); initialize_->setEnabled(!busy); }
+void SettingsWidget::addSignedJoinAction() {
+    auto *button = new QPushButton(tr("Set up signed synchronization…"), operations_);
+    button->setObjectName(QStringLiteral("cqsSignedJoin"));
+    operations_->layout()->addWidget(button);
+    connect(button, &QPushButton::clicked, this, &SettingsWidget::signedJoinRequested);
+    auto *advanced = new QPushButton(tr("Advanced signed setup…"), operations_);
+    advanced->setObjectName(QStringLiteral("cqsSignedAdvanced"));
+    operations_->layout()->addWidget(advanced);
+    connect(advanced, &QPushButton::clicked, this, &SettingsWidget::signedAdvancedRequested);
+    signedBackgroundStatus_ = new QLabel(operations_);
+    signedBackgroundStatus_->setWordWrap(true);
+    signedBackgroundStatus_->setTextFormat(Qt::PlainText);
+    operations_->layout()->addWidget(signedBackgroundStatus_);
+    stopSignedBackground_ = new QPushButton(tr("Stop signed background synchronization"), operations_);
+    operations_->layout()->addWidget(stopSignedBackground_);
+    connect(stopSignedBackground_, &QPushButton::clicked, this, &SettingsWidget::stopSignedBackgroundRequested);
+}
+void SettingsWidget::setSignedBackgroundStatus(const QString &status, bool armed) {
+    if (!signedBackgroundStatus_ || !stopSignedBackground_) return;
+    signedBackgroundStatus_->setText(status);
+    stopSignedBackground_->setVisible(armed);
+    stopSignedBackground_->setEnabled(armed);
+}
 void SettingsWidget::setStatus(const QString &text) { status_->setText(text); }
 void SettingsWidget::setRuntimeStatus(const UiContext &context,const UiStatus &status,bool applied,bool available) {
     runtimeStatus_->setText(status.text()+(applied?QString{}:tr("\nApply the current profile before device, key or recovery actions.")));
     diagnosticsText_=status.diagnostic(context);
-    for(auto *button:operations_->findChildren<QPushButton *>())
+    for(auto *button:operations_->findChildren<QPushButton *>()) if (button != stopSignedBackground_)
         button->setEnabled(applied&&available&&context.enabled&&(!context.busy||button->objectName()=="cqsOperation_stopAutomaticSync"));
     for(auto *button:findChildren<QPushButton *>())if(button->objectName().startsWith("cqsVaultAction_"))button->setEnabled(applied&&available&&context.enabled&&!context.busy);
 }

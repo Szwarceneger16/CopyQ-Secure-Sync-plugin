@@ -1,0 +1,663 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "signed_join_wizard.h"
+#include "device_identity.h"
+#include "device_join_dialog.h"
+#include "device_trust_journal.h"
+#include "signed_join_checkpoint.h"
+#include "storage.h"
+
+#include <QByteArray>
+#include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QEventLoop>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QPlainTextEdit>
+#include <QPointer>
+#include <QPushButton>
+#include <QStringList>
+#include <QThread>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <exception>
+#include <future>
+#include <memory>
+#include <optional>
+#include <utility>
+
+namespace cqs::native {
+namespace {
+using namespace cqs::trust;
+using crypto::Bytes;
+
+constexpr auto RequestPrefix = "cqs-join-request-v1/";
+constexpr qsizetype TokenHexSize = 64;
+constexpr qsizetype RequestBytes = 128;
+constexpr qsizetype PacketHexLimit = 2 * storage::MaxControlPacketBytes;
+
+[[noreturn]] void invalidInput() { throw Error(ErrorCode::Invalid); }
+
+std::uint64_t now() {
+    const auto seconds = QDateTime::currentSecsSinceEpoch();
+    if (seconds <= 0) throw JournalError(JournalCode::ClockRollback);
+    return static_cast<std::uint64_t>(seconds);
+}
+
+template<class Container>
+QString hex(const Container &bytes) {
+    return QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(bytes.data()),
+                                          static_cast<qsizetype>(bytes.size())).toHex());
+}
+
+Bytes parseHex(const QString &input, qsizetype maximum) {
+    if (input.isEmpty() || input.size() > maximum || input.size() % 2 != 0) invalidInput();
+    for (const auto ch : input) {
+        const auto c = ch.unicode();
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            invalidInput();
+    }
+    const auto bytes = QByteArray::fromHex(input.toLatin1());
+    return {bytes.begin(), bytes.end()};
+}
+
+Token tokenAt(const Bytes &bytes, std::size_t offset) {
+    Token token{};
+    if (offset > bytes.size() || bytes.size() - offset < token.size()) invalidInput();
+    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(offset), token.size(), token.begin());
+    return token;
+}
+
+Token parseToken(const QString &value) {
+    if (value.size() != TokenHexSize) invalidInput();
+    return tokenAt(parseHex(value, TokenHexSize), 0);
+}
+
+QString encodeRequest(const JoinRequest &request) {
+    return QLatin1String(RequestPrefix) + hex(request.applicant.id) + hex(request.applicant.signingKey)
+           + hex(request.applicant.encryptionKey) + hex(request.request);
+}
+
+JoinRequest decodeRequest(const QString &wire) {
+    const auto prefix = QLatin1String(RequestPrefix);
+    if (wire.size() != prefix.size() + 2 * RequestBytes || !wire.startsWith(prefix)) invalidInput();
+    const auto bytes = parseHex(wire.mid(prefix.size()), 2 * RequestBytes);
+    return {{tokenAt(bytes, 0), tokenAt(bytes, 32), tokenAt(bytes, 64)}, tokenAt(bytes, 96)};
+}
+
+// Check aggregate size before copying or splitting, then bound the number and
+// size of every individual public input. Clipboard contents are never read.
+QStringList boundedLines(const QString &input, qsizetype lineLimit) {
+    const auto countLimit = static_cast<qsizetype>(MaxMembers);
+    if (input.size() > countLimit * (lineLimit + 2)) invalidInput();
+    auto lines = input.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    if (lines.isEmpty() || lines.size() > countLimit) invalidInput();
+    for (auto &line : lines) {
+        if (line.endsWith(QLatin1Char('\r'))) line.chop(1);
+        if (line.isEmpty() || line.size() > lineLimit) invalidInput();
+    }
+    return lines;
+}
+
+std::vector<Token> approverIds(const QString &input) {
+    std::vector<Token> result;
+    for (const auto &line : boundedLines(input, TokenHexSize)) result.push_back(parseToken(line));
+    return result;
+}
+
+Certificate combinedCertificate(const QString &input) {
+    std::optional<Certificate> result;
+    Bytes proposal;
+    for (const auto &line : boundedLines(input, PacketHexLimit)) {
+        const auto part = decodeCertificate(parseHex(line, PacketHexLimit));
+        const auto encoded = encodeProposal(part.proposal);
+        if (!result) {
+            result = Certificate{part.proposal, {}};
+            proposal = encoded;
+        }
+        if (proposal != encoded || part.approvals.size() > MaxMembers - result->approvals.size()) invalidInput();
+        result->approvals.insert(result->approvals.end(), part.approvals.begin(), part.approvals.end());
+    }
+    // Round-tripping sorts approvals and rejects repeated signers before a
+    // review can display or accept the assembled certificate.
+    return decodeCertificate(encodeCertificate(*result));
+}
+
+template<class Action>
+auto onWorker(Action action) {
+    std::optional<decltype(action())> result;
+    std::exception_ptr failure;
+    QEventLoop loop;
+    const std::unique_ptr<QThread> worker(QThread::create([&] {
+        try { result.emplace(action()); }
+        catch (...) { failure = std::current_exception(); }
+    }));
+    QObject::connect(worker.get(), &QThread::finished, &loop, &QEventLoop::quit, Qt::QueuedConnection);
+    worker->start();
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    worker->wait();
+    if (failure) std::rethrow_exception(failure);
+    return std::move(result).value();
+}
+
+std::optional<QString> input(QWidget &parent, const QString &label, bool multiline = false) {
+    bool accepted = false;
+    const auto title = QObject::tr("Secure Sync — signed device Join");
+    const auto value = multiline
+        ? QInputDialog::getMultiLineText(&parent, title, label, {}, &accepted)
+        : QInputDialog::getText(&parent, title, label, QLineEdit::Normal, {}, &accepted);
+    if (!accepted) return std::nullopt;
+    return value;
+}
+
+void showPublicValue(QWidget &parent, const QString &label, const QString &value) {
+    QDialog dialog(&parent);
+    dialog.setWindowTitle(QObject::tr("Secure Sync — public Join message"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *description = new QLabel(label, &dialog);
+    description->setWordWrap(true);
+    layout->addWidget(description);
+    auto *wire = new QPlainTextEdit(value, &dialog);
+    wire->setReadOnly(true);
+    layout->addWidget(wire);
+    auto *close = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    QObject::connect(close, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(close);
+    dialog.resize(660, 300);
+    dialog.exec();
+}
+
+template<class Action>
+void addAction(QDialog &dialog, QVBoxLayout &layout, const QString &name, Action action) {
+    auto *button = new QPushButton(name, &dialog);
+    layout.addWidget(button);
+    QObject::connect(button, &QPushButton::clicked, &dialog, [&, action = std::move(action)] {
+        try { action(); }
+        catch (...) {
+            // Do not surface exception details, private paths, keys or payloads
+            // through this UI. The backend defines exact retry semantics.
+            if (dialog.isVisible())
+                QMessageBox::warning(&dialog, QObject::tr("Secure Sync — Join refused"),
+                    QObject::tr("The operation failed or its durable outcome is unconfirmed. "
+                                "Check the current membership, packet and local permissions. "
+                                "Reopen the wizard before retrying the same operation."));
+        }
+    });
+}
+
+enum class BlockedReplicaImport { RowLimit, ProtectedRows };
+
+struct LocalSnapshot {
+    transaction::Snapshot value;
+    ~LocalSnapshot() {
+        for (auto &item : value) for (auto &field : item) crypto::wipe(field.second);
+    }
+};
+
+void confirmSource(const SignedReplicaRequest &request) {
+    if (!request.confirmSource || !request.confirmSource()) throw JournalError(JournalCode::Enrollment);
+}
+
+void validateTarget(const SignedReplicaRequest &request, const transaction::Snapshot &before,
+                    const transaction::Snapshot &after) {
+    if (after.size() > static_cast<std::size_t>(request.maximumItems)) throw BlockedReplicaImport::RowLimit;
+    if (!request.preserveProtectedRows || !request.preserveProtectedRows(before, after))
+        throw BlockedReplicaImport::ProtectedRows;
+}
+
+QString deferredImport(BlockedReplicaImport blocked) {
+    return blocked == BlockedReplicaImport::RowLimit
+        ? QObject::tr("The verified history exceeds the CopyQ item limit. The local copy was retained.")
+        : QObject::tr("The verified history would change pinned or locked items, or exceeds the local tag policy. The local copy was retained.");
+}
+} // namespace
+
+trust::SignedReplicaResult synchronizeSignedReplica(trust::TrustJournal &journal, const trust::Identity &identity,
+    const storage::Directory &transport, trust::SignedJoinCheckpoint &checkpoint, const SignedReplicaRequest &request,
+    const std::filesystem::path &privateStaging, const std::function<bool()> &canProceed) {
+    if (canProceed && (!canProceed() || !request.sourcePinned)) throw JournalError(JournalCode::Enrollment);
+    auto mounted = checkpoint.mount(request.expected);
+    if (request.sourcePinned) confirmSource(request);
+    else if (mounted->replica().pending) throw JournalError(JournalCode::Enrollment);
+    const LocalSnapshot local{mounted->snapshot()};
+    std::function<bool()> guard;
+    if (canProceed) guard = [&] { return canProceed() && request.confirmSource && request.confirmSource(); };
+    const auto result = journal.synchronizeReplica(identity, transport, request.expected, mounted->replica(), local.value, now(),
+        [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
+            confirmSource(request);
+            mounted->updateReplica(replica, snapshot, mounted->generation());
+        }, privateStaging, [&](const auto &before, const auto &after) { validateTarget(request, before, after); }, guard);
+    if (!request.sourcePinned && result == SignedReplicaResult::UpToDate) confirmSource(request);
+    return result;
+}
+
+void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity &identity,
+                         const storage::Directory &transport, SignedJoinCheckpoint &checkpoint,
+                         const std::string &profileBinding, const SyncKey *publishKey,
+                         const std::filesystem::path &privateStaging, const std::function<bool()> &stillCurrent,
+                         const std::function<bool(const JoinActivation &)> &activate,
+                         const QString &replicaSource, const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica,
+                         const std::function<bool()> &startBackground, const std::function<bool()> &activateNextGeneration) {
+    // The preferences widget can be deleted by the host while a modal dialog
+    // runs. The wizard is stack-owned so that its worker can always be joined.
+    QDialog wizard;
+    wizard.setWindowModality(Qt::ApplicationModal);
+    const bool hasParent = parent != nullptr;
+    const QPointer<QWidget> originalParent(parent);
+    if (parent) QObject::connect(parent, &QObject::destroyed, &wizard, &QDialog::reject);
+    const auto checkCurrent = [&] {
+        if ((hasParent && !originalParent) || (stillCurrent && !stillCurrent()))
+            throw JournalError(JournalCode::Enrollment);
+    };
+    wizard.setWindowTitle(QObject::tr("Secure Sync — signed device Join"));
+    const auto run = [&](auto action) {
+        checkCurrent();
+        auto result = onWorker(std::move(action));
+        checkCurrent();
+        return result;
+    };
+    auto *layout = new QVBoxLayout(&wizard);
+    auto *notice = new QLabel(QObject::tr(
+        "Exchange only the public Join messages. Compare the full values on independent trusted "
+        "screens. A storage receipt confirms that the sealed group key was saved. A signed checkpoint confirms "
+        "an encrypted local copy of the reviewed history."), &wizard);
+    notice->setWordWrap(true);
+    layout->addWidget(notice);
+    auto *local = new QLabel(QObject::tr("Local device ID %1").arg(hex(identity.member().id)), &wizard);
+    local->setTextFormat(Qt::PlainText);
+    local->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(local);
+    addAction(wizard, *layout, QObject::tr("Inspect signed membership"), [&] {
+        const auto status = run([&] { return journal.inspect(); });
+        const auto &state = status.state;
+        const bool active = std::find(state.members.begin(), state.members.end(), identity.member()) != state.members.end();
+        const auto membership = status.forked ? QObject::tr("Conflict detected") :
+                                (active ? QObject::tr("Active member") : QObject::tr("No current membership"));
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync — signed membership"),
+            QObject::tr("%1\nGroup %2\nGeneration %3\nVerified Join %4\nSealed key stored %5")
+                .arg(membership, hex(state.group), QString::number(static_cast<qulonglong>(state.keyGeneration)),
+                     status.verifiedJoin ? QObject::tr("Yes") : QObject::tr("No"),
+                     status.installedKey ? QObject::tr("Yes") : QObject::tr("No")));
+    });
+    auto *columns = new QHBoxLayout;
+    layout->addLayout(columns);
+    auto *applicant = new QGroupBox(QObject::tr("Device requesting access"), &wizard);
+    auto *member = new QGroupBox(QObject::tr("Existing device"), &wizard);
+    auto *applicantActions = new QVBoxLayout(applicant);
+    auto *memberActions = new QVBoxLayout(member);
+    columns->addWidget(applicant);
+    columns->addWidget(member);
+
+    addAction(wizard, *applicantActions, QObject::tr("1. Create or reopen request"), [&] {
+        const auto request = run([&] { return journal.beginJoin(identity, now()); });
+        showPublicValue(wizard, QObject::tr("Send this public request to an existing device."), encodeRequest(request));
+    });
+    addAction(wizard, *memberActions, QObject::tr("1. Prepare Add proposal"), [&] {
+        const auto value = input(wizard, QObject::tr("Paste the public request from the requesting device."));
+        if (!value) return;
+        const auto request = decodeRequest(*value);
+        const auto proposal = run([&] {
+            const auto time = now();
+            return journal.proposeJoin(request, time, time + 15 * 60);
+        });
+        showPublicValue(wizard, QObject::tr("Send this public Add proposal to the applicant and each intended approver."),
+                        hex(encodeProposal(proposal)));
+    });
+    addAction(wizard, *applicantActions, QObject::tr("2. Show comparison before approvals"), [&] {
+        const auto value = input(wizard, QObject::tr("Paste the public Add proposal."));
+        if (!value) return;
+        const auto proposal = decodeProposal(parseHex(*value, PacketHexLimit));
+        const auto ids = input(wizard, QObject::tr("Enter the intended approvers' full device IDs, one per line."), true);
+        if (!ids) return;
+        const auto signers = approverIds(*ids);
+        const auto review = run([&] { return journal.reviewJoin(proposal, signers, now()); });
+        showDeviceJoinReview(&wizard, review);
+    });
+    addAction(wizard, *memberActions, QObject::tr("2. Compare and sign approval"), [&] {
+        const auto value = input(wizard, QObject::tr("Paste the public Add proposal."));
+        if (!value) return;
+        const auto proposal = decodeProposal(parseHex(*value, PacketHexLimit));
+        const auto review = run([&] { return journal.reviewJoinApproval(proposal, now()); });
+        const auto confirmed = confirmDeviceJoinReview(&wizard, review);
+        if (!confirmed) return;
+        if (confirmed->size() != 1 || confirmed->front().approver != identity.member().id) invalidInput();
+        const auto approval = run([&] { return journal.approve(proposal, identity, confirmed->front().digest, now()); });
+        showPublicValue(wizard, QObject::tr("Send this public signed approval to the applicant."),
+                        hex(encodeCertificate({proposal, {approval}})));
+    });
+    addAction(wizard, *applicantActions, QObject::tr("3. Verify signed approvals"), [&] {
+        const auto value = input(wizard, QObject::tr("Paste the public signed approval packets, one per line."), true);
+        if (!value) return;
+        const auto certificate = combinedCertificate(*value);
+        if (certificate.proposal.operation != Operation::Add || certificate.proposal.subject != identity.member())
+            invalidInput();
+        const auto resumed = run([&] { return journal.inspect().verifiedJoin; });
+        std::vector<JoinConfirmation> confirmations;
+        if (!resumed) {
+            std::vector<Token> signers;
+            for (const auto &approval : certificate.approvals) signers.push_back(approval.signer);
+            const auto review = run([&] { return journal.reviewJoin(certificate.proposal, signers, now()); });
+            const auto confirmed = confirmDeviceJoinReview(&wizard, review);
+            if (!confirmed) return;
+            confirmations = *confirmed;
+        }
+        (void)run([&] { return journal.acceptJoin(certificate, confirmations, now()); });
+        showPublicValue(wizard, QObject::tr("Send the verified public membership certificate to the existing devices."),
+                        hex(encodeCertificate(certificate)));
+    });
+    addAction(wizard, *memberActions, QObject::tr("3. Record membership certificate"), [&] {
+        const auto value = input(wizard, QObject::tr("Paste the public membership certificate."));
+        if (!value) return;
+        const auto certificate = decodeCertificate(parseHex(*value, PacketHexLimit));
+        const auto outcome = run([&] {
+            // A first admission of this device always requires independent
+            // comparisons. Once admitted, observing a conflicting Add can
+            // still persist fork evidence and stop subsequent operations.
+            if (certificate.proposal.operation == Operation::Add &&
+                certificate.proposal.subject.id == identity.member().id &&
+                !journal.inspect().verifiedJoin) invalidInput();
+            return journal.observe(certificate, now());
+        });
+        if (outcome == ObserveResult::ForkDetected) {
+            QMessageBox::warning(&wizard, QObject::tr("Secure Sync — membership conflict"),
+                QObject::tr("A conflicting membership certificate was recorded. Signed Join is blocked."));
+        } else {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("Membership certificate verified."));
+        }
+    });
+    addAction(wizard, *memberActions, QObject::tr("4. Publish sealed key for a member"), [&] {
+        const auto value = input(wizard, QObject::tr("Enter the intended recipient's full device ID."));
+        if (!value) return;
+        const auto recipient = parseToken(*value);
+        if (QMessageBox::question(&wizard, QObject::tr("Secure Sync — confirm key delivery"),
+            QObject::tr("Publish the current group key, sealed for this member?\n\n%1").arg(hex(recipient)),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        const auto address = run([&] {
+            transport.checkPublicationStaging(privateStaging);
+            const auto installed = publishKey ? std::unique_ptr<SyncKey>{} : journal.loadInstalledKey(identity, now());
+            const auto &key = publishKey ? *publishKey : *installed;
+            (void)journal.prepareDelivery(recipient, identity, key, now());
+            return journal.publishDelivery(recipient, transport, now(), privateStaging);
+        });
+        showPublicValue(wizard, QObject::tr("Send this immutable sealed key packet address to the recipient."),
+                        QString::fromStdString(address));
+    });
+    addAction(wizard, *applicantActions, QObject::tr("4. Install sealed key"), [&] {
+        const auto value = input(wizard, QObject::tr("Enter the immutable sealed key packet address."));
+        if (!value) return;
+        const auto address = hex(parseToken(*value)).toStdString();
+        const auto receipt = run([&] {
+            if (!journal.inspect().verifiedJoin) throw JournalError(JournalCode::Enrollment);
+            return journal.installDelivery(transport.readControl(address), identity, now());
+        });
+        showPublicValue(wizard, QObject::tr("The sealed key is stored. Send this public storage receipt to the sender."),
+                        hex(receipt));
+    });
+    addAction(wizard, *memberActions, QObject::tr("Record a storage receipt"), [&] {
+        const auto value = input(wizard, QObject::tr("Paste the public storage receipt from the recipient."));
+        if (!value) return;
+        const auto receipt = parseHex(*value, PacketHexLimit);
+        (void)run([&] { return journal.recordReceipt(receipt, now()); });
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("Storage receipt verified."));
+    });
+    addAction(wizard, *applicantActions, QObject::tr("5. Review and write signed checkpoint"), [&] {
+        const auto expected = run([&] {
+            return journal.preflightJoinActivation(identity, transport, profileBinding, now());
+        });
+        if (QMessageBox::question(&wizard, QObject::tr("Secure Sync — confirm checkpoint"),
+            QObject::tr("Write this verified history as an encrypted private checkpoint?\n\n"
+                        "Group %1\nGeneration %2\nTip %3\nPacket digest %4\nProfile binding %5")
+                .arg(hex(expected.group), QString::number(static_cast<qulonglong>(expected.generation)),
+                     QString::fromStdString(expected.tipId), hex(expected.tipDigest),
+                     QString::fromStdString(expected.profileBinding)),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        const auto write = [&] {
+            (void)run([&] {
+                journal.applyJoinActivation(identity, transport, expected, now(),
+                    [&](const JoinActivation &verified, const events::Event &tip, const transaction::Snapshot &snapshot) {
+                        checkpoint.apply(verified, tip, snapshot);
+                    });
+                return true;
+            });
+        };
+        write();
+        if (!activate || QMessageBox::question(&wizard, QObject::tr("Secure Sync — activate signed tab"),
+                QObject::tr("The encrypted signed checkpoint was verified. Enable a new local signed_sync tab for this profile? "
+                            "Edits stay in the private checkpoint. CopyQ commands, clipboard actions and exports can access open items."),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("Encrypted signed checkpoint verified."));
+            return;
+        }
+        // A membership change or new tip while the confirmation was open
+        // invalidates the original review. Exact retries retain local edits.
+        write();
+        if (!activate(expected)) {
+            QMessageBox::warning(&wizard, QObject::tr("Secure Sync — activation refused"),
+                QObject::tr("The encrypted checkpoint is retained. Enable Encrypt Tabs, move Secure Sync to the first "
+                            "plugin position, disable incompatible plugins and check that signed_sync is unused."));
+            return;
+        }
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync"),
+            QObject::tr("Create the signed_sync tab in CopyQ to open the encrypted local history."));
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Synchronize signed_sync"), [&] {
+        QMessageBox confirmation(QMessageBox::Question, QObject::tr("Secure Sync — synchronize signed tab"),
+            QObject::tr("Use this folder for signed synchronization?\n%1\n\n"
+                        "The tab must be unloaded. This can publish local edits as an encrypted signed packet "
+                        "or update a clean local checkpoint from verified history.")
+                .arg(replicaSource),
+            QMessageBox::Yes | QMessageBox::No, &wizard);
+        confirmation.setTextFormat(Qt::PlainText);
+        confirmation.setDefaultButton(QMessageBox::No);
+        if (confirmation.exec() != QMessageBox::Yes) return;
+        checkCurrent();
+        const auto request = prepareReplica();
+        if (!request) {
+            QMessageBox::warning(&wizard, QObject::tr("Secure Sync — synchronization refused"),
+                QObject::tr("Check that signed_sync is activated and unloaded, Encrypt Tabs is enabled, "
+                            "Secure Sync is first, and the checkpoint, journal and signed folder match the active profile."));
+            return;
+        }
+        SignedReplicaResult result;
+        try {
+            // Do not dispatch CopyQ commands or preference changes between
+            // authorization and a potentially irrevocable publication.
+            result = std::async(std::launch::async, [&] {
+                return synchronizeSignedReplica(journal, identity, transport, checkpoint, *request, privateStaging);
+            }).get();
+            checkCurrent();
+        } catch (BlockedReplicaImport blocked) {
+            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"), deferredImport(blocked));
+            return;
+        }
+        QString message;
+        switch (result) {
+        case SignedReplicaResult::UpToDate: message = QObject::tr("The signed tab is up to date."); break;
+        case SignedReplicaResult::Pulled: message = QObject::tr("Verified history saved. Reopen signed_sync to see it."); break;
+        case SignedReplicaResult::Published: message = QObject::tr("The encrypted signed update was published and verified."); break;
+        case SignedReplicaResult::Conflict:
+            message = QObject::tr("Signed history diverged. The local copy and signed branches were retained.");
+            break;
+        }
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync"), message);
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Resolve signed conflict"), [&] {
+        const auto request = prepareReplica();
+        if (!request) throw JournalError(JournalCode::Enrollment);
+        const auto review = run([&] {
+            const auto mounted = checkpoint.mount(request->expected);
+            if (request->sourcePinned) confirmSource(*request);
+            return journal.reviewReplicaConflict(identity, transport, request->expected,
+                mounted->replica(), mounted->snapshot(), now());
+        });
+        if (!review) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("No signed conflict requires a decision."));
+            return;
+        }
+        QStringList choices{QObject::tr("Keep this device's encrypted local copy")};
+        for (const auto &tip : review->tips)
+            choices.append(QObject::tr("Use signed version %1 (%2)").arg(QString::fromStdString(tip.id), hex(tip.digest)));
+        bool accepted = false;
+        const auto choice = QInputDialog::getItem(&wizard, QObject::tr("Secure Sync — resolve signed conflict"),
+            QObject::tr("Choose the content to publish. All reviewed signed branches remain in history."), choices, 0, false, &accepted);
+        const auto index = choices.indexOf(choice);
+        if (!accepted || index < 0) return;
+        QStringList parents;
+        for (const auto &tip : review->tips) parents.append(QString::fromStdString(tip.id) + "  " + hex(tip.digest));
+        QMessageBox confirmation(QMessageBox::Question, QObject::tr("Secure Sync — confirm signed resolution"),
+            QObject::tr("Publish the selected content against these exact signed versions?\n\n%1\n\n"
+                        "Choosing a signed version preserves the current local copy in an encrypted conflict backup.")
+                .arg(parents.join('\n')), QMessageBox::Yes | QMessageBox::No, &wizard);
+        confirmation.setTextFormat(Qt::PlainText);
+        confirmation.setDefaultButton(QMessageBox::No);
+        if (confirmation.exec() != QMessageBox::Yes) return;
+        checkCurrent();
+        try {
+            const auto result = std::async(std::launch::async, [&] {
+                auto mounted = checkpoint.mount(request->expected);
+                const LocalSnapshot local{mounted->snapshot()};
+                const auto selected = index ? review->tips.at(std::size_t(index - 1)).id : std::string{};
+                if (request->sourcePinned) confirmSource(*request);
+                return journal.resolveReplicaConflict(identity, transport, request->expected, mounted->replica(), local.value,
+                    *review, selected, now(), [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
+                        confirmSource(*request);
+                        mounted->updateReplica(replica, snapshot, mounted->generation());
+                    }, privateStaging, [&](const auto &before, const auto &after) {
+                        validateTarget(*request, before, after);
+                        if (!mounted->replica().pending && before != after) mounted->checkConflictBackupCapacity(after);
+                    });
+            }).get();
+            checkCurrent();
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"),
+                result == SignedReplicaResult::Published
+                    ? QObject::tr("The signed resolution was published. Reopen signed_sync to see the local copy.")
+                    : QObject::tr("Signed history changed. Local data and verified branches were retained. Review the conflict again."));
+        } catch (BlockedReplicaImport blocked) {
+            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"), deferredImport(blocked));
+        }
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Recover pending publication after key rotation"), [&] {
+        const auto request = prepareReplica();
+        if (!request || !request->sourcePinned) throw JournalError(JournalCode::Enrollment);
+        if (QMessageBox::question(&wizard, QObject::tr("Secure Sync — recover after key rotation"),
+                QObject::tr("Retire the matching old-generation reservation locally? The working copy stays encrypted. "
+                            "This does not publish an event or activate synchronization under the new key."),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        checkCurrent();
+        const auto result = std::async(std::launch::async, [&] {
+            confirmSource(*request);
+            auto mounted = checkpoint.mount(request->expected);
+            const LocalSnapshot local{mounted->snapshot()};
+            return journal.recoverRotatedReplica(identity, request->expected, mounted->replica(), local.value, now(),
+                [&](const SignedReplicaState &replica, const transaction::Snapshot &snapshot) {
+                    mounted->updateReplica(replica, snapshot, mounted->generation());
+                });
+        }).get();
+        checkCurrent();
+        QString message;
+        switch (result) {
+        case SignedReplicaRecovery::NothingPending: message = QObject::tr("There is no matching pending publication."); break;
+        case SignedReplicaRecovery::RetiredUnattempted:
+            message = QObject::tr("The old reservation was retired before any publication attempt. Local edits were retained."); break;
+        case SignedReplicaRecovery::RetiredPossiblyPublished:
+            message = QObject::tr("The old reservation was retired. An earlier publication may have reached transport. Local edits were retained."); break;
+        case SignedReplicaRecovery::RetiredConfirmedPublished:
+            message = QObject::tr("The journal confirms an earlier transport write. Local recovery is complete and local edits were retained."); break;
+        }
+        QMessageBox::information(&wizard, QObject::tr("Secure Sync"), message);
+    });
+    if (prepareReplica) addAction(wizard, *applicantActions, QObject::tr("Manage encrypted conflict backups"), [&] {
+        const auto request = prepareReplica();
+        if (!request || !request->sourcePinned) throw JournalError(JournalCode::Enrollment);
+        const auto listed = run([&] {
+            confirmSource(*request);
+            const auto mounted = checkpoint.mount(request->expected);
+            std::vector<std::size_t> counts;
+            for (std::size_t i = 0; i < mounted->conflictBackupCount(); ++i)
+                counts.push_back(mounted->conflictBackup(i).size());
+            return std::make_pair(mounted->generation(), counts);
+        });
+        QStringList choices;
+        for (std::size_t i = 0; i < listed.second.size(); ++i)
+            choices.append(QObject::tr("Backup %1 (%2 items)").arg(qulonglong(i + 1)).arg(qulonglong(listed.second[i])));
+        if (choices.isEmpty()) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), QObject::tr("There are no encrypted conflict backups."));
+            return;
+        }
+        bool accepted = false;
+        const auto selected = QInputDialog::getItem(&wizard, QObject::tr("Secure Sync — encrypted backups"),
+            QObject::tr("Choose an encrypted local backup."), choices, int(choices.size()) - 1, false, &accepted);
+        const auto index = choices.indexOf(selected);
+        if (!accepted || index < 0) return;
+        QMessageBox action(QMessageBox::Question, QObject::tr("Secure Sync — backup action"),
+            QObject::tr("Restore this backup and keep the current copy as a backup, or remove the selected backup from this checkpoint?"),
+            QMessageBox::Cancel, &wizard);
+        const auto restore = action.addButton(QObject::tr("Restore"), QMessageBox::AcceptRole);
+        const auto discard = action.addButton(QObject::tr("Remove backup"), QMessageBox::DestructiveRole);
+        action.setDefaultButton(QMessageBox::Cancel);
+        action.exec();
+        if (action.clickedButton() != restore && action.clickedButton() != discard) return;
+        const bool restoring = action.clickedButton() == restore;
+        if (!restoring && QMessageBox::question(&wizard, QObject::tr("Secure Sync — confirm backup removal"),
+                QObject::tr("Remove only the selected backup from the encrypted checkpoint?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+        checkCurrent();
+        try {
+            std::async(std::launch::async, [&] {
+                confirmSource(*request);
+                auto mounted = checkpoint.mount(request->expected);
+                if (mounted->generation() != listed.first) throw JournalError(JournalCode::HistoryChanged);
+                if (restoring) {
+                    validateTarget(*request, mounted->snapshot(), mounted->conflictBackup(std::size_t(index)));
+                    mounted->restoreConflictBackup(std::size_t(index), listed.first);
+                } else {
+                    mounted->discardConflictBackup(std::size_t(index), listed.first);
+                }
+            }).get();
+            checkCurrent();
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"), restoring
+                ? QObject::tr("The encrypted backup is now the local working copy. Reopen signed_sync to see it.")
+                : QObject::tr("The selected backup was removed from the encrypted checkpoint."));
+        } catch (BlockedReplicaImport blocked) {
+            if (wizard.isVisible()) QMessageBox::warning(&wizard, QObject::tr("Secure Sync — update deferred"), deferredImport(blocked));
+        }
+    });
+    if (startBackground) addAction(wizard, *applicantActions, QObject::tr("Start signed background synchronization"), [&] {
+        QMessageBox confirmation(QMessageBox::Question, QObject::tr("Secure Sync — signed background synchronization"),
+            QObject::tr("Allow this CopyQ session to send local edits as encrypted signed updates and fetch verified changes "
+                        "while signed_sync is unloaded?\n\n%1\n\n"
+                        "The session stops on conflicts or errors and can be stopped in Preferences.").arg(replicaSource),
+            QMessageBox::Yes | QMessageBox::No, &wizard);
+        confirmation.setTextFormat(Qt::PlainText);
+        confirmation.setDefaultButton(QMessageBox::No);
+        if (confirmation.exec() != QMessageBox::Yes) return;
+        checkCurrent();
+        if (!startBackground()) {
+            QMessageBox::warning(&wizard, QObject::tr("Secure Sync — background synchronization refused"),
+                QObject::tr("Activate and unload signed_sync, and verify the pinned source by synchronizing manually first."));
+            return;
+        }
+        wizard.accept();
+    });
+    if (activateNextGeneration) addAction(wizard, *applicantActions, QObject::tr("Activate accepted key generation"), [&] {
+        checkCurrent();
+        if (activateNextGeneration()) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"),
+                QObject::tr("The new encrypted checkpoint is active. Reopen signed_sync. The previous checkpoint was retained."));
+            wizard.accept();
+        }
+    });
+    applicantActions->addStretch();
+    memberActions->addStretch();
+    auto *close = new QDialogButtonBox(QDialogButtonBox::Close, &wizard);
+    QObject::connect(close, &QDialogButtonBox::rejected, &wizard, &QDialog::reject);
+    layout->addWidget(close);
+    wizard.resize(690, 340);
+    wizard.exec();
+}
+} // namespace cqs::native
