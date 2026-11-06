@@ -155,10 +155,14 @@ void SettingsWidget::setProfile(const Profile &p) {
 }
 void SettingsWidget::setBusy(bool busy) { fields_->setEnabled(!busy); inspect_->setEnabled(!busy); initialize_->setEnabled(!busy); }
 void SettingsWidget::addSignedJoinAction() {
-    auto *button = new QPushButton(tr("Signed Join (experimental)…"), operations_);
+    auto *button = new QPushButton(tr("Set up signed synchronization…"), operations_);
     button->setObjectName(QStringLiteral("cqsSignedJoin"));
     operations_->layout()->addWidget(button);
     connect(button, &QPushButton::clicked, this, &SettingsWidget::signedJoinRequested);
+    auto *advanced = new QPushButton(tr("Advanced signed setup…"), operations_);
+    advanced->setObjectName(QStringLiteral("cqsSignedAdvanced"));
+    operations_->layout()->addWidget(advanced);
+    connect(advanced, &QPushButton::clicked, this, &SettingsWidget::signedAdvancedRequested);
     signedBackgroundStatus_ = new QLabel(operations_);
     signedBackgroundStatus_->setWordWrap(true);
     signedBackgroundStatus_->setTextFormat(Qt::PlainText);

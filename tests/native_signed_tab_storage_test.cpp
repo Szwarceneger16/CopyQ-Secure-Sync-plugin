@@ -216,4 +216,60 @@ int main(int argc, char **argv) {
     recovered.reset();
     CHECK(!storage.hasModel());
     CHECK(checkpoint.mount(proof)->generation() == 2);
+
+    const auto successorDir = temporary.path() + QStringLiteral("/successor");
+    directory(successorDir);
+    auto successorProof = proof;
+    successorProof.profileBinding = "signed-native-successor";
+    successorProof.tipDigest = token(6);
+    successorProof.generation = 1;
+    SignedJoinCheckpoint successor(path(successorDir), Key, successorProof.profileBinding);
+    successor.apply(successorProof, tip, original);
+    cqs::native::SignedTabConfiguration successorConfiguration{successorDir, {}, successorProof, temporary.path()};
+    successorConfiguration.predecessorMarker = cqs::native::signedTabMarkerIdentity(proof);
+    successorConfiguration.predecessorMaximumGeneration = 2;
+    storage.setConfiguration(successorConfiguration);
+    storage.setKeyProvider([](const auto &) { return cqs::crypto::Bytes{}; });
+    Model guidedModel;
+    CHECK(!load(storage, guidedModel, firstMarker) && guidedModel.rowCount() == 0);
+    storage.setKeyProvider([&](const auto &) {
+        storage.setConfiguration({});
+        return Key;
+    });
+    CHECK(!load(storage, guidedModel, firstMarker) && guidedModel.rowCount() == 0 && !storage.hasModel());
+    storage.setConfiguration(successorConfiguration);
+    storage.setKeyProvider([&](const auto &) {
+        allowed = false;
+        return Key;
+    });
+    CHECK(!load(storage, guidedModel, firstMarker) && guidedModel.rowCount() == 0 && !storage.hasModel());
+    allowed = true;
+    storage.setKeyProvider([&](const auto &) {
+        auto changed = successorConfiguration;
+        ++changed.predecessorMaximumGeneration;
+        storage.setConfiguration(changed);
+        return Key;
+    });
+    CHECK(!load(storage, guidedModel, firstMarker) && guidedModel.rowCount() == 0 && !storage.hasModel());
+    storage.setConfiguration(successorConfiguration);
+    auto removedOwner = std::make_unique<SignedTabStorage>();
+    removedOwner->setConfiguration(successorConfiguration);
+    removedOwner->setGuard([] { return true; });
+    removedOwner->setKeyProvider([&](const auto &) {
+        removedOwner.reset();
+        return Key;
+    });
+    Model orphanedModel;
+    CHECK(!load(*removedOwner, orphanedModel, firstMarker) && !removedOwner && orphanedModel.rowCount() == 0);
+    storage.setKeyProvider([](const auto &) { return Key; });
+    saver = load(storage, guidedModel, firstMarker);
+    CHECK(saver && guidedModel.text(0) == "abc");
+    const auto successorMarker = save(saver, guidedModel);
+    CHECK(successorMarker.mid(16, 32) == cqs::native::signedTabMarkerIdentity(successorProof));
+    QCoreApplication::processEvents();
+    saver.reset();
+    Model refused;
+    CHECK(!load(storage, refused, future) && refused.rowCount() == 0);
+    storage.setConfiguration(cqs::native::SignedTabConfiguration{successorDir, {}, successorProof, temporary.path()});
+    CHECK(!load(storage, refused, firstMarker) && refused.rowCount() == 0);
 }

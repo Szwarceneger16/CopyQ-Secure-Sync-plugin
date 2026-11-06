@@ -22,4 +22,9 @@ void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Pro
                          const ActivateSignedTab &activate,
                          const PrepareSignedReplica &prepareReplica,
                          const ArmSignedReplica &armReplica);
+void openGuidedSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Profile &legacy,
+                         const std::function<bool()> &stillCurrent,
+                         const ActivateSignedTab &activate,
+                         const PrepareSignedReplica &prepareReplica,
+                         const ArmSignedReplica &armReplica);
 }

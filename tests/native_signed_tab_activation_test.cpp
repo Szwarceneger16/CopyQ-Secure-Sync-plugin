@@ -10,6 +10,7 @@
 #include <QSettings>
 #include <QTemporaryDir>
 #include <QVariant>
+#include <QtEndian>
 
 // Match the pinned host's public QObject surface without loading other plugins.
 class ItemFactory final : public QObject {
@@ -126,6 +127,20 @@ int main(int argc, char **argv) {
     CHECK(decoded && decoded->expected.generation == 0);
     CHECK(decoded->expected.profileBinding == configuration.expected.profileBinding);
     CHECK(encodeSignedTab(*decoded, journal) == encoded);
+    auto guided = configuration;
+    guided.keyFile.clear();
+    guided.setupRoot = QFileInfo(temp.path()).canonicalFilePath();
+    const auto guidedWire = encodeSignedTab(guided, journal);
+    CHECK(decodeSignedTab(profile, guidedWire)->setupRoot == guided.setupRoot);
+    guided.keyFile = key;
+    CHECK(!decodeSignedTab(profile, encodeSignedTab(guided, journal)));
+    guided.keyFile.clear();
+    guided.predecessorMarker = QByteArray(32, 'P');
+    guided.predecessorMaximumGeneration = 11;
+    const auto transitioned = decodeSignedTab(profile, encodeSignedTab(guided, journal));
+    CHECK(transitioned && transitioned->predecessorMaximumGeneration == 11);
+    guided.predecessorMaximumGeneration = 0;
+    CHECK(!decodeSignedTab(profile, encodeSignedTab(guided, journal)));
 
     const auto copiedProfile = temp.filePath("copied-profile.ini");
     CHECK(QFile::copy(profile, copiedProfile));
@@ -176,6 +191,79 @@ int main(int argc, char **argv) {
     malformed(QStringLiteral("journalBinding"), QStringLiteral("legacy-profile"));
     malformed(QStringLiteral("keyFile"), temp.filePath("missing-key"));
     malformed(QStringLiteral("unknown"), true);
+
+    CHECK(QDir(temp.path()).mkdir("successor"));
+    auto successor = configuration;
+    successor.checkpointDirectory = QFileInfo(temp.filePath("successor")).canonicalFilePath();
+    successor.expected.generation = 1;
+    successor.expected.tipDigest = token(9);
+    successor.expected.profileBinding = signedTabBinding(canonicalProfile, successor.checkpointDirectory, journal);
+    QByteArray marker = SignedTabPreamble + QByteArrayLiteral("CQSSGN01") + signedTabMarkerIdentity(configuration.expected);
+    const auto generation = qToBigEndian<quint64>(3);
+    marker.append(reinterpret_cast<const char *>(&generation), sizeof(generation));
+    writeFile(cache, marker);
+    retainSignedPredecessorMarker(successor, configuration, 3);
+    CHECK(successor.predecessorMaximumGeneration == 3 &&
+          successor.predecessorMarker == signedTabMarkerIdentity(configuration.expected));
+    const auto retentionRefuses = [&](const QByteArray &bytes, const SignedTabConfiguration &current,
+                                     std::uint64_t maximum) {
+        writeFile(cache, bytes);
+        auto candidate = successor;
+        bool refused = false;
+        try {
+            retainSignedPredecessorMarker(candidate, current, maximum);
+        } catch (const cqs::trust::JournalError &error) {
+            CHECK(error.code() == cqs::trust::JournalCode::HistoryChanged);
+            refused = true;
+        }
+        CHECK(refused && candidate.predecessorMarker.isEmpty() && candidate.predecessorMaximumGeneration == 0);
+    };
+    auto futureMarker = marker;
+    qToBigEndian<quint64>(4, futureMarker.data() + 48);
+    retentionRefuses(futureMarker, configuration, 3);
+    retentionRefuses(marker, configuration, 0);
+    auto unrelatedMarker = marker;
+    unrelatedMarker[16] = char(unrelatedMarker[16] ^ 1);
+    retentionRefuses(unrelatedMarker, configuration, 3);
+    retentionRefuses(marker.left(55), configuration, 3);
+    writeFile(cache + QStringLiteral(".tmp"), marker);
+    retentionRefuses(marker, configuration, 3);
+    CHECK(QFile::remove(cache + QStringLiteral(".tmp")));
+    auto earlier = configuration;
+    earlier.predecessorMarker = QByteArray(32, 'P');
+    earlier.predecessorMaximumGeneration = 2;
+    auto inheritedMarker = marker;
+    inheritedMarker.replace(16, 32, earlier.predecessorMarker);
+    qToBigEndian<quint64>(2, inheritedMarker.data() + 48);
+    writeFile(cache, inheritedMarker);
+    auto inherited = successor;
+    retainSignedPredecessorMarker(inherited, earlier, 99);
+    CHECK(inherited.predecessorMarker == earlier.predecessorMarker && inherited.predecessorMaximumGeneration == 2);
+    qToBigEndian<quint64>(3, inheritedMarker.data() + 48);
+    retentionRefuses(inheritedMarker, earlier, 99);
+    CHECK(QFile::remove(cache));
+    auto uncached = successor;
+    retainSignedPredecessorMarker(uncached, configuration, 3);
+    CHECK(uncached.predecessorMarker.isEmpty() && uncached.predecessorMaximumGeneration == 0);
+    writeFile(cache, marker);
+    settings.setValue("Plugins/securesync/active_signed_tab", encoded + 'x');
+    settings.sync();
+    CHECK(!persistSignedSuccessor(profile, configuration, successor, journal, {transport, journalDirectory}));
+    CHECK(settings.value("Plugins/securesync/active_signed_tab").toByteArray() == encoded + 'x');
+    CHECK(settings.value("Plugins/securesync/signed_replica_source").toByteArray() == sourcePin);
+    settings.setValue("Plugins/securesync/active_signed_tab", encoded);
+    settings.sync();
+    CHECK(!persistSignedSuccessor(profile, configuration, successor, journal, {other, journalDirectory}));
+    CHECK(persistSignedSuccessor(profile, configuration, successor, journal, {transport, journalDirectory}));
+    CHECK(persistSignedSuccessor(profile, configuration, successor, journal, {transport, journalDirectory}));
+    CHECK(!confirmSignedReplicaSource(profile, encoded, sourcePin, false));
+    const auto changed = settings.value("Plugins/securesync/active_signed_tab").toByteArray();
+    CHECK(decodeSignedTab(profile, changed)->expected.generation == 1);
+    settings.setValue("Plugins/securesync/signed_replica_source", sourcePin);
+    settings.sync();
+    CHECK(!persistSignedSuccessor(profile, configuration, successor, journal, {transport, journalDirectory}));
+    CHECK(settings.value("Plugins/securesync/active_signed_tab").toByteArray() == changed);
+    CHECK(settings.value("Plugins/securesync/signed_replica_source").toByteArray() == sourcePin);
 
     app.setProperty("CopyQ_server", QVariant{});
     CHECK(!signedTabHostReady(profile));

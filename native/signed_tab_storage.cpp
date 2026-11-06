@@ -8,7 +8,6 @@
 #include "signed_join_checkpoint.h"
 #include "signed_tab_marker.h"
 #include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QDir>
 #include <QIODevice>
 #include <QScopeGuard>
@@ -40,6 +39,8 @@ auto proofFields(const trust::JoinActivation &proof) {
 
 bool sameConfiguration(const SignedTabConfiguration &a, const SignedTabConfiguration &b) {
     return a.checkpointDirectory == b.checkpointDirectory && a.keyFile == b.keyFile &&
+           a.setupRoot == b.setupRoot && a.predecessorMarker == b.predecessorMarker &&
+           a.predecessorMaximumGeneration == b.predecessorMaximumGeneration &&
            proofFields(a.expected) == proofFields(b.expected);
 }
 
@@ -62,26 +63,6 @@ QByteArray integer(quint64 value) {
     return QByteArray(reinterpret_cast<const char *>(&encoded), sizeof(encoded));
 }
 
-QByteArray markerIdentity(const trust::JoinActivation &proof) {
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    hash.addData(QByteArrayView("CopyQ-Secure-Sync-signed-tab-marker-v1"));
-    const auto text = [&hash](const std::string &value) {
-        hash.addData(integer(value.size()));
-        hash.addData(QByteArrayView(value.data(), qsizetype(value.size())));
-    };
-    const auto token = [&hash](const trust::Token &value) {
-        hash.addData(QByteArrayView(reinterpret_cast<const char *>(value.data()), value.size()));
-    };
-    text(proof.profileBinding);
-    token(proof.group);
-    token(proof.root);
-    token(proof.head);
-    token(proof.member);
-    token(proof.tipDigest);
-    hash.addData(integer(proof.generation));
-    text(proof.tipId);
-    return hash.result();
-}
 
 struct LocalKey {
     crypto::Bytes bytes;
@@ -250,13 +231,17 @@ void SignedTabStorage::setGuard(std::function<bool()> guard) { guard_ = std::mov
 void SignedTabStorage::setSnapshotValidator(std::function<void(const transaction::Snapshot &)> validator) {
     validateSnapshot_ = std::move(validator);
 }
+void SignedTabStorage::setKeyProvider(std::function<crypto::Bytes(const SignedTabConfiguration &)> provider) {
+    keyProvider_ = std::move(provider);
+}
 
 bool SignedTabStorage::authorized(const SignedTabConfiguration &configuration) const {
     if (!guiThread(this) || !configuration_ || !sameConfiguration(*configuration_, configuration) || !guard_)
         return false;
     try {
+        const QPointer<const SignedTabStorage> owner(this);
         const auto guard = guard_;
-        return guard() && configuration_ && sameConfiguration(*configuration_, configuration);
+        return guard() && owner && owner->configuration_ && sameConfiguration(*owner->configuration_, configuration);
     } catch (...) {
         return false;
     }
@@ -282,25 +267,41 @@ ItemSaverPtr SignedTabStorage::restore(const QString &tab, QAbstractItemModel *m
     const QPointer<QAbstractListModel> list(qobject_cast<QAbstractListModel *>(model));
     if (!list || list->rowCount() != 0) return {};
 
-    const QScopedValueRollback<bool> restoring(restoring_, true);
+    const QPointer<SignedTabStorage> owner(this);
+    restoring_ = true;
+    const auto restoring = qScopeGuard([owner] { if (owner) owner->restoring_ = false; });
     try {
         const auto configuration = *configuration_;
-        if (!authorized(configuration) || !list) refuse(ModelErrorCode::AccessDenied);
-        const auto identity = markerIdentity(configuration.expected);
+        if (!authorized(configuration) || !owner || !list) refuse(ModelErrorCode::AccessDenied);
+        const auto identity = signedTabMarkerIdentity(configuration.expected);
         quint64 minimum = 0;
         if (marker) {
             const auto bytes = marker->read(MarkerSize + 1);
-            if (bytes.size() != MarkerSize || !marker->atEnd() || !bytes.startsWith(MarkerMagic) ||
-                bytes.mid(MarkerMagic.size(), IdentitySize) != identity)
+            if (bytes.size() != MarkerSize || !marker->atEnd() || !bytes.startsWith(MarkerMagic))
                 refuse(ModelErrorCode::Changed);
             minimum = qFromBigEndian<quint64>(bytes.constData() + MarkerMagic.size() + IdentitySize);
             if (!minimum) refuse(ModelErrorCode::Changed);
+            const auto storedIdentity = bytes.mid(MarkerMagic.size(), IdentitySize);
+            if (storedIdentity != identity) {
+                if (configuration.predecessorMarker.size() != IdentitySize ||
+                    storedIdentity != configuration.predecessorMarker ||
+                    minimum > configuration.predecessorMaximumGeneration) refuse(ModelErrorCode::Changed);
+                minimum = 0;
+            }
         }
 
         const auto directory = localPath(configuration.checkpointDirectory);
-        const auto credential = localPath(configuration.keyFile);
+        LocalKey provided{};
+        if (!configuration.setupRoot.isEmpty()) {
+            const auto provider = keyProvider_;
+            if (!provider) refuse(ModelErrorCode::AccessDenied);
+            provided.bytes = provider(configuration);
+            if (!owner || provided.bytes.size() != 32 || !authorized(configuration) || !owner || !list)
+                refuse(ModelErrorCode::AccessDenied);
+        }
         auto mounted = std::async(std::launch::async, [&] {
-            const LocalKey key{readKeyStrict(credential)};
+            const LocalKey key{configuration.setupRoot.isEmpty()
+                ? readKeyStrict(localPath(configuration.keyFile)) : std::move(provided.bytes)};
             trust::SignedJoinCheckpoint checkpoint(directory, key.bytes, configuration.expected.profileBinding);
             return checkpoint.mount(configuration.expected);
         }).get();
@@ -311,11 +312,12 @@ ItemSaverPtr SignedTabStorage::restore(const QString &tab, QAbstractItemModel *m
             if (const auto live = weakSaver.lock()) live->detach();
         });
         saver->restoreRows(maximum);
+        if (!owner) refuse(ModelErrorCode::AccessDenied);
         if (!marker) saver->awaitInitialMarker();
         active_ = saver;
         return saver;
     } catch (...) {
-        emit error(QStringLiteral("Signed Sync could not authenticate and restore the encrypted tab."));
+        if (owner) emit owner->error(QStringLiteral("Signed Sync could not authenticate and restore the encrypted tab."));
         return {};
     }
 }

@@ -19,6 +19,7 @@ constexpr char BindingDomain[] = "CopyQ-Secure-Sync-signed-join-checkpoint-bindi
 constexpr char DescriptorDomain[] = "CopyQ-Secure-Sync-signed-join-checkpoint-proof-lab-v1";
 constexpr char DescriptorMime[] = "application/x-copyq-secure-sync-signed-join-checkpoint-lab-v1";
 constexpr char ReplicaMime[] = "application/x-copyq-secure-sync-signed-replica-lab-v1";
+constexpr char SuccessorMime[] = "application/x-copyq-secure-sync-signed-generation-successor-lab-v1";
 // Schema 3 keeps the Join snapshot in local. After the first edit, schema 5
 // keeps the original in its single archive. Schema 6 adds replica metadata
 // alongside the original proof in the authenticated preserved field.
@@ -217,7 +218,11 @@ SignedReplicaState checkRecord(const Record &record, const std::string &binding,
         record.allocatedSequence || record.publication || record.resolution || !record.witnessed.empty()) refuse();
     const auto &metadata = record.preserved->front();
     const auto descriptor = metadata.find(DescriptorMime);
-    if (metadata.size() != (replicated ? 2u : 1u) || descriptor == metadata.end() ||
+    const auto successor = metadata.find(SuccessorMime);
+    const bool transitioned = successor != metadata.end();
+    if (transitioned && (!replicated || successor->second.size() != Token{}.size() ||
+        std::all_of(successor->second.begin(), successor->second.end(), [](auto byte) { return byte == 0; }))) refuse();
+    if (metadata.size() != (replicated ? (transitioned ? 3u : 2u) : 1u) || descriptor == metadata.end() ||
         descriptor->second != proof) refuse();
     if (!replicated) return {{expected.tipId, expected.tipDigest}, {}};
     const auto replica = metadata.find(ReplicaMime);
@@ -347,6 +352,55 @@ void SignedJoinCheckpoint::apply(const JoinActivation &verified, const events::E
         backing.store.commit(current.value, wanted.value);
         (void)confirm(backing.store, wanted.value);
     }
+}
+
+void SignedJoinCheckpoint::applySuccessor(const JoinActivation &verified, const events::Event &tip,
+    const Snapshot &snapshot, const Snapshot &previousLocal, const Token &transitionReceipt) {
+    auto &backing = *backing_;
+    const auto proofBytes = descriptor(verified, backing.profileBinding);
+    if (transitionReceipt == Token{} || tip.revision.id != verified.tipId) refuse();
+    history::validateRevision(tip.revision);
+    const WipedSnapshot decoded{packed::decode(tip.items)};
+    if (decoded.value != snapshot) refuse();
+    packed::validateSnapshot(previousLocal, {});
+    const Bytes receipt(transitionReceipt.begin(), transitionReceipt.end());
+    WipedRecord wanted{{ReplicaSchema, backing.binding, 2, {}, {}, snapshot, digestHex(proofBytes)}};
+    const SignedReplicaState replica{{verified.tipId, verified.tipDigest}, {}};
+    wanted.value.preserved = Snapshot{{{DescriptorMime, proofBytes}, {ReplicaMime, replicaDescriptor(replica)}, {SuccessorMime, receipt}}};
+    wanted.value.archives = {snapshot, previousLocal};
+    // Check aggregate archive/metadata capacity before create-only persistence.
+    const WipedBytes capacity{state::serialize(wanted.value)};
+    const auto session = lock(backing.session);
+    const auto lease = lock(backing.store);
+    try {
+        WipedRecord current{backing.store.load()};
+        (void)checkRecord(current.value, backing.binding, proofBytes, verified);
+        const auto &metadata = current.value.preserved->front();
+        const auto retained = metadata.find(SuccessorMime);
+        if (retained == metadata.end() || retained->second != receipt || originalSnapshot(current.value) != snapshot) refuse();
+        // Exact retry authenticates the durable destination without changing
+        // edits or the user's later explicit backup decisions.
+        return;
+    } catch (const state::Error &error) {
+        if (error.code() != state::ErrorCode::Missing) throw;
+    }
+    backing.store.initialize(wanted.value);
+    (void)confirm(backing.store, wanted.value);
+}
+
+void SignedJoinCheckpoint::checkSuccessorCapacity(const JoinActivation &provisional, const Snapshot &snapshot,
+    const Snapshot &previousLocal) const {
+    auto proof = provisional;
+    if (proof.tipDigest == Token{}) proof.tipDigest.fill(1);
+    const auto proofBytes = descriptor(proof, backing_->profileBinding);
+    packed::validateSnapshot(snapshot, {});
+    packed::validateSnapshot(previousLocal, {});
+    const SignedReplicaState replica{{proof.tipId, proof.tipDigest}, {}};
+    WipedRecord wanted{{ReplicaSchema, backing_->binding, 2, {}, {}, snapshot, digestHex(proofBytes)}};
+    wanted.value.preserved = Snapshot{{{DescriptorMime, proofBytes}, {ReplicaMime, replicaDescriptor(replica)},
+        {SuccessorMime, Bytes(Token{}.size(), 1)}}};
+    wanted.value.archives = {snapshot, previousLocal};
+    const WipedBytes capacity{state::serialize(wanted.value)};
 }
 
 Snapshot SignedJoinCheckpoint::read(const JoinActivation &expected) {

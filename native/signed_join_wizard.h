@@ -42,5 +42,6 @@ void runSignedJoinWizard(QWidget *parent, trust::TrustJournal &journal, const tr
                          const std::function<bool(const trust::JoinActivation &)> &activate = {},
                          const QString &replicaSource = {},
                          const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica = {},
-                         const std::function<bool()> &startBackground = {});
+                         const std::function<bool()> &startBackground = {},
+                         const std::function<bool()> &activateNextGeneration = {});
 } // namespace cqs::native

@@ -32,6 +32,7 @@ signals:
     void vaultActionRequested(QString action);
     void operationRequested(QString action);
     void signedJoinRequested();
+    void signedAdvancedRequested();
     void stopSignedBackgroundRequested();
 private:
     QLineEdit *device_, *transport_, *key_, *state_, *vault_, *staging_;

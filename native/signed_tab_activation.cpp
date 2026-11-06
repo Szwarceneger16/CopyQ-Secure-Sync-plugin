@@ -7,6 +7,8 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFileInfo>
+#include <QFile>
+#include <QtEndian>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSettings>
@@ -44,9 +46,11 @@ std::string signedTabBinding(const QString &settingsFile, const QString &directo
 
 QByteArray signedReplicaSourcePin(const std::string &profileBinding, const SignedReplicaSource &source) {
     if (!canonicalPath(source.transport, true) || !canonicalPath(source.journal, true)) return {};
+    if (!source.setupRoot.isEmpty() && !canonicalPath(source.setupRoot, true)) return {};
     QByteArray bytes("CopyQ-Secure-Sync-native-replica-source-v1");
     bytes.append('\0').append(QByteArray::fromStdString(profileBinding)).append('\0').append(source.transport.toUtf8())
         .append('\0').append(source.journal.toUtf8());
+    if (!source.setupRoot.isEmpty()) bytes.append('\0').append(source.setupRoot.toUtf8());
     return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
 }
 
@@ -74,12 +78,19 @@ bool confirmSignedReplicaSource(const QString &settingsFile, const QByteArray &a
 
 QByteArray encodeSignedTab(const SignedTabConfiguration &configuration, const std::string &journalBinding) {
     const auto &a = configuration.expected;
-    return QJsonDocument(QJsonObject{
-        {"version", 1}, {"directory", configuration.checkpointDirectory}, {"keyFile", configuration.keyFile},
+    const int version = !configuration.predecessorMarker.isEmpty() ? 3 : !configuration.setupRoot.isEmpty() ? 2 : 1;
+    QJsonObject object{
+        {"version", version}, {"directory", configuration.checkpointDirectory}, {"keyFile", configuration.keyFile},
         {"journalBinding", QString::fromStdString(journalBinding)}, {"binding", QString::fromStdString(a.profileBinding)},
         {"group", hex(a.group)}, {"root", hex(a.root)}, {"head", hex(a.head)}, {"member", hex(a.member)},
         {"tipDigest", hex(a.tipDigest)}, {"generation", QString::number(a.generation)}, {"tipId", QString::fromStdString(a.tipId)}
-    }).toJson(QJsonDocument::Compact);
+    };
+    if (version >= 2) object.insert("setupRoot", configuration.setupRoot);
+    if (version >= 3) {
+        object.insert("predecessorMarker", QString::fromLatin1(configuration.predecessorMarker.toHex()));
+        object.insert("predecessorMaximumGeneration", QString::number(configuration.predecessorMaximumGeneration));
+    }
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
 std::optional<SignedTabConfiguration> decodeSignedTab(const QString &settingsFile, const QByteArray &encoded) {
@@ -88,9 +99,19 @@ std::optional<SignedTabConfiguration> decodeSignedTab(const QString &settingsFil
     SignedTabConfiguration configuration{};
     configuration.checkpointDirectory = object.value("directory").toString();
     configuration.keyFile = object.value("keyFile").toString();
+    configuration.setupRoot = object.value("setupRoot").toString();
+    if (object.contains("predecessorMarker")) {
+        const auto encodedMarker = object.value("predecessorMarker").toString().toLatin1();
+        configuration.predecessorMarker = QByteArray::fromHex(encodedMarker);
+        bool validGeneration = false;
+        configuration.predecessorMaximumGeneration = object.value("predecessorMaximumGeneration").toString().toULongLong(&validGeneration);
+        if (configuration.predecessorMarker.size() != 32 || configuration.predecessorMarker.toHex() != encodedMarker ||
+            !validGeneration || !configuration.predecessorMaximumGeneration) return {};
+    }
     const auto canonicalSettings = QFileInfo(settingsFile).canonicalFilePath();
     if (!canonicalPath(canonicalSettings, false) || !canonicalPath(configuration.checkpointDirectory, true) ||
-        !canonicalPath(configuration.keyFile, false)) return {};
+        (configuration.setupRoot.isEmpty() ? !canonicalPath(configuration.keyFile, false) :
+            !configuration.keyFile.isEmpty() || !canonicalPath(configuration.setupRoot, true))) return {};
     const auto journalBinding = object.value("journalBinding").toString().toStdString();
     const auto trustPin = QByteArray::fromStdString(journalBinding).mid(6);
     if (journalBinding.compare(0, 6, "trust-") != 0 || trustPin.size() != 64 ||
@@ -172,5 +193,64 @@ QString signedTabCachePath() {
     const auto part = QByteArray(SignedTabName).toBase64().replace('/', '-');
     return QFileInfo(dataPath).dir().filePath(QCoreApplication::applicationName() +
         QStringLiteral("_tab_") + QString::fromLatin1(part) + QStringLiteral(".dat"));
+}
+
+void retainSignedPredecessorMarker(SignedTabConfiguration &successor, const SignedTabConfiguration &current,
+                                  std::uint64_t reviewedGeneration) {
+    successor.predecessorMarker.clear();
+    successor.predecessorMaximumGeneration = 0;
+    const auto cache = signedTabCachePath();
+    if (cache.isEmpty()) throw trust::JournalError(trust::JournalCode::Enrollment);
+    const QFileInfo info(cache);
+    const QFileInfo interrupted(cache + QStringLiteral(".tmp"));
+    if (info.isSymLink() || interrupted.exists() || interrupted.isSymLink())
+        throw trust::JournalError(trust::JournalCode::HistoryChanged);
+    if (!info.exists()) return;
+    QFile file(cache);
+    if (!info.isFile() || !file.open(QIODevice::ReadOnly)) throw trust::JournalError(trust::JournalCode::Enrollment);
+    const auto marker = file.read(57);
+    if (marker.size() != 56 || !file.atEnd() || !marker.startsWith(SignedTabPreamble + QByteArrayLiteral("CQSSGN01")))
+        throw trust::JournalError(trust::JournalCode::HistoryChanged);
+    const auto identity = marker.mid(16, 32);
+    const auto generation = qFromBigEndian<quint64>(marker.constData() + 48);
+    if (!generation) throw trust::JournalError(trust::JournalCode::HistoryChanged);
+    std::uint64_t maximum = 0;
+    if (identity == signedTabMarkerIdentity(current.expected)) maximum = reviewedGeneration;
+    else if (identity == current.predecessorMarker) maximum = current.predecessorMaximumGeneration;
+    if (!maximum || generation > maximum) throw trust::JournalError(trust::JournalCode::HistoryChanged);
+    successor.predecessorMarker = identity;
+    successor.predecessorMaximumGeneration = maximum;
+}
+
+bool persistSignedSuccessor(const QString &settingsFile, const SignedTabConfiguration &current,
+                           const SignedTabConfiguration &successor, const std::string &journalBinding,
+                           const SignedReplicaSource &source) {
+    if (current.expected.group != successor.expected.group || current.expected.root != successor.expected.root ||
+        current.expected.member != successor.expected.member || current.expected.generation >= successor.expected.generation ||
+        current.checkpointDirectory == successor.checkpointDirectory || current.keyFile != successor.keyFile ||
+        current.setupRoot != successor.setupRoot || current.setupRoot != source.setupRoot) return false;
+    const auto oldValue = encodeSignedTab(current, journalBinding);
+    const auto newValue = encodeSignedTab(successor, journalBinding);
+    if (!decodeSignedTab(settingsFile, oldValue) || !decodeSignedTab(settingsFile, newValue)) return false;
+    const auto oldPin = signedReplicaSourcePin(current.expected.profileBinding, source);
+    const auto newPin = signedReplicaSourcePin(successor.expected.profileBinding, source);
+    if (oldPin.isEmpty() || newPin.isEmpty()) return false;
+    QSettings settings(settingsFile, QSettings::IniFormat);
+    settings.sync();
+    settings.beginGroup("Plugins/securesync");
+    const auto active = settings.value(SignedTabSetting).toByteArray();
+    const auto pin = settings.value(SignedReplicaSourceSetting).toByteArray();
+    if (settings.status() != QSettings::NoError) return false;
+    if (active == newValue) return pin == newPin;
+    if (active != oldValue || pin != oldPin) return false;
+    settings.setValue(SignedTabSetting, newValue);
+    settings.setValue(SignedReplicaSourceSetting, newPin);
+    settings.sync();
+    if (settings.status() != QSettings::NoError) return false;
+    QSettings confirmed(settingsFile, QSettings::IniFormat);
+    confirmed.sync();
+    confirmed.beginGroup("Plugins/securesync");
+    return confirmed.status() == QSettings::NoError && confirmed.value(SignedTabSetting).toByteArray() == newValue &&
+           confirmed.value(SignedReplicaSourceSetting).toByteArray() == newPin;
 }
 } // namespace cqs::native

@@ -65,6 +65,15 @@ struct JoinActivation {
     std::uint64_t generation;
     std::string tipId;
 };
+struct SignedGenerationTarget {
+    JoinActivation activation;
+    bool seed = false;
+    bool resuming = false;
+    bool retiresStaleSeed = false;
+    Token retirementDigest{}, seedDigest{};
+    std::size_t seedItems = 0;
+    bool pendingSnapshotDiffers = false;
+};
 using JoinActivationWriter = std::function<void(const JoinActivation &, const events::Event &,
                                                  const transaction::Snapshot &)>;
 struct SignedReplicaCursor {
@@ -111,8 +120,11 @@ public:
     static constexpr std::size_t MaxControlBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxClipboardEventBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxJournalBytes = MaxControlBytes + MaxClipboardEventBytes +
-                                                   96 + 77 * history::MaxEvents + 2 * Token{}.size() + sizeof(std::uint64_t);
-    TrustJournal(transaction::Store &store, Genesis genesis, Member local);
+                                                   256 + 77 * history::MaxEvents + 2 * Token{}.size() + sizeof(std::uint64_t);
+    // A founder key is optional and comes only from authenticated private setup.
+    // Its owner must outlive this journal. Every operation checks it against the
+    // current accepted generation, or uses a verified installed envelope.
+    TrustJournal(transaction::Store &store, Genesis genesis, Member local, const SyncKey *founderKey = nullptr);
     TrustJournal(const TrustJournal &) = delete;
     TrustJournal &operator=(const TrustJournal &) = delete;
     static std::string binding(const Genesis &genesis, const Member &local);
@@ -149,6 +161,16 @@ public:
     void applyJoinActivation(const Identity &applicant, const storage::Directory &transport,
                              const JoinActivation &expected, std::uint64_t trustedNow,
                              const JoinActivationWriter &write);
+    // An explicit successor profile may adopt a current signed tip or Seed
+    // an empty current scope. Only its exact scoped reservation can resume or
+    // be retired after another rotation; old generation transport is untouched.
+    SignedGenerationTarget preflightGenerationActivation(const Identity &identity, const storage::Directory &transport,
+        const JoinActivation &previous, std::string successorBinding, std::uint64_t trustedNow,
+        const transaction::Snapshot *seedSnapshot = nullptr, bool explicitlyReviewPending = false);
+    void applyGenerationActivation(const Identity &identity, const storage::Directory &transport,
+        const JoinActivation &previous, const SignedGenerationTarget &successor, const Token &confirmation,
+        const transaction::Snapshot &seedSnapshot, std::uint64_t trustedNow, const JoinActivationWriter &write,
+        const std::filesystem::path &privateStaging = {}, const SignedReplicaTargetValidator &validateTarget = {});
     // The caller holds the checkpoint session and supplies a stable local snapshot.
     // The writer durably updates the checkpoint while this method holds the journal lease.
     SignedReplicaResult synchronizeReplica(const Identity &identity, const storage::Directory &transport,
@@ -238,15 +260,18 @@ private:
         const std::filesystem::path &, const SignedReplicaTargetValidator &, const std::function<bool()> &,
         const ReplicaResolution *);
     JoinActivation verifyJoinActivation(const Identity &, const storage::Directory &, std::string,
-                                        std::uint64_t, const JoinActivation *, const JoinActivationWriter &);
+        std::uint64_t, const JoinActivation *, const JoinActivationWriter &);
+    SignedGenerationTarget verifyGenerationActivation(const Identity &, const storage::Directory &, const JoinActivation &,
+        std::string, std::uint64_t, const SignedGenerationTarget *, const Token &, const transaction::Snapshot *,
+        const JoinActivationWriter &, const std::filesystem::path &, const SignedReplicaTargetValidator &, bool);
     PreparedClipboardEvent prepareClipboardEventLocked(const Identity &author, const SyncKey &key,
         const std::vector<SignedEventParent> &parents, const std::vector<std::string> &packedItems,
         std::uint64_t now, events::Limits limits, const Token *migration = nullptr,
-        const Token *replicaTag = nullptr);
+        const Token *replicaTag = nullptr, const Token *generationScope = nullptr);
     std::string publishClipboardEventLocked(std::uint64_t sequence, const SyncKey &key,
         const storage::Directory &transport, std::uint64_t now, ClipboardPublication mode,
         const std::filesystem::path &privateStaging, const Token *migration = nullptr,
-        const ReplicaPublication *replica = nullptr);
+        const ReplicaPublication *replica = nullptr, const Token *generationScope = nullptr);
     crypto::Bytes prepare(const Token &recipient, const Identity &sender, const SyncKey &key,
                          std::uint64_t now, KeyScope scope);
     std::unique_ptr<transaction::Store::Lease> lock();
@@ -255,6 +280,7 @@ private:
     transaction::Store &store_;
     Genesis genesis_;
     Member local_;
+    const SyncKey *founderKey_ = nullptr;
     std::string binding_;
     std::atomic<bool> uncertain_{false};
     std::optional<std::uint64_t> seenGeneration_;

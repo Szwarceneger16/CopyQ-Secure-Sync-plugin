@@ -3,8 +3,9 @@
 Status: engineering baseline for the isolated policy model, not a deployed wire
 protocol or audited cryptographic implementation. The [stage-1 requirements](DEVICE-TRUST-DESIGN.md)
 remain authoritative. The [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates)
-are not all closed by this change. Nothing here activates new device trust in
-the current CopyQ plugin or handles real clipboard keys.
+are not all closed by this change. The optional native signed build can activate
+an editable signed tab with separate keys; the default plugin path is unchanged.
+These implementations remain opt-in pending distribution qualification.
 
 ## Implemented boundary
 
@@ -19,15 +20,19 @@ libsodium signatures, an encrypted identity vault, durable approval coordination
 and signed key envelopes and storage receipts. It replays pinned history,
 commits reservations before signing and durably stages the exact ciphertext
 for each authorized recipient.
-The acceptance gates cover integration with a running CopyQ profile.
+The optional native integration adds guided local provisioning, authenticated
+checkpoint activation and explicit synchronization in a running CopyQ profile.
+The acceptance gates still cover installed-platform and production delivery
+qualification.
 
 ## Cryptographic suite selected for integration
 
 The opt-in adapter uses libsodium single-part **Ed25519 detached signatures**,
 independently generated **X25519 encryption keys**, and `crypto_box_seal()` /
 `crypto_box_seal_open()` for recipient envelopes. Device signing and encryption
-keypairs use separate randomness. Group and request identifiers, nonce fields
-and recovery credentials use a cryptographic RNG.
+keypairs use separate randomness. Group and request identifiers, public recovery
+bindings and nonce fields use a cryptographic RNG. The separate offline recovery
+credential and package format described below remain unimplemented.
 
 This is an explicit alternative to the earlier HPKE candidate, not HPKE or MLS
 conformance. The sealed-box construction is library-provided; do not reproduce
@@ -277,6 +282,12 @@ that archive and establish an explicit successor history.
 
 ## Independent recovery credential
 
+This format is not implemented. Guided setup currently stores a random public
+recovery binding in the genesis, without exporting an independent recovery secret
+or usable offline package. Its local setup password only unlocks that device's
+encrypted profile; losing that profile and its password is not addressed by the
+proposed format below.
+
 The proposed first recovery format uses a generated 256-bit random recovery
 secret, separate from ordinary local passwords and device signing keys. Its
 public group binding is a domain-separated digest; the secret is exported only
@@ -322,12 +333,34 @@ tips and preserves the prior encrypted local copy when adopting a remote
 selection. An authorized device can retire its matching pending publication
 locally after key rotation. The old checkpoint remains bound to its generation.
 The earlier sealed-key storage receipt acknowledges only the sealed key write.
-Product work still includes guided provisioning, durable originator-key
-preparation, cloud discovery, acknowledged Join, cross-generation activation,
-broader recovery and platform qualification. Full disk/key rollback across
+
+Guided native provisioning now creates a private encrypted setup manifest with
+independent device, group and wrapping keys. Applicant setup requires the full
+genesis fingerprint from a separately trusted device. Founder setup creates one
+durable empty signed root and retains its initial group key locally in the
+encrypted manifest. Founder activation uses that independently pinned key only
+while current membership and key commitment authorize it; this creates no extra
+approval vote or permanent founder privilege. Advanced manually provisioned
+vault/journal/credential paths remain supported.
+
+An authorized surviving device with the accepted newer key installed may review
+and activate a separate encrypted successor checkpoint. A single authenticated
+new-generation tip is adopted, or the explicitly designated first device may
+confirm seeding an empty provisioned scope from its current local copy. The
+coordinator rechecks the exact old cursor, local content, new target and current
+authority, retains the old checkpoint and an encrypted local backup, and supports
+exact retry through durable seed and successor receipts. This is local adoption;
+events do not assert ancestry across key generations. Background synchronization
+remains a separate in-memory opt-in for each CopyQ session.
+
+Product work still includes cloud discovery, acknowledged Join, offline recovery
+package export/import, native legacy archive migration and platform qualification.
+Hosted signed-suite and real CopyQ two-device results, Windows/MSVC/NTFS and
+Flatpak package qualification, production cloud delivery and a fresh-machine
+recovery drill remain release gates. Full disk/key rollback across
 restarts requires an external monotonic anchor or explicit recovery policy.
-G5's signed event migration and G6-G7's installer/platform qualification still
-gate distribution. Advanced settings remain ordinary UI.
+G5's product migration and G6-G7's installer/platform qualification still gate
+distribution. Advanced settings remain ordinary UI.
 
 ## Primary references
 

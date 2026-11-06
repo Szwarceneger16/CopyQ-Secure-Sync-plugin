@@ -11,9 +11,11 @@ The tests use disposable directories and synthetic keys. The separate
 checkpoint in an editable CopyQ tab and
 [synchronize it on demand](#manual-signed-tab-synchronization) or
 [during an explicitly enabled CopyQ session](#signed-background-synchronization)
-while it is unloaded. It supports explicit signed conflict decisions and local
-retirement of pending publications after key rotation. Guided provisioning,
-cloud delivery and cross-generation activation remain product integration work.
+while it is unloaded. It includes guided local provisioning, founder activation,
+explicit signed conflict decisions, local retirement of pending publications and
+reviewed activation of an accepted newer key generation. Cloud discovery and
+offline recovery packages remain unimplemented; installed-platform qualification
+is still required.
 The [protocol design](DEVICE-TRUST-PROTOCOL.md)
 and [acceptance gates](DEVICE-TRUST-ACCEPTANCE.md#implementation-gates) define
 the product contract.
@@ -367,9 +369,10 @@ until finalization. The journal can still observe valid external membership
 evidence, and an Add, rotation or detected fork blocks the pending migration.
 After finalization, ordinary enrollment can proceed. The source lease
 serializes local access to the private record. Legacy peers can still change
-files they control, and subsequent source changes can block a retry. Product
-integration still requires native guided setup, profile activation and
-cloud-client qualification.
+files they control, and subsequent source changes can block a retry. This archive
+migration is a separate control-plane operation; the guided native setup creates
+an empty signed group and does not import an existing legacy tab. Native archive
+migration and cloud-client qualification remain distribution work.
 
 ## Authenticated Join and activation preflight
 
@@ -410,9 +413,20 @@ the version 5 payload. An all-zero intent represents a request still
 awaiting admission. Version 6 remains the separate founder migration format.
 Replay checks the admission marker against the accepted Add in the log.
 
-`preflightJoinActivation()` requires the verified admission and reopens the
-sealed key package from the private journal for the current member and key
-generation. It authenticates the signed generation scope and its retained
+Journal version 10 permits optional migration and replica publication evidence
+without fabricating a Join enrollment for the founder. Version 11 adds a scoped
+generation-Seed marker with pending, published or retired phase. Retirement
+retains a digest commitment to the old scope, head, generation, sequence and exact
+staged wire digest, and records when the publication outcome may be ambiguous.
+A later Seed retains that retirement lineage for interrupted retries.
+
+`preflightJoinActivation()` requires verified admission for an applicant and
+reopens the sealed key package from the private journal for the current member
+and key generation. The independently pinned founder may instead supply the
+guarded key retained by its local setup. This key must match the accepted
+generation commitment, and the founder must still be an active member of an
+unforked membership state. This is no additional admission vote or exemption
+from membership policy. The operation authenticates the signed generation scope and its retained
 witnesses, requires exactly one tip, and validates that tip's packed CopyQ
 MIME data. The journal commits the observed packet digests before returning
 the profile binding, group, root, membership head, member ID, generation and
@@ -439,8 +453,44 @@ Notes, FakeVim, Pinned Items and Tags (`securesync`, `itemtext`, `itemimage`,
 CopyQ plugin inventory and priority. Other enabled plugins can affect how CopyQ
 stores, renders or handles tab items.
 
-Open **Preferences → Devices and recovery → Signed Join (experimental)**. The
-dialog opens a previously provisioned identity vault and trust journal. Supply
+Open **Preferences → Devices and recovery → Set up signed synchronization…**.
+Choose one of these actions:
+
+1. **Create a new group** selects an empty synchronization folder and a private
+   local parent outside it. Setup creates a dedicated private profile, generates
+   an independent device identity, group key and separate random vault, journal
+   and checkpoint wrapping credentials, and publishes one empty signed Seed.
+   It then opens the existing verified checkpoint and activation workflow.
+2. **Join an existing group** selects the delivered signed transport and a
+   private parent. Obtain the public invitation and full group fingerprint from
+   a trusted device. Compare the complete fingerprint on an independent trusted
+   screen before entering it. The invitation pins the genesis; it grants no
+   membership or key access. Continue with the peer-verified Join steps below.
+3. **Open an existing signed profile** selects the private profile created
+   earlier and unlocks it with its setup password. Use this action after an
+   interruption, for later Join actions or for synchronization.
+
+Keep the private profile and its password. Setup requires at least 12 UTF-8
+password bytes and stores the generated credentials in a password-protected
+encrypted manifest. It writes no raw credential files to the transport. Public
+invitations contain the 192-byte genesis, encoded as lowercase hex after
+`cqs-signed-group-v1/`. The full fingerprint hashes a separate domain and all
+genesis fields. A random public recovery binding in this format is not an offline
+recovery credential. Recovery-package export and restore are not implemented.
+
+The manifest records a provisioning phase before initializing the vault and
+journal. An interrupted operation reuses those exact saved identities and
+credentials. Founder publication retries the exact staged empty Seed; burned
+reservations remain gaps. Only the provisional phase may create the initial
+Seed. Opening a ready profile never treats missing history as permission to
+reseed. Private directories are created with protected local permissions and
+validated pinned paths. Windows requires private storage and staging on the
+same fixed NTFS volume as transport. Initial provisioning holds a setup session
+lease, then releases it; live secrets remain guarded in memory. Journal and
+checkpoint operations retain their own exclusive leases.
+
+**Advanced signed setup…** opens a previously provisioned identity vault and
+trust journal. It remains available for controlled manual provisioning. Supply
 these pins from trusted local setup, encoded as contiguous hex in field order.
 
 | Field | Bytes in order | Hex digits |
@@ -484,7 +534,8 @@ requires an available signed history.
    `signed_sync` and its mnemonic aliases are unused and that the CopyQ `.dat`
    cache for that tab is absent. After activation, create a tab named exactly
    `signed_sync` and open it. On later starts, reopen the same tab with the
-   private checkpoint and its credential file available.
+   private checkpoint available. Guided profiles prompt for their local setup
+   password; advanced profiles require the private checkpoint credential file.
 
 ### Local tab storage boundary
 
@@ -498,8 +549,11 @@ requires the same binding and a checkpoint at least as recent as that marker.
 A checkpoint may be ahead of the marker after synchronization while the tab
 is unloaded or after an interrupted tab file update. The marker contains no
 clipboard items or credential bytes. Settings remember the checkpoint and
-credential file paths and the reviewed checkpoint's binding and provenance.
-Keep the raw checkpoint credential file private and outside the shared root.
+reviewed binding and provenance. Guided configurations identify the encrypted
+setup profile and prompt for its password on unlock; settings contain no setup
+password or raw wrapping credential. Advanced configurations retain a private
+credential-file path. Keep every private profile and raw credential file outside
+the shared root.
 
 An incompatible live plugin configuration, a missing or invalid checkpoint or
 credential, or a conflicting tab or cache on first activation causes refusal.
@@ -507,8 +561,14 @@ There is no automatic conversion of an existing tab. Signed verification
 refuses legacy packets and uses the signed generation scope throughout. The
 existing legacy storage and synchronization paths remain separate.
 
-The local tab opens from the checkpoint without the signed transport or trust
-journal. Opening or editing the tab does not start replication. Like other
+The local tab opens without the signed transport, trust journal or identity
+vault. Guided unlock authenticates only the ready setup manifest and its
+immutable group, genesis-root and member pins against the active checkpoint
+configuration; it performs no provisioning. It then opens the encrypted
+checkpoint using the recovered wrapping credential. Local data remains readable
+offline even if remote membership has subsequently changed; publication still
+requires current journal authority. Opening or editing the tab does not start
+replication. Like other
 CopyQ tabs, its open contents are available as plaintext to CopyQ commands.
 Copying items to the system clipboard or exporting them can put plaintext
 outside the checkpoint. Treat that data as you would data in any other CopyQ
@@ -521,9 +581,9 @@ tab.
    switch to a different tab. If the signed tab is still loaded, close CopyQ
    normally and reopen the profile with another tab selected. Keep
    `signed_sync` unloaded until synchronization completes.
-2. Open the **Signed Join (experimental)** wizard again using the trusted
-   local pins, private storage and credential paths, and signed transport
-   from setup. Select **Synchronize signed_sync**. Review the displayed
+2. Reopen the guided signed profile with its password, or use **Advanced signed
+   setup…** with the trusted local pins and credential paths. Select
+   **Synchronize signed_sync**. Review the displayed
    transport folder and confirm that this device may publish local edits there
    as an encrypted signed packet. New activations pin the canonical transport
    and private journal paths to the local profile. An older activation binds
@@ -627,11 +687,47 @@ an unattempted publication, a confirmed earlier transport write, and an
 earlier publication that may have reached transport when the journal cannot
 confirm its outcome. Existing transport history remains available.
 
-The checkpoint remains bound to the original key generation. Activation
-under the new generation requires separate authenticated setup. A membership
+The checkpoint remains bound to the original key generation. Use the separate
+reviewed generation activation below to adopt the current generation. A membership
 fork, removed device or mismatched reservation blocks this recovery.
 Current readers can open earlier private records. Older builds can refuse
 records written with conflict backups, merge intents or rotation evidence.
+
+### Activate an accepted newer key generation
+
+1. Exchange and accept the membership certificate and install the current sealed
+   key through the verified device workflow. Leave `signed_sync` unloaded. Retire
+   any matching old pending publication with the action above first.
+2. Select **Activate accepted key generation**. Choose a new private destination
+   for the successor checkpoint. The source remains intact. Review the old and
+   new generations, local item count, selected version and confirmation digest.
+3. If the new signed scope has one verified tip, adopt that exact version. If the
+   explicitly provisioned scope is empty, the designated first device may confirm
+   publishing its current local copy as the first signed snapshot. Check delivery
+   before doing so; simultaneous first devices can create branches. Other devices
+   should receive and authenticate that snapshot before activating.
+4. Confirm the review. The operation rechecks active membership, the installed
+   key, source cursor, exact local copy and target history under the journal and
+   old checkpoint leases. It writes and reads back a separate encrypted successor,
+   including a backup of the prior local copy, before updating the active profile.
+   Retry the retained destination after an interrupted write or activation.
+
+This is an explicit local adoption. Signed histories in different key generations
+do not claim cross-generation cryptographic ancestry. An old CopyQ routing marker
+is accepted only through the recorded predecessor binding and reviewed maximum
+checkpoint generation. Forks, removal, missing keys, changed local data, another
+target tip or unrelated pending work require a new review. The native row/item
+limits and protected-row checks also apply. Background synchronization does not
+activate a new generation automatically.
+
+A staged Seed that differs from the current local copy is refused by default.
+An explicit pending-content review can bind both the actual staged snapshot and
+the changed local copy; the successor uses the reviewed staged content and backs
+up the current local copy. If another accepted rotation makes an interrupted Seed
+stale, an explicit review may retire only that exact scoped intent locally. It
+does no old-scope transport I/O and does not claim the packet was never published.
+Unsealed reserved sequences are burned, and retirement evidence survives the
+next Seed and its retries.
 
 ## Clock and rollback limits
 
@@ -665,7 +761,7 @@ cmake -S . -B build-control -DCQS_BUILD_NATIVE_PLUGIN=OFF \
   -DCMAKE_PREFIX_PATH=/your/trusted/libsodium-prefix
 cmake --build build-control --parallel 2
 ctest --test-dir build-control --output-on-failure \
-  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration|device_join|signed_join_checkpoint)$'
+  -R '^(device-trust|device_identity|device_identity_vault|device_trust_journal|device_key_envelope|device_key_delivery|device_key_receipt|device_key_lifecycle|device_control_transport|device_signed_event|device_signed_history|device_archive_migration|device_join|signed_join_checkpoint|signed-setup)$'
 ```
 
 The optional identity suite uses RFC 8032 vectors, real approval signatures,
@@ -684,15 +780,33 @@ certificate retry and signed-history preflight with synthetic clipboard
 data. The signed checkpoint suite exercises encrypted reopen, exact retry,
 immutable baseline retention and refusal of changed or stale data. Native
 builds with testing enabled include the Qt comparison dialog test. The opt-in
-native build also includes `native-signed-tab-storage`,
-`native-signed-replica-background` and marker handling in `native-loader`.
+native build also includes `native-signed-setup`, `native-signed-generation`,
+`native-signed-tab-storage`, `native-signed-tab-activation`,
+`native-signed-replica-background` and marker
+handling in `native-loader`. `signed-setup` covers encrypted provisioning,
+independent credentials, verified invitations, exact reopen, immutable offline
+credential unlock, missing-history non-reseeding and Linux durable interruption
+cuts. The Qt setup suite drives
+cancel, founder creation, fingerprint refusal, password reopen and source checks.
+`device_join` also covers founder authority and reviewed generation adoption,
+successor backup retention, exact retry and interruption recovery.
+The `native-signed-two-device` CTest uses the `cqs-signed-two-device-test` fixture executable;
+`tests/run-copyq-signed-two-device.py` exercises two disposable CopyQ processes,
+encrypted cache markers, signed two-way updates, restart, conflicts and incomplete
+or altered delivery. The fixture uses the production detached coordinator after
+tab unload; it does not qualify human setup or actual cloud delivery.
 These focused tests do not qualify the installed CopyQ GUI or sandboxed
 packages.
 Exact results belong to the implementing PR and current test run.
 
-Qualification still requires Windows/NTFS and Flatpak, physical power-loss
-behavior, human peer verification and production transport. Enable the optional
-build flag to include these suites in CI.
+Release gates remain successful hosted Linux and Windows/MSVC runs of the signed
+suites and real CopyQ two-device qualification, Windows/NTFS and Flatpak package
+qualification, physical power-loss behavior, human peer-verification trials and
+production cloud-client delivery. The offline recovery format, credential-bound
+package export/import and fresh-machine restore drill are not implemented.
+Dependency publisher provenance and distribution metadata remain required below.
+Enable the optional build flag to include the signed suites in CI; adding the
+jobs does not itself close their qualification gates.
 
 ## Dependency qualification
 

@@ -9,6 +9,7 @@ inline constexpr auto SignedReplicaSourceSetting = "signed_replica_source";
 struct SignedReplicaSource {
     QString transport;
     QString journal;
+    QString setupRoot = {};
 };
 
 std::string signedTabBinding(const QString &settingsFile, const QString &directory, const std::string &journalBinding);
@@ -21,4 +22,9 @@ bool signedTabHostReady(const QString &settingsFile, QString *enabledInventory =
 int signedTabReplicaLimit(const QString &settingsFile);
 bool signedTabDestinationFree(const QString &settingsFile);
 QString signedTabCachePath();
+void retainSignedPredecessorMarker(SignedTabConfiguration &successor, const SignedTabConfiguration &current,
+                                  std::uint64_t reviewedGeneration);
+bool persistSignedSuccessor(const QString &settingsFile, const SignedTabConfiguration &current,
+                           const SignedTabConfiguration &successor, const std::string &journalBinding,
+                           const SignedReplicaSource &source);
 } // namespace cqs::native

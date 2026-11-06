@@ -45,6 +45,15 @@ struct ReplicaEvidence {
     std::uint64_t generation;
     ReplicaPublicationState publication;
 };
+struct GenerationSeed {
+    Token scope;
+    std::uint64_t generation, sequence;
+    Token head;
+    bool completed;
+    bool retired = false;
+    bool retiredPredecessor = false;
+    Token retiredEvidence{};
+};
 struct Log {
     std::uint64_t initial = 0, watermark = 0;
     std::vector<Entry> entries;
@@ -57,6 +66,7 @@ struct Log {
     std::optional<Enrollment> enrollment;
     std::optional<Token> replicaTag;
     std::optional<ReplicaEvidence> replicaEvidence;
+    std::optional<GenerationSeed> generationSeed;
 };
 [[noreturn]] void fail(JournalCode code) { throw JournalError(code); }
 bool sameConfirmation(const Token &a, const Token &b) noexcept {
@@ -117,13 +127,24 @@ Bytes encode(const Log &log, const Token &pins) {
         log.deliveries.size() > MaxMembers || log.allocatedSequence > history::MaxSequence ||
         (!log.allocatedSequence && log.pendingEvent) ||
         (log.enrollment && (!log.eventLedger || log.migration)) ||
-        ((log.replicaTag || log.replicaEvidence) && (!log.enrollment || log.enrollment->acceptedIntent == Token{})) ||
+        ((log.replicaTag || log.replicaEvidence) && log.enrollment && log.enrollment->acceptedIntent == Token{}) ||
         (log.replicaTag && (!log.pendingEvent || *log.replicaTag == Token{})) ||
-        (log.replicaEvidence && (log.replicaEvidence->tag == Token{} || !log.allocatedSequence)))
+        (log.replicaEvidence && (log.replicaEvidence->tag == Token{} || !log.allocatedSequence)) ||
+        (log.generationSeed && (!log.eventLedger ||
+            (log.replicaTag && !log.generationSeed->completed && !log.generationSeed->retired) ||
+            (log.generationSeed->completed && log.generationSeed->retired) ||
+            ((log.generationSeed->retired || log.generationSeed->retiredPredecessor) !=
+             (log.generationSeed->retiredEvidence != Token{})) ||
+            log.generationSeed->scope == Token{} || log.generationSeed->head == Token{} ||
+            !log.generationSeed->sequence || log.generationSeed->sequence > history::MaxSequence ||
+            log.generationSeed->sequence > log.allocatedSequence + 1 ||
+            ((log.generationSeed->completed || log.generationSeed->retired) &&
+             log.generationSeed->sequence > log.allocatedSequence))))
         fail(JournalCode::Invalid);
     const bool lifecycle = !log.deliveries.empty() || !log.installed.empty();
-    const auto version = log.enrollment ? (log.replicaEvidence ? 9 : (log.replicaTag ? 8 : 7)) : (log.migration ? 6 :
-        (log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1))));
+    const auto version = log.generationSeed ? 11 : (!log.enrollment && (log.replicaTag || log.replicaEvidence) ? 10 :
+        (log.enrollment ? (log.replicaEvidence ? 9 : (log.replicaTag ? 8 : 7)) : (log.migration ? 6 :
+        (log.eventLedger ? 5 : (log.allocatedSequence ? 4 : (lifecycle ? 3 : 1))))));
     Bytes out; domain(out, JournalDomain); u32(out, version); append(out, pins);
     u64(out, log.initial); u64(out, log.watermark);
     u32(out, static_cast<std::uint32_t>(log.entries.size()));
@@ -158,21 +179,31 @@ Bytes encode(const Log &log, const Token &pins) {
         u32(out, static_cast<std::uint32_t>(ledger.witnesses.size()));
         for (const auto &[id, digest] : ledger.witnesses) { append(out, id); append(out, digest); }
     }
+    if (version >= 10) out.push_back(log.migration ? 1 : 0);
     if (log.migration) {
         append(out, log.migration->confirmation);
         u64(out, log.migration->sequence);
         out.push_back(log.migration->completed ? 1 : 0);
     }
+    if (version == 11) out.push_back(log.enrollment ? 1 : 0);
     if (log.enrollment) {
         append(out, log.enrollment->request);
         append(out, log.enrollment->acceptedIntent);
     }
-    if (version == 9) out.push_back(log.replicaTag ? 1 : 0);
+    if (version >= 9) out.push_back(log.replicaTag ? 1 : 0);
     if (log.replicaTag) append(out, *log.replicaTag);
+    if (version >= 10) out.push_back(log.replicaEvidence ? 1 : 0);
     if (log.replicaEvidence) {
         append(out, log.replicaEvidence->tag);
         u64(out, log.replicaEvidence->generation);
         out.push_back(static_cast<std::uint8_t>(log.replicaEvidence->publication));
+    }
+    if (log.generationSeed) {
+        append(out, log.generationSeed->scope); u64(out, log.generationSeed->generation);
+        u64(out, log.generationSeed->sequence); append(out, log.generationSeed->head);
+        out.push_back(log.generationSeed->retired ? 2 : (log.generationSeed->completed ? 1 : 0));
+        out.push_back(log.generationSeed->retiredPredecessor ? 1 : 0);
+        append(out, log.generationSeed->retiredEvidence);
     }
     return out;
 }
@@ -225,7 +256,7 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
     if (bytes.size() > TrustJournal::MaxJournalBytes) fail(JournalCode::Invalid);
     Reader reader(bytes); reader.expect(JournalDomain);
     const auto version = reader.number32();
-    if (version < 1 || version > 9) fail(JournalCode::Invalid);
+    if (version < 1 || version > 11) fail(JournalCode::Invalid);
     if (reader.token() != pins) fail(JournalCode::WrongPins);
     Log log; log.initial = reader.number64(); log.watermark = reader.number64();
     const auto count = reader.number32();
@@ -284,7 +315,9 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
         }
         log.eventLedger = std::move(ledger);
     }
-    if (version == 6) {
+    const auto migrated = version >= 10 ? reader.byte() : (version == 6 ? 1 : 0);
+    if (migrated > 1) fail(JournalCode::Invalid);
+    if (migrated) {
         const auto confirmation = reader.token();
         const auto sequence = reader.number64();
         const auto completed = reader.byte();
@@ -294,29 +327,48 @@ Log decode(const transaction::Record &record, const std::string &binding, const 
             fail(JournalCode::Invalid);
         log.migration = ArchiveMigration{confirmation, sequence, completed != 0};
     }
-    if (version >= 7) {
+    const auto enrolled = version == 11 ? reader.byte() : (version >= 7 && version <= 9 ? 1 : 0);
+    if (enrolled > 1) fail(JournalCode::Invalid);
+    if (enrolled) {
         const auto request = reader.token();
         const auto acceptedIntent = reader.token();
         if (request == Token{}) fail(JournalCode::Invalid);
         log.enrollment = Enrollment{request, acceptedIntent};
     }
-    const auto tagged = version == 9 ? reader.byte() : (version == 8 ? 1 : 0);
+    const auto tagged = version >= 9 ? reader.byte() : (version == 8 ? 1 : 0);
     if (tagged > 1) fail(JournalCode::Invalid);
     if (tagged) {
         const auto tag = reader.token();
-        if (tag == Token{} || !log.pendingEvent || log.enrollment->acceptedIntent == Token{})
+        if (tag == Token{} || !log.pendingEvent || (log.enrollment && log.enrollment->acceptedIntent == Token{}))
             fail(JournalCode::Invalid);
         log.replicaTag = tag;
     }
-    if (version == 9) {
+    const auto evidenced = version >= 10 ? reader.byte() : (version == 9 ? 1 : 0);
+    if (evidenced > 1) fail(JournalCode::Invalid);
+    if (evidenced) {
         const auto tag = reader.token();
         const auto generation = reader.number64();
         const auto publication = static_cast<ReplicaPublicationState>(reader.byte());
-        if (tag == Token{} || !log.allocatedSequence || log.enrollment->acceptedIntent == Token{} ||
+        if (tag == Token{} || !log.allocatedSequence || (log.enrollment && log.enrollment->acceptedIntent == Token{}) ||
             publication < ReplicaPublicationState::Unattempted || publication > ReplicaPublicationState::ConfirmedPublished ||
             (log.replicaTag && (tag != *log.replicaTag || publication == ReplicaPublicationState::ConfirmedPublished)))
             fail(JournalCode::Invalid);
         log.replicaEvidence = ReplicaEvidence{tag, generation, publication};
+    }
+    if (version == 10 && !log.replicaTag && !log.replicaEvidence) fail(JournalCode::Invalid);
+    if (version == 11) {
+        GenerationSeed seed{reader.token(), reader.number64(), reader.number64(), reader.token(), false};
+        const auto phase = reader.byte();
+        const auto retiredPredecessor = reader.byte();
+        if (phase > 2 || retiredPredecessor > 1 || seed.scope == Token{} || seed.head == Token{} || !seed.sequence ||
+            seed.sequence > history::MaxSequence || seed.sequence > log.allocatedSequence + 1 ||
+            (phase && seed.sequence > log.allocatedSequence) || (log.replicaTag && !phase)) fail(JournalCode::Invalid);
+        seed.completed = phase == 1;
+        seed.retired = phase == 2;
+        seed.retiredPredecessor = retiredPredecessor != 0;
+        seed.retiredEvidence = reader.token();
+        if ((seed.retired || seed.retiredPredecessor) != (seed.retiredEvidence != Token{})) fail(JournalCode::Invalid);
+        log.generationSeed = seed;
     }
     if (!reader.done()) fail(JournalCode::Invalid);
     return log;
@@ -426,6 +478,8 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
     if (log.enrollment &&
         (local.id == g.founder.id || acceptedJoin != (log.enrollment->acceptedIntent != Token{})))
         fail(JournalCode::Invalid);
+    if ((log.replicaTag || log.replicaEvidence) && local != g.founder &&
+        (!log.enrollment || log.enrollment->acceptedIntent == Token{})) fail(JournalCode::Invalid);
     if (claimed && (!proof || membership.forked() ||
         proof->context.generation != membership.current().keyGeneration ||
         proof->context.commitment != membership.current().keyCommitment ||
@@ -461,6 +515,22 @@ Membership replay(const Log &log, const Genesis &g, const Member &local,
             fail(JournalCode::Invalid);
         if (pendingGeneration) *pendingGeneration = context.generation;
     }
+    if (log.generationSeed) {
+        const auto &seed = *log.generationSeed;
+        const auto *head = membership.acceptedState(seed.head);
+        if (!head || head->keyGeneration != seed.generation || seed.generation > membership.current().keyGeneration ||
+            member(*head, local.id) != local ||
+            (seed.retired && seed.generation >= membership.current().keyGeneration) ||
+            ((seed.completed || seed.retired) && log.pendingEvent && seed.sequence == log.allocatedSequence) ||
+            (!seed.completed && !seed.retired && seed.sequence <= log.allocatedSequence &&
+             (seed.sequence != log.allocatedSequence || !log.pendingEvent))) fail(JournalCode::Invalid);
+        if (!seed.completed && !seed.retired && log.pendingEvent && !log.pendingEvent->empty()) {
+            const auto wire = std::string_view(reinterpret_cast<const char *>(log.pendingEvent->data()), log.pendingEvent->size());
+            const auto header = SignedEventCodec::inspect(wire);
+            if (header.context.generation != seed.generation || header.context.head != seed.head ||
+                !header.parents.empty()) fail(JournalCode::Invalid);
+        }
+    }
     return membership;
 }
 void checkPriorKeys(const Log &log, const Genesis &genesis, const State &state, const SyncKey &key) {
@@ -489,6 +559,23 @@ void checkEventKey(const Log &log, const Genesis &genesis, const State &state, c
     if (key.commitment(state.group, state.keyGeneration) != state.keyCommitment)
         throw EnvelopeError(EnvelopeCode::KeyMismatch);
     checkPriorKeys(log, genesis, state, key);
+}
+
+std::unique_ptr<SyncKey> activationKey(const Log &log, const std::optional<EnvelopeAuthority> &installed,
+    const Genesis &genesis, const Member &local, const Identity &identity, const SyncKey *founderKey) {
+    if (installed) return KeyEnvelopeCodec::open(log.installed, installed->context, installed->sender, identity);
+    if (local != genesis.founder || !founderKey) fail(JournalCode::MissingKey);
+    struct PrivateKey {
+        Bytes bytes;
+        ~PrivateKey() { crypto::wipe(bytes); }
+    } secret{founderKey->exportPrivate()};
+    return SyncKey::import(secret.bytes);
+}
+
+bool activatedIdentity(const Log &log, const Genesis &genesis, const Member &local,
+                       const std::optional<EnvelopeAuthority> &installed, const SyncKey *founderKey) {
+    return (log.enrollment && log.enrollment->acceptedIntent != Token{}) ||
+           (local == genesis.founder && (installed || founderKey));
 }
 std::map<Token, std::size_t> eventAuthors(const State &state) {
     std::map<Token, std::size_t> authors;
@@ -562,8 +649,9 @@ void TrustJournal::initialize(state::FileStore &store, const Genesis &g, const M
     auto lease = store.lock(); if (!lease) fail(JournalCode::Busy);
     store.initialize(initialRecord(g, local, now));
 }
-TrustJournal::TrustJournal(transaction::Store &store, Genesis genesis, Member local)
-    : store_(store), genesis_(std::move(genesis)), local_(std::move(local)), binding_(binding(genesis_, local_)) {
+TrustJournal::TrustJournal(transaction::Store &store, Genesis genesis, Member local, const SyncKey *founderKey)
+    : store_(store), genesis_(std::move(genesis)), local_(std::move(local)), founderKey_(founderKey), binding_(binding(genesis_, local_)) {
+    if (founderKey_ && local_ != genesis_.founder) fail(JournalCode::WrongPins);
     (void)inspect();
 }
 std::unique_ptr<transaction::Store::Lease> TrustJournal::lock() {
@@ -826,9 +914,8 @@ std::unique_ptr<SyncKey> TrustJournal::loadInstalledKey(const Identity &recipien
     if (membership.forked()) throw Error(ErrorCode::Forked);
     clock(log, now);
     if (member(membership.current(), local_.id) != local_) fail(JournalCode::WrongPins);
-    if (!proof) fail(JournalCode::MissingKey);
-    auto key = KeyEnvelopeCodec::open(log.installed, proof->context, proof->sender, recipient);
-    checkPriorKeys(log, genesis_, membership.current(), *key);
+    auto key = activationKey(log, proof, genesis_, local_, recipient, founderKey_);
+    checkEventKey(log, genesis_, membership.current(), *key);
     return key;
 }
 bool TrustJournal::recordReceipt(const Bytes &receipt, std::uint64_t now) {
@@ -902,7 +989,7 @@ PreparedClipboardEvent TrustJournal::prepareClipboardEvent(const Identity &autho
 
 PreparedClipboardEvent TrustJournal::prepareClipboardEventLocked(const Identity &author, const SyncKey &key,
     const std::vector<SignedEventParent> &parents, const std::vector<std::string> &packedItems,
-    std::uint64_t now, events::Limits limits, const Token *migration, const Token *replicaTag) {
+    std::uint64_t now, events::Limits limits, const Token *migration, const Token *replicaTag, const Token *generationScope) {
     SignedEventCodec::validateLimits(limits);
     limits.eventBytes = std::min(limits.eventBytes, MaxClipboardEventBytes);
     const auto record = load();
@@ -916,6 +1003,11 @@ PreparedClipboardEvent TrustJournal::prepareClipboardEventLocked(const Identity 
     if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
     (void)eventAuthors(state);
     checkEventKey(log, genesis_, state, key);
+    if (log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired &&
+        (!generationScope || !sameConfirmation(*generationScope, log.generationSeed->scope))) fail(JournalCode::EventPending);
+    if (generationScope && (!log.generationSeed || log.generationSeed->completed || log.generationSeed->retired ||
+        log.generationSeed->generation != state.keyGeneration || log.generationSeed->sequence != log.allocatedSequence + 1 ||
+        !parents.empty() || replicaTag || migration)) fail(JournalCode::EventReservation);
     if (log.migration && !log.migration->completed &&
         (!migration || !sameConfirmation(*migration, log.migration->confirmation))) fail(JournalCode::Migration);
     if (log.pendingEvent && (!migration || !log.migration || !log.pendingEvent->empty()))
@@ -958,7 +1050,8 @@ PreparedClipboardEvent TrustJournal::resumeClipboardEvent(std::uint64_t sequence
     clock(log, now);
     const auto &state = membership.current();
     if (member(state, local_.id) != local_) fail(JournalCode::WrongPins);
-    if (!log.pendingEvent || log.pendingEvent->empty() || sequence != log.allocatedSequence || log.replicaTag)
+    if (!log.pendingEvent || log.pendingEvent->empty() || sequence != log.allocatedSequence || log.replicaTag ||
+        (log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired))
         fail(JournalCode::EventReservation);
     if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (pendingGeneration != state.keyGeneration) throw Error(ErrorCode::Stale);
@@ -980,7 +1073,8 @@ void TrustJournal::discardClipboardEvent(std::uint64_t sequence, std::uint64_t n
     auto log = decode(record, binding_, pins);
     (void)replay(log, genesis_, local_);
     clock(log, now);
-    if (!log.pendingEvent || sequence != log.allocatedSequence || log.replicaTag) fail(JournalCode::EventReservation);
+    if (!log.pendingEvent || sequence != log.allocatedSequence || log.replicaTag ||
+        (log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired)) fail(JournalCode::EventReservation);
     if (log.migration && !log.migration->completed) fail(JournalCode::Migration);
     if (log.eventLedger && log.eventLedger->publicationAttempted) fail(JournalCode::EventPublication);
     log.pendingEvent.reset();
@@ -1245,18 +1339,18 @@ void verifyReplicaIntent(const events::Event &event, const SignedReplicaState &r
 
 std::unique_ptr<SyncKey> replicaAuthority(const Identity &identity, const JoinActivation &activation,
     const SignedReplicaState &replica, const Log &log, const Membership &membership,
-    const std::optional<EnvelopeAuthority> &installed, const Genesis &genesis, const Member &local, std::uint64_t now) {
+    const std::optional<EnvelopeAuthority> &installed, const Genesis &genesis, const Member &local, std::uint64_t now,
+    const SyncKey *founderKey) {
     if (membership.forked()) throw Error(ErrorCode::Forked);
     if (identity.member() != local || activation.member != local.id) fail(JournalCode::WrongPins);
-    if (!log.enrollment || log.enrollment->acceptedIntent == Token{} || !log.eventLedger)
+    if (!activatedIdentity(log, genesis, local, installed, founderKey) || !log.eventLedger)
         fail(JournalCode::Enrollment);
     const auto &state = membership.current();
     const auto *admitted = membership.acceptedState(activation.head);
     if (!admitted || activation.group != state.group || activation.root != state.root ||
         activation.generation != state.keyGeneration || activation.generation != admitted->keyGeneration ||
         member(*admitted, local.id) != local) fail(JournalCode::HistoryChanged);
-    if (!installed) fail(JournalCode::MissingKey);
-    auto key = KeyEnvelopeCodec::open(log.installed, installed->context, installed->sender, identity);
+    auto key = activationKey(log, installed, genesis, local, identity, founderKey);
     (void)clipboardAuthority(log, membership, genesis, local, *key, now);
     if (!witnessed(log.eventLedger->witnesses, activation.tipId, activation.tipDigest) ||
         !witnessed(log.eventLedger->witnesses, replica.cursor.id, replica.cursor.digest))
@@ -1337,6 +1431,243 @@ void TrustJournal::applyJoinActivation(const Identity &applicant, const storage:
     (void)verifyJoinActivation(applicant, transport, expected.profileBinding, now, &expected, write);
 }
 
+SignedGenerationTarget TrustJournal::preflightGenerationActivation(const Identity &identity, const storage::Directory &transport,
+    const JoinActivation &previous, std::string successorBinding, std::uint64_t now,
+    const transaction::Snapshot *seedSnapshot, bool explicitlyReviewPending) {
+    return verifyGenerationActivation(identity, transport, previous, std::move(successorBinding), now,
+        nullptr, {}, seedSnapshot, {}, {}, {}, explicitlyReviewPending);
+}
+
+void TrustJournal::applyGenerationActivation(const Identity &identity, const storage::Directory &transport,
+    const JoinActivation &previous, const SignedGenerationTarget &successor, const Token &confirmation,
+    const transaction::Snapshot &seedSnapshot, std::uint64_t now, const JoinActivationWriter &write,
+    const std::filesystem::path &privateStaging, const SignedReplicaTargetValidator &validateTarget) {
+    if (!write || confirmation == Token{}) fail(JournalCode::Enrollment);
+    (void)verifyGenerationActivation(identity, transport, previous, successor.activation.profileBinding, now,
+        &successor, confirmation, &seedSnapshot, write, privateStaging, validateTarget, successor.pendingSnapshotDiffers);
+}
+
+SignedGenerationTarget TrustJournal::verifyGenerationActivation(const Identity &identity, const storage::Directory &transport,
+    const JoinActivation &previous, std::string binding, std::uint64_t now, const SignedGenerationTarget *expected,
+    const Token &confirmation, const transaction::Snapshot *seedSnapshot, const JoinActivationWriter &write,
+    const std::filesystem::path &privateStaging, const SignedReplicaTargetValidator &validateTarget, bool explicitlyReviewPending) {
+    state::validateBinding(binding);
+    state::validateBinding(previous.profileBinding);
+    const auto lease = lock();
+    auto record = load();
+    const auto pins = pin(genesis_, local_);
+    auto log = decode(record, binding_, pins);
+    std::optional<EnvelopeAuthority> installed;
+    const auto membership = replay(log, genesis_, local_, &installed);
+    if (membership.forked()) throw Error(ErrorCode::Forked);
+    if (identity.member() != local_ || previous.member != local_.id) fail(JournalCode::WrongPins);
+    if (!activatedIdentity(log, genesis_, local_, installed, founderKey_)) fail(JournalCode::Enrollment);
+    const auto key = activationKey(log, installed, genesis_, local_, identity, founderKey_);
+    const auto &current = clipboardAuthority(log, membership, genesis_, local_, *key, now);
+    const auto *old = membership.acceptedState(previous.head);
+    if (!old || binding == previous.profileBinding || previous.group != current.group || previous.root != current.root ||
+        previous.generation != old->keyGeneration || previous.generation >= current.keyGeneration ||
+        member(*old, local_.id) != local_ || !storage::validSignedEventId(previous.tipId) || previous.tipDigest == Token{})
+        fail(JournalCode::HistoryChanged);
+    const auto seedScope = [&](std::uint64_t generation) {
+        Bytes bytes;
+        domain(bytes, "CopyQ-Secure-Sync-generation-seed-scope-v1");
+        u64(bytes, previous.profileBinding.size()); append(bytes, previous.profileBinding);
+        append(bytes, previous.group); append(bytes, previous.root); append(bytes, previous.head);
+        append(bytes, previous.member); u64(bytes, previous.generation);
+        append(bytes, previous.tipId); append(bytes, previous.tipDigest);
+        u64(bytes, binding.size()); append(bytes, binding); u64(bytes, generation);
+        return replicaToken(crypto::sha256(bytes));
+    };
+    const auto scope = seedScope(current.keyGeneration);
+    const bool stale = log.generationSeed && !log.generationSeed->completed &&
+        log.generationSeed->generation < current.keyGeneration &&
+        sameConfirmation(log.generationSeed->scope, seedScope(log.generationSeed->generation));
+    const bool scoped = log.generationSeed && log.generationSeed->generation == current.keyGeneration &&
+        sameConfirmation(log.generationSeed->scope, scope);
+    bool owned = scoped && !log.generationSeed->completed && !log.generationSeed->retired &&
+        log.generationSeed->generation == current.keyGeneration && sameConfirmation(log.generationSeed->scope, scope);
+    if ((log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired && !owned && !stale) ||
+        (log.pendingEvent && !owned && !stale))
+        fail(JournalCode::EventPending);
+    auto &ledger = eventLedger(log, current.keyGeneration);
+    const auto device = SignedEventCodec::deviceName(local_.id);
+    const auto folder = transport.openSignedEvents(eventScope(current));
+    const auto packets = folder->scan();
+    bool ready = owned && log.pendingEvent && !log.pendingEvent->empty();
+    const auto id = ready ? history::makeId(device, log.generationSeed->sequence) : std::string{};
+    const auto wire = ready ? eventBytes(*log.pendingEvent) : std::string_view{};
+    const auto visible = ready && std::any_of(packets.begin(), packets.end(), [&](const auto &packet) { return packet.id == id; });
+    if (ready && visible && !ledger.publicationAttempted) fail(JournalCode::HistoryChanged);
+    auto input = transportEnvelopes(packets, ledger, device, id, wire, ledger.publicationAttempted);
+    if (ready && !visible) input.push_back({id, wire});
+    auto history = authenticateHistory(membership, *key, input, {}, true);
+    const WipeEvents wipeHistory{history.events};
+    auto observed = history.wireDigests;
+    if (ready && !visible) observed.erase(id);
+    if (ready && visible && ledger.publicationAttempted &&
+        history.graph.tips() != std::vector<std::string>{id}) {
+        // A verified descendant can arrive after an ambiguous successful
+        // publication. Complete only the exact visible reservation locally;
+        // the fresh review must adopt the currently authenticated sole tip.
+        // An older reviewed Seed is still rejected below before persistence.
+        log.pendingEvent.reset();
+        log.generationSeed->completed = true;
+        ledger.publicationAttempted = false;
+        ready = owned = false;
+    }
+    SignedGenerationTarget target{{binding, current.group, current.root, current.digest, local_.id, {}, current.keyGeneration, {}}, false, false};
+    target.retiresStaleSeed = stale || (scoped && log.generationSeed->retiredPredecessor);
+    if (stale || scoped) target.retirementDigest = log.generationSeed->retiredEvidence;
+    if (stale && !log.generationSeed->retired) {
+        Bytes evidence;
+        domain(evidence, "CopyQ-Secure-Sync-retired-generation-seed-v1");
+        append(evidence, log.generationSeed->retiredEvidence); append(evidence, log.generationSeed->scope);
+        append(evidence, log.generationSeed->head); u64(evidence, log.generationSeed->generation);
+        u64(evidence, log.generationSeed->sequence);
+        evidence.push_back(log.pendingEvent ? 1 : 0);
+        const auto digest = log.pendingEvent && !log.pendingEvent->empty()
+            ? SignedEventCodec::digest(eventBytes(*log.pendingEvent)) : Token{};
+        append(evidence, digest);
+        // Rotation makes any old attempted-publication outcome conservative.
+        evidence.push_back(1);
+        target.retirementDigest = replicaToken(crypto::sha256(evidence));
+    }
+    if (ready) {
+        if (history.graph.tips() != std::vector<std::string>{id}) fail(JournalCode::HistoryChanged);
+        target.seed = target.resuming = true;
+        target.activation.head = log.generationSeed->head;
+        target.activation.tipId = id;
+        target.activation.tipDigest = SignedEventCodec::digest(wire);
+    } else if (history.graph.size()) {
+        if (history.graph.tips().size() != 1) fail(JournalCode::HistoryChanged);
+        target.activation.tipId = history.graph.tips().front();
+        target.activation.tipDigest = history.wireDigests.at(target.activation.tipId);
+    } else {
+        const auto allocated = stale ? std::max(log.allocatedSequence, log.generationSeed->sequence) : log.allocatedSequence;
+        if (allocated == history::MaxSequence) throw Error(ErrorCode::Overflow);
+        target.seed = true;
+        target.activation.tipId = history::makeId(device, allocated + 1);
+    }
+    const bool exactCompletedSeed = expected && expected->seed &&
+        log.generationSeed && log.generationSeed->completed && log.generationSeed->generation == current.keyGeneration &&
+        sameConfirmation(log.generationSeed->scope, scope) && expected->activation.tipId ==
+            history::makeId(device, log.generationSeed->sequence);
+    if (exactCompletedSeed) {
+        if (history.graph.tips() != std::vector<std::string>{expected->activation.tipId}) fail(JournalCode::HistoryChanged);
+        const auto &seed = replicaEvent(history, expected->activation.tipId);
+        if (!seed.revision.parents.empty()) fail(JournalCode::HistoryChanged);
+        target.seed = true;
+        target.resuming = false;
+        target.activation.head = log.generationSeed->head;
+        target.activation.tipId = seed.revision.id;
+        target.activation.tipDigest = history.wireDigests.at(seed.revision.id);
+    }
+    if (seedSnapshot && target.seed && (ready || exactCompletedSeed)) {
+        auto decoded = packed::decode(replicaEvent(history, target.activation.tipId).items);
+        const WipeSnapshot wipe{decoded};
+        target.seedDigest = replicaLocalDigest(decoded);
+        target.seedItems = decoded.size();
+        target.pendingSnapshotDiffers = decoded != *seedSnapshot;
+        if (target.pendingSnapshotDiffers && !explicitlyReviewPending) fail(JournalCode::HistoryChanged);
+    } else if (seedSnapshot && target.seed) {
+        target.seedDigest = replicaLocalDigest(*seedSnapshot);
+        target.seedItems = seedSnapshot->size();
+    }
+    if (expected) {
+        const auto &a = expected->activation;
+        const auto &b = target.activation;
+        const bool originalSeedRetry = expected->seed && target.seed && seedSnapshot &&
+            (a.tipDigest == Token{} || exactCompletedSeed);
+        if (a.profileBinding != b.profileBinding || a.group != b.group || a.root != b.root || a.head != b.head ||
+            a.member != b.member || a.generation != b.generation || a.tipId != b.tipId ||
+            expected->retiresStaleSeed != target.retiresStaleSeed || expected->retirementDigest != target.retirementDigest ||
+            expected->seedDigest != target.seedDigest || expected->seedItems != target.seedItems ||
+            expected->pendingSnapshotDiffers != target.pendingSnapshotDiffers ||
+            (a.tipDigest != Token{} && a.tipDigest != b.tipDigest) ||
+            (!originalSeedRetry && (a.tipDigest != b.tipDigest || expected->seed != target.seed || expected->resuming != target.resuming)))
+            fail(JournalCode::HistoryChanged);
+    }
+    const auto saveLog = [&] {
+        log.watermark = now;
+        auto replacement = record;
+        storeLog(replacement, log, pins);
+        save(record, replacement);
+        record = std::move(replacement);
+    };
+    ledger.witnesses = std::move(observed);
+    saveLog();
+    if (!write) return target;
+    const auto retireStale = [&] {
+        if (!stale || log.generationSeed->retired) return;
+        if (ledger.generation != current.keyGeneration || ledger.publicationAttempted) fail(JournalCode::EventReservation);
+        // A pre-seal marker owns a sequence too. Burn it before any new slot
+        // can be allocated; old ciphertext is never re-signed or republished.
+        log.allocatedSequence = std::max(log.allocatedSequence, log.generationSeed->sequence);
+        log.pendingEvent.reset();
+        log.generationSeed->retired = true;
+        log.generationSeed->retiredEvidence = target.retirementDigest;
+        saveLog();
+    };
+    if (!target.seed) {
+        if (owned) {
+            // A burned empty slot has never acquired publishable bytes.
+            if (ready || ledger.publicationAttempted) fail(JournalCode::EventReservation);
+            log.pendingEvent.reset(); log.generationSeed.reset(); saveLog();
+        }
+        const auto &tip = replicaEvent(history, target.activation.tipId);
+        auto snapshot = packed::decode(tip.items);
+        const WipeSnapshot wipe{snapshot};
+        if (validateTarget) validateTarget(*seedSnapshot, snapshot);
+        retireStale();
+        write(target.activation, tip, snapshot);
+        return target;
+    }
+    if (!seedSnapshot || confirmation == Token{}) fail(JournalCode::Confirmation);
+    if (ready || exactCompletedSeed) {
+        auto snapshot = packed::decode(replicaEvent(history, target.activation.tipId).items);
+        const WipeSnapshot wipe{snapshot};
+        if (validateTarget) validateTarget(*seedSnapshot, snapshot);
+    } else if (validateTarget) validateTarget(*seedSnapshot, *seedSnapshot);
+    if (!ready && !exactCompletedSeed) {
+        transaction::Limits snapshotLimits;
+        snapshotLimits.snapshotBytes = MaxClipboardEventBytes;
+        auto packedItems = packed::encode(*seedSnapshot, snapshotLimits);
+        const WipeItems wipe{packedItems};
+        events::Limits limits; limits.eventBytes = MaxClipboardEventBytes;
+        SignedEventCodec::validateSeedPayload(packedItems, limits);
+        transport.checkPublicationStaging(privateStaging);
+        retireStale();
+        if (owned) {
+            log.pendingEvent.reset(); log.generationSeed.reset(); saveLog();
+        }
+        const auto sequence = log.allocatedSequence + 1;
+        log.generationSeed = GenerationSeed{scope, current.keyGeneration, sequence, current.digest,
+            false, false, target.retiresStaleSeed, target.retirementDigest};
+        saveLog();
+        const auto prepared = prepareClipboardEventLocked(identity, *key, {}, packedItems, now, {}, nullptr, nullptr, &scope);
+        if (prepared.sequence != sequence) fail(JournalCode::EventReservation);
+    }
+    if (!exactCompletedSeed) {
+        auto pendingRecord = load();
+        auto pendingLog = decode(pendingRecord, binding_, pins);
+        if (!pendingLog.generationSeed) fail(JournalCode::EventReservation);
+        (void)publishClipboardEventLocked(pendingLog.generationSeed->sequence, *key, transport, now,
+            ClipboardPublication::Seed, privateStaging, nullptr, nullptr, &scope);
+    }
+    const auto finishedRecord = load();
+    const auto finished = decode(finishedRecord, binding_, pins);
+    auto verified = verifiedTransportHistory(transport, membership, *key, local_, finished, *finished.eventLedger, {});
+    const WipeEvents wipeVerified{verified.events};
+    if (verified.graph.tips() != std::vector<std::string>{target.activation.tipId}) fail(JournalCode::HistoryChanged);
+    const auto &tip = replicaEvent(verified, target.activation.tipId);
+    target.activation.tipDigest = verified.wireDigests.at(tip.revision.id);
+    auto snapshot = packed::decode(tip.items);
+    const WipeSnapshot wipeSnapshot{snapshot};
+    write(target.activation, tip, snapshot);
+    return target;
+}
+
 JoinActivation TrustJournal::verifyJoinActivation(const Identity &applicant, const storage::Directory &transport,
     std::string profileBinding, std::uint64_t now, const JoinActivation *expected, const JoinActivationWriter &write) {
     state::validateBinding(profileBinding);
@@ -1347,10 +1678,10 @@ JoinActivation TrustJournal::verifyJoinActivation(const Identity &applicant, con
     if (membership.forked()) throw Error(ErrorCode::Forked);
     if (applicant.member() != local_) fail(JournalCode::WrongPins);
     clock(log, now);
-    if (!log.enrollment || log.enrollment->acceptedIntent == Token{} || log.pendingEvent)
+    if (!activatedIdentity(log, genesis_, local_, installed, founderKey_) || log.pendingEvent ||
+        (log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired))
         fail(JournalCode::Enrollment);
-    if (!installed) fail(JournalCode::MissingKey);
-    const auto key = KeyEnvelopeCodec::open(log.installed, installed->context, installed->sender, applicant);
+    const auto key = activationKey(log, installed, genesis_, local_, applicant, founderKey_);
     const auto &state = clipboardAuthority(log, membership, genesis_, local_, *key, now);
     auto &ledger = eventLedger(log, state.keyGeneration);
     auto verified = verifiedTransportHistory(transport, membership, *key, local_, log, ledger, {});
@@ -1398,7 +1729,7 @@ std::optional<SignedReplicaConflict> TrustJournal::reviewReplicaConflict(const I
     if (log.pendingEvent) fail(JournalCode::EventPending);
     std::optional<EnvelopeAuthority> installed;
     const auto membership = replay(log, genesis_, local_, &installed);
-    const auto key = replicaAuthority(identity, activation, replica, log, membership, installed, genesis_, local_, now);
+    const auto key = replicaAuthority(identity, activation, replica, log, membership, installed, genesis_, local_, now, founderKey_);
     auto &ledger = *log.eventLedger;
     auto verified = verifiedTransportHistory(transport, membership, *key, local_, log, ledger, {});
     const WipeEvents wipe{verified.events};
@@ -1444,9 +1775,10 @@ SignedReplicaResult TrustJournal::synchronizeReplicaImpl(const Identity &identit
     const auto pins = pin(genesis_, local_);
     auto log = decode(record, binding_, pins);
     if ((resolution || canProceed) && log.pendingEvent) fail(JournalCode::EventPending);
+    if (log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired) fail(JournalCode::EventPending);
     std::optional<EnvelopeAuthority> installed;
     const auto membership = replay(log, genesis_, local_, &installed);
-    const auto key = replicaAuthority(identity, activation, replica, log, membership, installed, genesis_, local_, now);
+    const auto key = replicaAuthority(identity, activation, replica, log, membership, installed, genesis_, local_, now, founderKey_);
     const auto persistReplica = [&](const transaction::Snapshot &snapshot) {
         checkProceed();
         write(replica, snapshot);
@@ -1671,7 +2003,9 @@ SignedReplicaRecovery TrustJournal::recoverRotatedReplica(const Identity &identi
     const auto membership = replay(log, genesis_, local_, nullptr, &pendingGeneration);
     if (membership.forked()) throw Error(ErrorCode::Forked);
     if (identity.member() != local_ || activation.member != local_.id) fail(JournalCode::WrongPins);
-    if (!log.enrollment || log.enrollment->acceptedIntent == Token{} || !log.eventLedger)
+    if ((!log.enrollment || log.enrollment->acceptedIntent == Token{}) && local_ != genesis_.founder)
+        fail(JournalCode::Enrollment);
+    if (!log.eventLedger)
         fail(JournalCode::Enrollment);
     clock(log, now);
     const auto &current = membership.current();
@@ -1720,7 +2054,8 @@ SignedReplicaRecovery TrustJournal::recoverRotatedReplica(const Identity &identi
 
 std::string TrustJournal::publishClipboardEventLocked(std::uint64_t sequence, const SyncKey &key,
     const storage::Directory &transport, std::uint64_t now, ClipboardPublication mode,
-    const std::filesystem::path &privateStaging, const Token *migration, const ReplicaPublication *replica) {
+    const std::filesystem::path &privateStaging, const Token *migration, const ReplicaPublication *replica,
+    const Token *generationScope) {
     const auto checkProceed = [&] {
         if (replica && replica->canProceed && !replica->canProceed()) fail(JournalCode::EventPublication);
     };
@@ -1731,6 +2066,11 @@ std::string TrustJournal::publishClipboardEventLocked(std::uint64_t sequence, co
     std::uint64_t pendingGeneration = 0;
     const auto membership = replay(log, genesis_, local_, nullptr, &pendingGeneration);
     const auto &state = clipboardAuthority(log, membership, genesis_, local_, key, now);
+    if (log.generationSeed && !log.generationSeed->completed && !log.generationSeed->retired &&
+        (!generationScope || !sameConfirmation(*generationScope, log.generationSeed->scope))) fail(JournalCode::EventPending);
+    if (generationScope && (!log.generationSeed || log.generationSeed->completed || log.generationSeed->retired ||
+        log.generationSeed->generation != state.keyGeneration || log.generationSeed->sequence != sequence ||
+        mode != ClipboardPublication::Seed || replica || migration)) fail(JournalCode::EventReservation);
     if (migration) {
         if (!log.migration || !sameConfirmation(log.migration->confirmation, *migration) ||
             log.migration->sequence != sequence || state.keyGeneration || mode != ClipboardPublication::Seed ||
@@ -1832,6 +2172,7 @@ std::string TrustJournal::publishClipboardEventLocked(std::uint64_t sequence, co
             log.replicaEvidence = ReplicaEvidence{replica->tag, state.keyGeneration, ReplicaPublicationState::ConfirmedPublished};
         log.pendingEvent.reset();
         log.replicaTag.reset();
+        if (generationScope) log.generationSeed->completed = true;
         if (migration) log.migration->completed = true;
         auto finished = attempted;
         storeLog(finished, log, pins);

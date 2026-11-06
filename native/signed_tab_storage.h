@@ -2,6 +2,7 @@
 #pragma once
 
 #include "device_trust_journal.h"
+#include "signed_tab_identity.h"
 #include "item/itemwidget.h"
 #include <QObject>
 #include <functional>
@@ -13,6 +14,9 @@ struct SignedTabConfiguration {
     QString checkpointDirectory;
     QString keyFile;
     trust::JoinActivation expected;
+    QString setupRoot = {};
+    QByteArray predecessorMarker = {};
+    std::uint64_t predecessorMaximumGeneration = 0;
 };
 
 // The host's tab file is a routing marker. The signed Join checkpoint remains
@@ -26,6 +30,7 @@ public:
     void setConfiguration(std::optional<SignedTabConfiguration> configuration);
     void setGuard(std::function<bool()> guard);
     void setSnapshotValidator(std::function<void(const transaction::Snapshot &)> validator);
+    void setKeyProvider(std::function<crypto::Bytes(const SignedTabConfiguration &)> provider);
     bool canSave(const QString &tab) const;
     static bool recognizes(QIODevice *file);
     ItemSaverPtr initialize(const QString &tab, QAbstractItemModel *model, int maximum);
@@ -44,6 +49,7 @@ private:
     std::optional<SignedTabConfiguration> configuration_;
     std::function<bool()> guard_;
     std::function<void(const transaction::Snapshot &)> validateSnapshot_;
+    std::function<crypto::Bytes(const SignedTabConfiguration &)> keyProvider_;
     std::weak_ptr<Saver> active_;
     bool restoring_ = false;
 };

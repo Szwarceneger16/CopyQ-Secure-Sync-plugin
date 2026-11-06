@@ -5,8 +5,12 @@
 #include "device_trust_journal.h"
 #include "packed_items.h"
 #include "signed_join_checkpoint.h"
+#include "signed_generation_transition.h"
 #include "storage.h"
 #include "test_check.h"
+#ifdef _WIN32
+#include "windows_test_acl.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -224,19 +228,41 @@ struct Fixture {
     }
 };
 
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
+void privateDirectory(const std::filesystem::path &path)
+{
+#ifdef _WIN32
+    cqs::testing::directory(path);
+#else
+    CHECK(std::filesystem::create_directory(path));
+    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+#endif
+}
+
 class Transport final {
 public:
     explicit Transport(const State &state)
     {
+#ifdef _WIN32
+        Token random{};
+        const auto bytes = cqs::crypto::random(random.size());
+        std::copy(bytes.begin(), bytes.end(), random.begin());
+        const auto temporary = std::filesystem::temp_directory_path() / ("cqs-device-join-" + hex(random));
+        privateDirectory(temporary);
+        staging_ = temporary / "staging";
+        privateDirectory(staging_);
+#else
         char path[] = "/tmp/cqs-device-join-XXXXXX";
         const char *directory = ::mkdtemp(path);
         CHECK(directory);
-        root = std::filesystem::path(directory) / "transport";
-        std::filesystem::create_directories(root / "events");
+        const auto temporary = std::filesystem::path(directory);
+#endif
+        root = temporary / "transport";
+        privateDirectory(root);
+        privateDirectory(root / "events");
         scope = {state.group, state.root, state.keyGeneration};
         signedFolder = root / storage::signedEventFolderName(scope);
-        std::filesystem::create_directory(signedFolder);
+        privateDirectory(signedFolder);
         directory_ = std::make_unique<storage::Directory>(root);
     }
 
@@ -248,12 +274,14 @@ public:
     }
 
     const storage::Directory &directory() const { return *directory_; }
+    const std::filesystem::path &staging() const { return staging_; }
 
     std::filesystem::path root, signedFolder;
     storage::SignedEventScope scope;
 
 private:
     std::unique_ptr<storage::Directory> directory_;
+    std::filesystem::path staging_;
 };
 
 // One CopyQ 17 QDataStream text/plain MIME item with value "abc".
@@ -264,7 +292,7 @@ std::string seed(Fixture &f, const Transport &transport, const std::vector<std::
 {
     const auto prepared = f.journal(0).prepareClipboardEvent(*f.identities[0], *f.key, {}, items, Now);
     return f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now,
-                                              ClipboardPublication::Seed);
+                                              ClipboardPublication::Seed, transport.staging());
 }
 
 Bytes install(Fixture &f, std::size_t recipient = 1)
@@ -278,8 +306,7 @@ Bytes install(Fixture &f, std::size_t recipient = 1)
 std::filesystem::path privateCheckpoint(const Transport &transport, const std::string &name = "signed-checkpoint")
 {
     const auto path = transport.root.parent_path() / name;
-    CHECK(std::filesystem::create_directory(path));
-    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+    privateDirectory(path);
     return path;
 }
 
@@ -335,7 +362,7 @@ struct JoinedReplica {
                 rejects<JournalError>(JournalCode::Busy, [&] { (void)fixture.journal(member).inspect(); });
                 if (beforeWrite) beforeWrite(state, snapshot);
                 mounted->updateReplica(state, snapshot, mounted->generation());
-            }, {}, {}, canProceed);
+            }, transport.staging(), {}, canProceed);
     }
 
     std::optional<SignedReplicaConflict> reviewConflict()
@@ -355,7 +382,7 @@ struct JoinedReplica {
             [&](const SignedReplicaState &state, const tx::Snapshot &snapshot) {
                 if (beforeWrite) beforeWrite(state, snapshot);
                 mounted->updateReplica(state, snapshot, mounted->generation());
-            }, {}, [&](const tx::Snapshot &before, const tx::Snapshot &after) {
+            }, transport.staging(), [&](const tx::Snapshot &before, const tx::Snapshot &after) {
                 if (validate) validate(before, after);
                 if (!mounted->replica().pending) mounted->checkConflictBackupCapacity(after);
             });
@@ -400,6 +427,20 @@ struct ReplicaPair {
     }
 };
 
+void enrollFourthReplica(ReplicaPair &pair)
+{
+    auto &fixture = pair.fixture;
+    for (const auto &wire : fixture.journal(0).inspect().certificates)
+        CHECK(fixture.journal(3).observe(decodeCertificate(wire), Now) == ObserveResult::Applied);
+    const auto proposal = fixture.proposal(fixture.request(3));
+    const auto admission = fixture.certificate(proposal, {0, 1});
+    const auto review = fixture.journal(3).reviewJoin(proposal, {fixture.member(0).id, fixture.member(1).id}, Now);
+    CHECK(fixture.journal(3).acceptJoin(admission, Fixture::confirmations(review), Now) == ObserveResult::Applied);
+    for (const auto member : {0u, 1u, 2u})
+        CHECK(fixture.journal(member).observe(admission, Now) == ObserveResult::Applied);
+    CHECK(!install(fixture, 3).empty());
+}
+
 void rotateReplicaKey(ReplicaPair &pair, std::size_t removed)
 {
     auto &fixture = pair.fixture;
@@ -413,6 +454,91 @@ void rotateReplicaKey(ReplicaPair &pair, std::size_t removed)
     }
     CHECK(fixture.journal(1).observe(removal, Now) == ObserveResult::Applied);
     CHECK(fixture.journal(1).inspect().state.keyGeneration == 1);
+}
+
+struct RotatedGeneration {
+    std::unique_ptr<SyncKey> key = SyncKey::generate();
+    storage::SignedEventScope scope;
+
+    explicit RotatedGeneration(ReplicaPair &pair, std::size_t removed = 2)
+    {
+        auto &fixture = pair.fixture;
+        const auto proposal = fixture.journal(0).propose(Operation::Remove, fixture.member(removed), token(81), token(82),
+            Now, Expires, key->commitment(fixture.genesis.group, 1));
+        Certificate removal{proposal, {}};
+        for (const auto signer : {0u, removed == 1 ? 2u : 1u}) {
+            removal.approvals.push_back(fixture.journal(signer).approve(proposal, *fixture.identities[signer],
+                verificationDigest(proposal, fixture.member(signer)), Now));
+        }
+        for (const auto member : {0u, 1u, 2u})
+            CHECK(fixture.journal(member).observe(removal, Now) == ObserveResult::Applied);
+        const auto state = fixture.journal(0).inspect().state;
+        scope = {state.group, state.root, state.keyGeneration};
+        CHECK(scope.generation == 1);
+        privateDirectory(pair.transport.root / storage::signedEventFolderName(scope));
+        if (removed != 1) {
+            const auto wire = fixture.journal(0).prepareDelivery(fixture.member(1).id, *fixture.identities[0], *key, Now);
+            CHECK(!fixture.journal(1).installDelivery(wire, *fixture.identities[1], Now).empty());
+        }
+    }
+
+    std::string seedCurrent(ReplicaPair &pair, const tx::Snapshot &snapshot)
+    {
+        const auto prepared = pair.fixture.journal(0).prepareClipboardEvent(*pair.fixture.identities[0], *key,
+            {}, cqs::packed::encode(snapshot), Now);
+        return pair.fixture.journal(0).publishClipboardEvent(prepared.sequence, *key, pair.transport.directory(), Now,
+            ClipboardPublication::Seed, pair.transport.staging());
+    }
+};
+
+struct SecondRotatedGeneration {
+    std::unique_ptr<SyncKey> key = SyncKey::generate();
+    storage::SignedEventScope scope;
+
+    explicit SecondRotatedGeneration(ReplicaPair &pair, std::size_t removed = 3)
+    {
+        auto &fixture = pair.fixture;
+        const auto proposal = fixture.journal(0).propose(Operation::Remove, fixture.member(removed), token(85), token(86),
+            Now, Expires, key->commitment(fixture.genesis.group, 2));
+        Certificate removal{proposal, {}};
+        for (const auto signer : {0u, removed == 1 ? 3u : 1u})
+            removal.approvals.push_back(fixture.journal(signer).approve(proposal, *fixture.identities[signer],
+                verificationDigest(proposal, fixture.member(signer)), Now));
+        for (const auto member : {0u, 1u, 3u})
+            CHECK(fixture.journal(member).observe(removal, Now) == ObserveResult::Applied);
+        const auto state = fixture.journal(0).inspect().state;
+        scope = {state.group, state.root, state.keyGeneration};
+        CHECK(scope.generation == 2);
+        CHECK(std::filesystem::create_directory(pair.transport.root / storage::signedEventFolderName(scope)));
+        if (removed != 1) {
+            const auto wire = fixture.journal(0).prepareDelivery(fixture.member(1).id, *fixture.identities[0], *key, Now);
+            CHECK(!fixture.journal(1).installDelivery(wire, *fixture.identities[1], Now).empty());
+        }
+    }
+};
+
+storage::SignedEventScope stageGenerationSeedBeforeSecondRotation(ReplicaPair &pair,
+    SignedJoinCheckpoint &candidate, const std::string &binding, unsigned interruptedCommit)
+{
+    enrollFourthReplica(pair);
+    RotatedGeneration rotated(pair);
+    const auto firstRemoval = decodeCertificate(pair.fixture.journal(0).inspect().certificates.back());
+    CHECK(pair.fixture.journal(3).observe(firstRemoval, Now) == ObserveResult::Applied);
+    const auto &identity = *pair.fixture.identities[1];
+    const auto reviewed = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+        pair.first.checkpoint, pair.first.activation, binding, Now);
+    auto &store = pair.fixture.store(1);
+    store.deferredCommits = interruptedCommit;
+    store.failure = MemoryStore::Fault::After;
+    rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+        SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+            candidate, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+    });
+    pair.fixture.reopen(1);
+    const auto pending = pair.fixture.journal(1).inspect().pendingEvent;
+    CHECK(pending && pending->ready && pending->publicationAttempted == (interruptedCommit >= 4));
+    CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).empty());
+    return rotated.scope;
 }
 
 const storage::SignedEventPacket &packet(const std::vector<storage::SignedEventPacket> &packets,
@@ -477,7 +603,7 @@ void exerciseNativeConflictWizard()
             [&](const auto &before, const auto &after) { return before == local && after == remote; }};
     };
     cqs::native::runSignedJoinWizard(nullptr, pair.fixture.journal(1), *pair.fixture.identities[1],
-        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, {}, {}, {}, QStringLiteral("synthetic"), prepare);
+        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, pair.transport.staging(), {}, {}, QStringLiteral("synthetic"), prepare);
     CHECK(selected && confirmed && completed);
     const auto mounted = pair.first.mount();
     CHECK(mounted->snapshot() == remote && mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
@@ -544,7 +670,7 @@ void exerciseNativeWizard(WizardActivation choice)
                 if (choice == WizardActivation::AdvanceTip) {
                     const std::vector<SignedEventParent> parents{{expected.tipId, expected.tipDigest}};
                     const auto prepared = f.journal(0).prepareClipboardEvent(*f.identities[0], *f.key, parents, ValidItems, Now);
-                    CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now).empty());
+                    CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now, ClipboardPublication::Append, transport.staging()).empty());
                 }
                 auto *answer = choice == WizardActivation::Decline ? message->button(QMessageBox::No) : yes;
                 CHECK(answer);
@@ -574,7 +700,7 @@ void exerciseNativeWizard(WizardActivation choice)
         wizard->reject();
     });
     cqs::native::runSignedJoinWizard(nullptr, f.journal(1), *f.identities[1], transport.directory(),
-                                     checkpoint, Binding, nullptr, {}, {}, activate);
+                                     checkpoint, Binding, nullptr, transport.staging(), {}, activate);
     CHECK(checkpointConfirmed && completed && activationReviewed == (choice != WizardActivation::NoCallback));
     CHECK(activationCalls == (choice == WizardActivation::Accept ? 1u : 0u));
     const auto mounted = checkpoint.mount(expected);
@@ -626,7 +752,7 @@ void exerciseNativeReplicaWizard(JoinedReplica &replica, const tx::Snapshot &loc
     });
     cqs::native::runSignedJoinWizard(nullptr, replica.fixture.journal(replica.member),
         *replica.fixture.identities[replica.member], replica.transport.directory(), replica.checkpoint,
-        Binding, nullptr, {}, {}, {}, QString::fromStdString(replica.transport.root.string()),
+        Binding, nullptr, replica.transport.staging(), {}, {}, QString::fromStdString(replica.transport.root.string()),
         [&]() -> std::optional<cqs::native::SignedReplicaRequest> {
             CHECK(confirmed && !completed);
             ++prepared;
@@ -678,7 +804,7 @@ void exerciseNativeBackgroundConsent(ReplicaPair &pair, bool accept)
         });
     });
     cqs::native::runSignedJoinWizard(nullptr, pair.fixture.journal(1), *pair.fixture.identities[1],
-        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, {}, {}, {}, source, {}, [&] {
+        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, pair.transport.staging(), {}, {}, source, {}, [&] {
             CHECK(accept && prompted && armCalls == 0);
             ++armCalls;
             return true;
@@ -709,7 +835,7 @@ void exerciseNativeRotationRecovery(ReplicaPair &pair)
         });
     });
     cqs::native::runSignedJoinWizard(nullptr, pair.fixture.journal(1), *pair.fixture.identities[1],
-        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, {}, {}, {},
+        pair.transport.directory(), pair.first.checkpoint, Binding, nullptr, pair.transport.staging(), {}, {},
         QString::fromStdString(pair.transport.root.string()), [&]() -> std::optional<cqs::native::SignedReplicaRequest> {
             CHECK(!confirmed && !completed);
             return cqs::native::SignedReplicaRequest{pair.first.activation, 100, true,
@@ -876,24 +1002,23 @@ int main(int argc, char **argv)
         const auto retried = runJoinApplicantWizard(f.journal(1), certificate, empty, noPrompt, [] { return Expires; });
         CHECK(retried && *retried == ObserveResult::AlreadyKnown && noPrompt.str().empty());
     });
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     test("a reopened encrypted FileStore retains the verified enrollment and sealed key", [] {
         Fixture f;
         Transport transport(f.journal(0).inspect().state);
-        const auto privateDirectory = transport.root.parent_path() / "private";
-        CHECK(std::filesystem::create_directory(privateDirectory));
-        std::filesystem::permissions(privateDirectory, std::filesystem::perms::owner_all);
+        const auto privatePath = transport.root.parent_path() / "private";
+        privateDirectory(privatePath);
         const auto binding = TrustJournal::binding(f.genesis, f.member(1));
         const Bytes credential(32, 0x24);
         Token initialChallenge{};
         {
-            st::FileStore store(privateDirectory, binding, credential);
+            st::FileStore store(privatePath, binding, credential);
             TrustJournal::initialize(store, f.genesis, f.member(1), Now);
             TrustJournal applicant(store, f.genesis, f.member(1));
             initialChallenge = applicant.beginJoin(*f.identities[1], Now).request;
         }
         {
-            st::FileStore store(privateDirectory, binding, credential);
+            st::FileStore store(privatePath, binding, credential);
             TrustJournal applicant(store, f.genesis, f.member(1));
             const auto request = applicant.beginJoin(*f.identities[1], Now);
             CHECK(request.request == initialChallenge);
@@ -906,7 +1031,7 @@ int main(int argc, char **argv)
             CHECK(f.journal(0).recordReceipt(applicant.installDelivery(package, *f.identities[1], Now), Now));
         }
         const auto tip = seed(f, transport);
-        st::FileStore store(privateDirectory, binding, credential);
+        st::FileStore store(privatePath, binding, credential);
         TrustJournal applicant(store, f.genesis, f.member(1));
         CHECK(applicant.inspect().verifiedJoin && applicant.inspect().installedKey);
         const auto result = applicant.preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now);
@@ -979,7 +1104,7 @@ int main(int argc, char **argv)
         const std::vector<SignedEventParent> parents{{tip, SignedEventCodec::digest(files[0].wire)}};
         for (unsigned i = 0; i < 2; ++i) {
             const auto prepared = f.journal(0).prepareClipboardEvent(*f.identities[0], *f.key, parents, ValidItems, Now);
-            CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now).empty());
+            CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now, ClipboardPublication::Append, transport.staging()).empty());
         }
         refuses([&] { f.journal(1).preflightJoinActivation(*f.identities[1], transport.directory(), Binding, Now); });
         CHECK(f.journal(1).inspect().eventWitnesses == 0);
@@ -1035,7 +1160,7 @@ int main(int argc, char **argv)
             if (advanceTip) {
                 const std::vector<SignedEventParent> parents{{tip, expected.tipDigest}};
                 const auto prepared = f.journal(0).prepareClipboardEvent(*f.identities[0], *f.key, parents, ValidItems, Now);
-                CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now).empty());
+                CHECK(!f.journal(0).publishClipboardEvent(prepared.sequence, *f.key, transport.directory(), Now, ClipboardPublication::Append, transport.staging()).empty());
             } else {
                 const auto later = f.certificate(f.proposal(f.request(2)), {0, 1});
                 CHECK(f.journal(1).observe(later, Now) == ObserveResult::Applied);
@@ -1140,7 +1265,7 @@ int main(int argc, char **argv)
         auto &founder = pair.fixture.journal(0);
         const auto sibling = founder.prepareClipboardEvent(*pair.fixture.identities[0], *pair.fixture.key,
             {{pair.initialTip, pair.first.activation.tipDigest}}, ValidItems, Now);
-        CHECK(!founder.publishClipboardEvent(sibling.sequence, *pair.fixture.key, pair.transport.directory(), Now).empty());
+        CHECK(!founder.publishClipboardEvent(sibling.sequence, *pair.fixture.key, pair.transport.directory(), Now, ClipboardPublication::Append, pair.transport.staging()).empty());
         const auto firstGeneration = pair.first.mount()->generation();
         CHECK(pair.first.sync() == SignedReplicaResult::Conflict);
         const auto first = pair.first.mount();
@@ -1186,7 +1311,7 @@ int main(int argc, char **argv)
         auto &founder = pair.fixture.journal(0);
         const auto sibling = founder.prepareClipboardEvent(*pair.fixture.identities[0], *pair.fixture.key,
             {{pair.initialTip, pair.first.activation.tipDigest}}, ValidItems, Now);
-        CHECK(!founder.publishClipboardEvent(sibling.sequence, *pair.fixture.key, pair.transport.directory(), Now).empty());
+        CHECK(!founder.publishClipboardEvent(sibling.sequence, *pair.fixture.key, pair.transport.directory(), Now, ClipboardPublication::Append, pair.transport.staging()).empty());
         const auto before = pair.packets();
         const auto review = pair.first.reviewConflict();
         CHECK(review && review->tips.size() == 2 && before.size() == 3);
@@ -1425,7 +1550,7 @@ int main(int argc, char **argv)
                 CHECK(interrupted.pendingEvent->publicationAttempted == (journalCommit == 3));
                 refuses([&] { journal.resumeClipboardEvent(1, Now); });
                 refuses([&] { journal.discardClipboardEvent(1, Now); });
-                refuses([&] { journal.publishClipboardEvent(1, *pair.fixture.key, pair.transport.directory(), Now); });
+                refuses([&] { journal.publishClipboardEvent(1, *pair.fixture.key, pair.transport.directory(), Now, ClipboardPublication::Append, pair.transport.staging()); });
             } else {
                 CHECK(!interrupted.pendingEvent);
             }
@@ -1452,7 +1577,7 @@ int main(int argc, char **argv)
         const auto reject = [&](const JoinActivation &activation, const SignedReplicaState &state) {
             refuses([&] {
                 journal.synchronizeReplica(*pair.fixture.identities[1], pair.transport.directory(), activation, state,
-                    local, Now, [](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); });
+                    local, Now, [](const SignedReplicaState &, const tx::Snapshot &) { CHECK(false); }, pair.transport.staging());
             });
         };
         auto changed = pair.first.activation;
@@ -1636,6 +1761,649 @@ int main(int argc, char **argv)
         CHECK(pair.first.recoverRotation() == SignedReplicaRecovery::RetiredPossiblyPublished);
         const auto mounted = pair.first.mount();
         CHECK(mounted->snapshot() == local && !mounted->replica().pending && pair.packets().size() == 1);
+    });
+    test("reviewed generation adoption preserves the encrypted source and archives the exact local view", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("unpublished local content from the previous generation");
+        const auto remote = textSnapshot("independently signed content in the accepted generation");
+        pair.first.edit(local);
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        const auto sourceGeneration = pair.first.mount()->generation();
+        RotatedGeneration rotated(pair);
+        const auto newTip = rotated.seedCurrent(pair, remote);
+        constexpr auto NewBinding = "explicit-successor-profile";
+        auto &journal = pair.fixture.journal(1);
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        CHECK(!reviewed.seedsEmptyGeneration && !reviewed.resumesPendingSeed);
+        CHECK(reviewed.sourceGeneration == sourceGeneration && reviewed.sourceItems == local.size());
+        CHECK(reviewed.successor.generation == 1 && reviewed.successor.tipId == newTip);
+        CHECK(reviewed.successor.tipDigest != Token{} && reviewed.confirmation != Token{});
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+        SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "generation-successor"), Bytes(32, 0x73), NewBinding);
+        unsigned activations = 0;
+        const auto activate = [&](const JoinActivation &actual) {
+            CHECK(actual.tipId == newTip && actual.tipDigest == reviewed.successor.tipDigest);
+            rejects<JournalError>(JournalCode::Busy, [&] { journal.inspect(); });
+            refuses([&] { pair.first.mount(); });
+            const auto mounted = successor.mount(actual);
+            CHECK(mounted->snapshot() == remote && mounted->conflictBackupCount() == 1);
+            CHECK(mounted->conflictBackup(0) == local);
+            ++activations;
+        };
+        SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+            successor, reviewed, reviewed.confirmation, Now, activate, pair.transport.staging());
+        CHECK(activations == 1 && readCheckpointBytes(sourceRecord) == encryptedSource);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+        const auto subsequentEdit = textSnapshot("edit after switching the active profile");
+        {
+            auto mounted = successor.mount(reviewed.successor);
+            mounted->save(subsequentEdit, mounted->generation());
+        }
+        SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+            successor, reviewed, reviewed.confirmation, Now, [&](const JoinActivation &actual) {
+                const auto mounted = successor.mount(actual);
+                CHECK(mounted->snapshot() == subsequentEdit && mounted->conflictBackupCount() == 1);
+                CHECK(mounted->conflictBackup(0) == local);
+                ++activations;
+            }, pair.transport.staging());
+        CHECK(activations == 2 && readCheckpointBytes(sourceRecord) == encryptedSource);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+    });
+    test("generation adoption refuses an unconfirmed or stale local review before creating its destination", [] {
+        ReplicaPair pair;
+        RotatedGeneration rotated(pair);
+        rotated.seedCurrent(pair, textSnapshot("new signed generation"));
+        constexpr auto NewBinding = "generation-confirmation-profile";
+        auto &journal = pair.fixture.journal(1);
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        const auto destination = privateCheckpoint(pair.transport, "generation-confirmation");
+        SignedJoinCheckpoint successor(destination, Bytes(32, 0x74), NewBinding);
+        auto wrong = reviewed.confirmation;
+        wrong.front() ^= 1;
+        refuses([&] {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, wrong, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+        const auto latest = textSnapshot("local edit made after the displayed review");
+        pair.first.edit(latest);
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        refuses([&] {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource && pair.first.mount()->snapshot() == latest);
+    });
+    test("a changed successor tip invalidates the displayed generation review", [] {
+        ReplicaPair pair;
+        RotatedGeneration rotated(pair);
+        rotated.seedCurrent(pair, textSnapshot("reviewed signed generation"));
+        constexpr auto NewBinding = "generation-history-profile";
+        auto &journal = pair.fixture.journal(1);
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        const auto &founder = *pair.fixture.identities[0];
+        const auto prepared = pair.fixture.journal(0).prepareClipboardEvent(founder, *rotated.key,
+            {{reviewed.successor.tipId, reviewed.successor.tipDigest}}, cqs::packed::encode(textSnapshot("later signed edit")), Now);
+        pair.fixture.journal(0).publishClipboardEvent(prepared.sequence, *rotated.key, pair.transport.directory(), Now, ClipboardPublication::Append, pair.transport.staging());
+        const auto destination = privateCheckpoint(pair.transport, "generation-history");
+        SignedJoinCheckpoint successor(destination, Bytes(32, 0x75), NewBinding);
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        refuses([&] {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+    });
+    test("an explicitly seeded generation retries the exact durable intent after activation failure", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("reviewed local content to seed the empty accepted generation");
+        pair.first.edit(local);
+        RotatedGeneration rotated(pair);
+        constexpr auto NewBinding = "generation-seed-profile";
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        CHECK(reviewed.seedsEmptyGeneration && !reviewed.resumesPendingSeed);
+        CHECK(reviewed.successor.generation == 1 && reviewed.successor.tipDigest == Token{});
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "generation-seed"), Bytes(32, 0x76), NewBinding);
+        JoinActivation actual{};
+        bool failed = false;
+        try {
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [&](const JoinActivation &activated) {
+                    actual = activated;
+                    CHECK(actual.generation == 1 && actual.tipDigest != Token{});
+                    throw std::runtime_error("Injected profile activation failure");
+                }, pair.transport.staging());
+        } catch (const std::runtime_error &error) {
+            CHECK(std::string(error.what()) == "Injected profile activation failure");
+            failed = true;
+        }
+        CHECK(failed && !actual.tipId.empty() && readCheckpointBytes(sourceRecord) == encryptedSource);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+        pair.fixture.reopen(1);
+        unsigned callbacks = 0;
+        SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+            successor, reviewed, reviewed.confirmation, Now, [&](const JoinActivation &activated) {
+                CHECK(activated.tipId == actual.tipId && activated.tipDigest == actual.tipDigest);
+                const auto mounted = successor.mount(activated);
+                CHECK(mounted->snapshot() == local && mounted->conflictBackupCount() == 1);
+                CHECK(mounted->conflictBackup(0) == local);
+                ++callbacks;
+            }, pair.transport.staging());
+        CHECK(callbacks == 1 && readCheckpointBytes(sourceRecord) == encryptedSource);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+        const auto laterEdit = textSnapshot("normal signed edit after the reviewed generation seed");
+        {
+            auto mounted = successor.mount(actual);
+            CHECK(!mounted->replica().pending);
+            mounted->save(laterEdit, mounted->generation());
+            const auto stableLocal = mounted->snapshot();
+            CHECK(pair.fixture.journal(1).synchronizeReplica(identity, pair.transport.directory(), actual,
+                mounted->replica(), stableLocal, Now, [&](const auto &replica, const auto &snapshot) {
+                    mounted->updateReplica(replica, snapshot, mounted->generation());
+                }, pair.transport.staging()) == SignedReplicaResult::Published);
+        }
+        pair.fixture.reopen(1);
+        {
+            const auto mounted = successor.mount(actual);
+            CHECK(mounted->snapshot() == laterEdit && mounted->conflictBackupCount() == 1);
+            CHECK(mounted->conflictBackup(0) == local);
+            const auto stableLocal = mounted->snapshot();
+            CHECK(pair.fixture.journal(1).synchronizeReplica(identity, pair.transport.directory(), actual,
+                mounted->replica(), stableLocal, Now, [](const auto &, const auto &) { CHECK(false); },
+                pair.transport.staging()) == SignedReplicaResult::UpToDate);
+        }
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 2);
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+    });
+    test("a staged generation seed cannot publish superseded local content after a fresh review", [] {
+        ReplicaPair pair;
+        const auto reviewedLocal = textSnapshot("local content sealed in the staged seed");
+        pair.first.edit(reviewedLocal);
+        RotatedGeneration rotated(pair);
+        constexpr auto NewBinding = "staged-seed-local-review-profile";
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        const auto destination = privateCheckpoint(pair.transport, "staged-seed-local-review");
+        SignedJoinCheckpoint successor(destination, Bytes(32, 0x7a), NewBinding);
+        auto &store = pair.fixture.store(1);
+        store.deferredCommits = 3;
+        store.failure = MemoryStore::Fault::After;
+        rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        pair.fixture.reopen(1);
+        const auto staged = pair.fixture.journal(1).inspect().pendingEvent;
+        CHECK(staged && staged->ready && !staged->publicationAttempted);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).empty());
+        const auto laterLocal = textSnapshot("new local content that was never confirmed for publication");
+        pair.first.edit(laterLocal);
+        const auto journalBefore = st::serialize(store.record);
+        refuses([&] {
+            SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+                pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        });
+        CHECK(st::serialize(store.record) == journalBefore);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).empty());
+        CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+        CHECK(pair.first.mount()->snapshot() == laterLocal && pair.fixture.journal(1).inspect().pendingEvent);
+        const auto explicitlyReviewed = SignedGenerationTransition::review(pair.fixture.journal(1), identity,
+            pair.transport.directory(), pair.first.checkpoint, pair.first.activation, NewBinding, Now, true);
+        CHECK(explicitlyReviewed.resumesPendingSeed && explicitlyReviewed.pendingSeedDiffers);
+        CHECK(explicitlyReviewed.pendingSeedDigest != Token{} && explicitlyReviewed.pendingSeedItems == reviewedLocal.size());
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        unsigned validations = 0;
+        rejects<st::Error>(st::ErrorCode::InvalidRecord, [&] {
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, explicitlyReviewed, explicitlyReviewed.confirmation, Now, [](const auto &) { CHECK(false); },
+                pair.transport.staging(), [&](const auto &before, const auto &target) {
+                    CHECK(before == laterLocal && target == reviewedLocal);
+                    ++validations;
+                    throw st::Error(st::ErrorCode::InvalidRecord, "Injected exact pending snapshot rejection");
+                });
+        });
+        const auto pendingAfterRejection = pair.fixture.journal(1).inspect().pendingEvent;
+        CHECK(validations == 1 && pendingAfterRejection && pendingAfterRejection->ready && !pendingAfterRejection->publicationAttempted);
+        CHECK(pair.fixture.journal(1).inspect().allocatedEventSequence == staged->sequence);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).empty());
+        CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+        JoinActivation activated{};
+        SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+            successor, explicitlyReviewed, explicitlyReviewed.confirmation, Now, [&](const auto &actual) { activated = actual; },
+            pair.transport.staging(), [&](const auto &before, const auto &target) {
+                CHECK(before == laterLocal && target == reviewedLocal);
+                ++validations;
+            });
+        CHECK(validations == 2 && activated.tipDigest == explicitlyReviewed.successor.tipDigest);
+        CHECK(pair.fixture.journal(1).inspect().allocatedEventSequence == staged->sequence);
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource && pair.first.mount()->snapshot() == laterLocal);
+        const auto mounted = successor.mount(activated);
+        CHECK(mounted->snapshot() == reviewedLocal && mounted->conflictBackupCount() == 1);
+        CHECK(mounted->conflictBackup(0) == laterLocal);
+    });
+    test("generation target validation rejects before reserving or publishing a seed", [] {
+        ReplicaPair pair;
+        RotatedGeneration rotated(pair);
+        constexpr auto NewBinding = "validated-generation-seed-profile";
+        auto &journal = pair.fixture.journal(1);
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        const auto sequenceBefore = journal.inspect().allocatedEventSequence;
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        const auto destination = privateCheckpoint(pair.transport, "validated-generation-seed");
+        SignedJoinCheckpoint successor(destination, Bytes(32, 0x7b), NewBinding);
+        unsigned validations = 0;
+        rejects<st::Error>(st::ErrorCode::InvalidRecord, [&] {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging(),
+                [&](const auto &previous, const auto &target) {
+                    CHECK(previous == target);
+                    ++validations;
+                    throw st::Error(st::ErrorCode::InvalidRecord, "Injected target validation rejection");
+                });
+        });
+        CHECK(validations == 1 && journal.inspect().allocatedEventSequence == sequenceBefore);
+        CHECK(!journal.inspect().pendingEvent && pair.transport.directory().scanSignedEvents(rotated.scope).empty());
+        CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+        unsigned activations = 0;
+        SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+            successor, reviewed, reviewed.confirmation, Now, [&](const auto &) { ++activations; }, pair.transport.staging());
+        CHECK(activations == 1 && pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+    });
+    test("generation seed recovers every interrupted durable journal boundary without a second publication", [] {
+        unsigned resumedReadySeeds = 0;
+        for (unsigned interruptedCommit = 0; interruptedCommit < 6; ++interruptedCommit) {
+            ReplicaPair pair;
+            const auto local = textSnapshot("local seed retained through an interrupted journal commit");
+            pair.first.edit(local);
+            RotatedGeneration rotated(pair);
+            constexpr auto NewBinding = "interrupted-generation-seed-profile";
+            const auto &identity = *pair.fixture.identities[1];
+            const auto reviewed = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+                pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+            const auto encryptedSource = readCheckpointBytes(sourceRecord);
+            SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "interrupted-generation-seed"), Bytes(32, 0x78), NewBinding);
+            auto &store = pair.fixture.store(1);
+            store.deferredCommits = interruptedCommit;
+            store.failure = MemoryStore::Fault::After;
+            rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+                SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                    successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+            });
+            CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+            pair.fixture.reopen(1);
+            const auto resumed = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+                pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            if (resumed.resumesPendingSeed) ++resumedReadySeeds;
+            JoinActivation activated{};
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, resumed, resumed.confirmation, Now, [&](const auto &actual) { activated = actual; }, pair.transport.staging());
+            CHECK(activated.generation == 1 && activated.tipDigest != Token{});
+            CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 1);
+            CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+            const auto mounted = successor.mount(activated);
+            CHECK(mounted->snapshot() == local && mounted->conflictBackupCount() == 1);
+            CHECK(mounted->conflictBackup(0) == local && !mounted->replica().pending);
+        }
+        CHECK(resumedReadySeeds != 0);
+    });
+    test("a fresh review reconciles an exact attempted seed and adopts its authenticated descendant", [] {
+        ReplicaPair pair;
+        const auto local = textSnapshot("local content used by the ambiguously published seed");
+        const auto descendantLocal = textSnapshot("authenticated descendant of the exact pending seed");
+        pair.first.edit(local);
+        RotatedGeneration rotated(pair);
+        constexpr auto NewBinding = "attempted-seed-descendant-profile";
+        auto &journal = pair.fixture.journal(1);
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "attempted-seed-descendant"), Bytes(32, 0x84), NewBinding);
+        const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+        const auto encryptedSource = readCheckpointBytes(sourceRecord);
+        auto &store = pair.fixture.store(1);
+        store.deferredCommits = 5;
+        store.failure = MemoryStore::Fault::Before;
+        rejects<st::Error>(st::ErrorCode::Io, [&] {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        pair.fixture.reopen(1);
+        const auto pending = pair.fixture.journal(1).inspect().pendingEvent;
+        CHECK(pending && pending->ready && pending->publicationAttempted);
+        const auto seeded = pair.transport.directory().scanSignedEvents(rotated.scope);
+        CHECK(seeded.size() == 1);
+        const auto seedDigest = SignedEventCodec::digest(seeded.front().wire);
+        const auto prepared = pair.fixture.journal(0).prepareClipboardEvent(*pair.fixture.identities[0], *rotated.key,
+            {{seeded.front().id, seedDigest}}, cqs::packed::encode(descendantLocal), Now);
+        const auto child = pair.fixture.journal(0).publishClipboardEvent(prepared.sequence, *rotated.key,
+            pair.transport.directory(), Now, ClipboardPublication::Append, pair.transport.staging());
+        const auto beforeStaleApply = st::serialize(store.record);
+        refuses([&] {
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        CHECK(st::serialize(store.record) == beforeStaleApply && pair.fixture.journal(1).inspect().pendingEvent);
+        const auto fresh = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        CHECK(!fresh.seedsEmptyGeneration && !fresh.resumesPendingSeed && fresh.successor.tipId == child);
+        CHECK(!pair.fixture.journal(1).inspect().pendingEvent);
+        JoinActivation activated{};
+        SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+            successor, fresh, fresh.confirmation, Now, [&](const auto &actual) { activated = actual; }, pair.transport.staging());
+        const auto packets = pair.transport.directory().scanSignedEvents(rotated.scope);
+        CHECK(packets.size() == 2 && packet(packets, seeded.front().id).wire == seeded.front().wire);
+        CHECK(pair.fixture.journal(1).inspect().allocatedEventSequence == pending->sequence);
+        CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+        const auto mounted = successor.mount(activated);
+        CHECK(mounted->snapshot() == descendantLocal && mounted->conflictBackupCount() == 1);
+        CHECK(mounted->conflictBackup(0) == local);
+    });
+    test("a completed seed retry refuses a descendant that appeared after the displayed review", [] {
+        ReplicaPair pair;
+        RotatedGeneration rotated(pair);
+        constexpr auto NewBinding = "changed-completed-seed-profile";
+        auto &journal = pair.fixture.journal(1);
+        const auto &identity = *pair.fixture.identities[1];
+        const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+            pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+        SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "changed-completed-seed"), Bytes(32, 0x79), NewBinding);
+        JoinActivation seedActivation{};
+        bool failed = false;
+        try {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [&](const auto &actual) {
+                    seedActivation = actual;
+                    throw std::runtime_error("Injected seed activation failure");
+                }, pair.transport.staging());
+        } catch (const std::runtime_error &error) {
+            CHECK(std::string(error.what()) == "Injected seed activation failure");
+            failed = true;
+        }
+        CHECK(failed && seedActivation.tipDigest != Token{});
+        const auto &founder = *pair.fixture.identities[0];
+        const auto prepared = pair.fixture.journal(0).prepareClipboardEvent(founder, *rotated.key,
+            {{seedActivation.tipId, seedActivation.tipDigest}}, cqs::packed::encode(textSnapshot("later signed successor")), Now);
+        pair.fixture.journal(0).publishClipboardEvent(prepared.sequence, *rotated.key, pair.transport.directory(), Now, ClipboardPublication::Append, pair.transport.staging());
+        refuses([&] {
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+        });
+        CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).size() == 2);
+        CHECK(successor.mount(seedActivation)->snapshot() == cqs::packed::decode(ValidItems));
+    });
+    test("a reviewed later generation retires only its exact stale seed without publishing old bytes", [] {
+        for (const unsigned interruptedCommit : {3u, 4u}) {
+            ReplicaPair pair;
+            const auto local = textSnapshot("source local content retained while an older seed is retired");
+            pair.first.edit(local);
+            constexpr auto NewBinding = "stale-generation-seed-profile";
+            const auto destination = privateCheckpoint(pair.transport, "stale-generation-seed");
+            SignedJoinCheckpoint successor(destination, Bytes(32, 0x80), NewBinding);
+            const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+            const auto encryptedSource = readCheckpointBytes(sourceRecord);
+            const auto staleScope = stageGenerationSeedBeforeSecondRotation(pair, successor, NewBinding, interruptedCommit);
+            SecondRotatedGeneration current(pair);
+            auto &journal = pair.fixture.journal(1);
+            const auto &identity = *pair.fixture.identities[1];
+            const auto reviewed = SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+                pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            CHECK(reviewed.retiresStaleSeed && reviewed.seedsEmptyGeneration && !reviewed.resumesPendingSeed);
+            CHECK(reviewed.successor.generation == 2 && reviewed.successor.tipDigest == Token{});
+            CHECK(journal.inspect().pendingEvent);
+            const auto journalBefore = st::serialize(pair.fixture.store(1).record);
+            refuses([&] {
+                SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, "wrong-stale-generation-binding", Now);
+            });
+            auto unreviewedRetirement = reviewed;
+            unreviewedRetirement.retiresStaleSeed = false;
+            refuses([&] {
+                SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                    successor, unreviewedRetirement, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+            });
+            CHECK(st::serialize(pair.fixture.store(1).record) == journalBefore);
+            CHECK(!std::filesystem::exists(destination / st::FileStore::RecordName));
+            JoinActivation activated{};
+            SignedGenerationTransition::apply(journal, identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [&](const auto &actual) { activated = actual; }, pair.transport.staging());
+            CHECK(activated.generation == 2 && activated.tipDigest != Token{});
+            CHECK(!journal.inspect().pendingEvent && readCheckpointBytes(sourceRecord) == encryptedSource);
+            CHECK(pair.transport.directory().scanSignedEvents(staleScope).empty());
+            CHECK(pair.transport.directory().scanSignedEvents(current.scope).size() == 1);
+            const auto successorGeneration = successor.mount(activated)->generation();
+            pair.fixture.reopen(1);
+            unsigned retried = 0;
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, reviewed, reviewed.confirmation, Now, [&](const auto &actual) {
+                    CHECK(actual.tipId == activated.tipId && actual.tipDigest == activated.tipDigest);
+                    ++retried;
+                }, pair.transport.staging());
+            const auto mounted = successor.mount(activated);
+            CHECK(retried == 1 && mounted->generation() == successorGeneration && mounted->snapshot() == local);
+            CHECK(mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
+            CHECK(pair.transport.directory().scanSignedEvents(staleScope).empty());
+            CHECK(pair.transport.directory().scanSignedEvents(current.scope).size() == 1);
+            CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+        }
+    });
+    test("stale seed retirement survives every journal barrier and retains its reviewed evidence", [] {
+        for (unsigned interruptedCommit = 0; interruptedCommit < 7; ++interruptedCommit) {
+            ReplicaPair pair;
+            const auto local = textSnapshot("current local copy preserved across interrupted seed retirement");
+            pair.first.edit(local);
+            constexpr auto NewBinding = "interrupted-stale-seed-profile";
+            SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "interrupted-stale-seed"), Bytes(32, 0x83), NewBinding);
+            const auto sourceRecord = pair.transport.root.parent_path() / "replica-1" / st::FileStore::RecordName;
+            const auto encryptedSource = readCheckpointBytes(sourceRecord);
+            const auto staleScope = stageGenerationSeedBeforeSecondRotation(pair, successor, NewBinding, 3);
+            SecondRotatedGeneration current(pair);
+            const auto &identity = *pair.fixture.identities[1];
+            const auto reviewed = SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+                pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            CHECK(reviewed.retiresStaleSeed && reviewed.retirementDigest != Token{});
+            auto &store = pair.fixture.store(1);
+            store.deferredCommits = interruptedCommit;
+            store.failure = MemoryStore::Fault::After;
+            rejects<st::Error>(st::ErrorCode::CommitUnconfirmed, [&] {
+                SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                    successor, reviewed, reviewed.confirmation, Now, [](const auto &) { CHECK(false); }, pair.transport.staging());
+            });
+            CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+            CHECK(pair.transport.directory().scanSignedEvents(staleScope).empty());
+            pair.fixture.reopen(1);
+            // The exact original review remains usable immediately after the
+            // retirement commit; later burned tuples require a fresh review.
+            const auto resumed = interruptedCommit == 1 ? reviewed :
+                SignedGenerationTransition::review(pair.fixture.journal(1), identity, pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            CHECK(resumed.retiresStaleSeed && resumed.retirementDigest == reviewed.retirementDigest);
+            JoinActivation activated{};
+            SignedGenerationTransition::apply(pair.fixture.journal(1), identity, pair.transport.directory(), pair.first.checkpoint,
+                successor, resumed, resumed.confirmation, Now, [&](const auto &actual) { activated = actual; }, pair.transport.staging());
+            CHECK(activated.generation == 2 && activated.tipDigest != Token{});
+            CHECK(pair.transport.directory().scanSignedEvents(staleScope).empty());
+            CHECK(pair.transport.directory().scanSignedEvents(current.scope).size() == 1);
+            CHECK(readCheckpointBytes(sourceRecord) == encryptedSource);
+            const auto mounted = successor.mount(activated);
+            CHECK(mounted->snapshot() == local && mounted->conflictBackupCount() == 1 && mounted->conflictBackup(0) == local);
+            CHECK(!pair.fixture.journal(1).inspect().pendingEvent);
+        }
+    });
+    test("stale generation seed retirement refuses removed members and a later membership fork", [] {
+        {
+            ReplicaPair pair;
+            constexpr auto NewBinding = "removed-stale-seed-profile";
+            SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "removed-stale-seed"), Bytes(32, 0x81), NewBinding);
+            const auto staleScope = stageGenerationSeedBeforeSecondRotation(pair, successor, NewBinding, 3);
+            SecondRotatedGeneration current(pair, 1);
+            const auto journalBefore = st::serialize(pair.fixture.store(1).record);
+            refuses([&] {
+                SignedGenerationTransition::review(pair.fixture.journal(1), *pair.fixture.identities[1], pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            });
+            CHECK(st::serialize(pair.fixture.store(1).record) == journalBefore && pair.fixture.journal(1).inspect().pendingEvent);
+            CHECK(pair.transport.directory().scanSignedEvents(staleScope).empty());
+            CHECK(pair.transport.directory().scanSignedEvents(current.scope).empty());
+        }
+        {
+            ReplicaPair pair;
+            constexpr auto NewBinding = "forked-stale-seed-profile";
+            SignedJoinCheckpoint successor(privateCheckpoint(pair.transport, "forked-stale-seed"), Bytes(32, 0x82), NewBinding);
+            const auto staleScope = stageGenerationSeedBeforeSecondRotation(pair, successor, NewBinding, 4);
+            auto &fixture = pair.fixture;
+            const auto alternativeKey = SyncKey::generate();
+            const auto sibling = fixture.journal(0).propose(Operation::Remove, fixture.member(1), token(87), token(88),
+                Now, Expires, alternativeKey->commitment(fixture.genesis.group, 2));
+            Certificate fork{sibling, {}};
+            for (const auto signer : {0u, 3u})
+                fork.approvals.push_back({fixture.member(signer).id,
+                    fixture.identities[signer]->sign(approvalBytes(sibling, fixture.member(signer)))});
+            SecondRotatedGeneration current(pair);
+            CHECK(fixture.journal(1).observe(fork, Now) == ObserveResult::ForkDetected);
+            const auto journalBefore = st::serialize(fixture.store(1).record);
+            refuses([&] {
+                SignedGenerationTransition::review(fixture.journal(1), *fixture.identities[1], pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, NewBinding, Now);
+            });
+            CHECK(st::serialize(fixture.store(1).record) == journalBefore && fixture.journal(1).inspect().pendingEvent);
+            CHECK(pair.transport.directory().scanSignedEvents(staleScope).empty());
+            CHECK(pair.transport.directory().scanSignedEvents(current.scope).empty());
+        }
+    });
+    test("generation review refuses unresolved and unrelated intents, removed members, missing keys and known forks", [] {
+        {
+            ReplicaPair pair;
+            {
+                auto mounted = pair.first.mount();
+                auto replica = mounted->replica();
+                replica.pending = SignedReplicaIntent{pair.fixture.journal(1).inspect().allocatedEventSequence + 1, token(91)};
+                mounted->updateReplica(replica, mounted->snapshot(), mounted->generation());
+            }
+            RotatedGeneration rotated(pair);
+            rotated.seedCurrent(pair, textSnapshot("new signed generation"));
+            refuses([&] {
+                SignedGenerationTransition::review(pair.fixture.journal(1), *pair.fixture.identities[1], pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, "pending-source-profile", Now);
+            });
+            CHECK(pair.first.mount()->replica().pending);
+        }
+        {
+            ReplicaPair pair;
+            RotatedGeneration rotated(pair);
+            auto &journal = pair.fixture.journal(1);
+            const auto &identity = *pair.fixture.identities[1];
+            const auto unrelated = journal.prepareClipboardEvent(identity, *rotated.key, {},
+                cqs::packed::encode(textSnapshot("unrelated current-generation reservation")), Now);
+            const auto before = st::serialize(pair.fixture.store(1).record);
+            refuses([&] {
+                SignedGenerationTransition::review(journal, identity, pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, "unrelated-reservation-profile", Now);
+            });
+            CHECK(st::serialize(pair.fixture.store(1).record) == before);
+            CHECK(journal.inspect().pendingEvent && journal.inspect().pendingEvent->sequence == unrelated.sequence);
+            CHECK(pair.transport.directory().scanSignedEvents(rotated.scope).empty());
+        }
+        {
+            ReplicaPair pair;
+            RotatedGeneration rotated(pair, 1);
+            rotated.seedCurrent(pair, textSnapshot("remaining members only"));
+            refuses([&] {
+                SignedGenerationTransition::review(pair.fixture.journal(1), *pair.fixture.identities[1], pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, "removed-source-profile", Now);
+            });
+        }
+        {
+            ReplicaPair pair;
+            rotateReplicaKey(pair, 2);
+            const auto state = pair.fixture.journal(1).inspect().state;
+            const storage::SignedEventScope scope{state.group, state.root, state.keyGeneration};
+            privateDirectory(pair.transport.root / storage::signedEventFolderName(scope));
+            refuses([&] {
+                SignedGenerationTransition::review(pair.fixture.journal(1), *pair.fixture.identities[1], pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, "missing-key-profile", Now);
+            });
+        }
+        {
+            ReplicaPair pair;
+            auto &fixture = pair.fixture;
+            const auto alternativeKey = SyncKey::generate();
+            const auto sibling = fixture.journal(0).propose(Operation::Remove, fixture.member(1), token(83), token(84),
+                Now, Expires, alternativeKey->commitment(fixture.genesis.group, 1));
+            Certificate fork{sibling, {}};
+            for (const auto signer : {0u, 2u})
+                fork.approvals.push_back({fixture.member(signer).id,
+                    fixture.identities[signer]->sign(approvalBytes(sibling, fixture.member(signer)))});
+            RotatedGeneration rotated(pair);
+            CHECK(fixture.journal(1).observe(fork, Now) == ObserveResult::ForkDetected);
+            refuses([&] {
+                SignedGenerationTransition::review(fixture.journal(1), *fixture.identities[1], pair.transport.directory(),
+                    pair.first.checkpoint, pair.first.activation, "forked-source-profile", Now);
+            });
+        }
+    });
+    test("an explicitly provisioned founder activates and reopens its own signed checkpoint without a fabricated Join", [] {
+        Fixture fixture;
+        fixture.journals[0] = std::make_unique<TrustJournal>(fixture.store(0), fixture.genesis, fixture.member(0), fixture.key.get());
+        Transport transport(fixture.journal(0).inspect().state);
+        const auto first = seed(fixture, transport);
+        const auto activation = fixture.journal(0).preflightJoinActivation(*fixture.identities[0], transport.directory(), Binding, Now);
+        CHECK(activation.member == fixture.member(0).id && activation.tipId == first);
+        CHECK(!fixture.journal(0).inspect().verifiedJoin);
+        const auto directory = privateCheckpoint(transport, "founder-checkpoint");
+        SignedJoinCheckpoint checkpoint(directory, Bytes(32, 0x77), Binding);
+        fixture.journal(0).applyJoinActivation(*fixture.identities[0], transport.directory(), activation, Now,
+            [&](const auto &verified, const auto &event, const auto &snapshot) { checkpoint.apply(verified, event, snapshot); });
+        const auto edited = textSnapshot("first device's private edit");
+        {
+            auto mounted = checkpoint.mount(activation);
+            mounted->save(edited, mounted->generation());
+            const auto local = mounted->snapshot();
+            CHECK(fixture.journal(0).synchronizeReplica(*fixture.identities[0], transport.directory(), activation,
+                mounted->replica(), local, Now, [&](const auto &replica, const auto &snapshot) {
+                    mounted->updateReplica(replica, snapshot, mounted->generation());
+                }, transport.staging()) == SignedReplicaResult::Published);
+        }
+        fixture.journals[0] = std::make_unique<TrustJournal>(fixture.store(0), fixture.genesis, fixture.member(0), fixture.key.get());
+        {
+            auto mounted = checkpoint.mount(activation);
+            CHECK(mounted->snapshot() == edited && !mounted->replica().pending);
+            const auto local = mounted->snapshot();
+            CHECK(fixture.journal(0).synchronizeReplica(*fixture.identities[0], transport.directory(), activation,
+                mounted->replica(), local, Now, [](const auto &, const auto &) { CHECK(false); }, transport.staging()) == SignedReplicaResult::UpToDate);
+        }
+        fixture.reopen(0);
+        refuses([&] { fixture.journal(0).preflightJoinActivation(*fixture.identities[0], transport.directory(), Binding, Now); });
+        const auto wrongKey = SyncKey::generate();
+        fixture.journals[0] = std::make_unique<TrustJournal>(fixture.store(0), fixture.genesis, fixture.member(0), wrongKey.get());
+        rejects<EnvelopeError>(EnvelopeCode::KeyMismatch, [&] {
+            fixture.journal(0).preflightJoinActivation(*fixture.identities[0], transport.directory(), Binding, Now);
+        });
+        rejects<JournalError>(JournalCode::WrongPins, [&] {
+            TrustJournal nonfounder(fixture.store(1), fixture.genesis, fixture.member(1), fixture.key.get());
+        });
     });
     test("a locally accepted removal and key rotation stops the old generation", [] {
         ReplicaPair pair;

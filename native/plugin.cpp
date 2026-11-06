@@ -32,6 +32,7 @@
 #ifdef CQS_BUILD_SIGNED_JOIN
 #include "signed_join_entry.h"
 #include "signed_tab_activation.h"
+#include "signed_setup.h"
 #endif
 
 struct SecureSyncJob {
@@ -330,6 +331,16 @@ SecureSyncPlugin::SecureSyncPlugin() {
         if (!cqs::native::signedTabHostReady(settingsFile_, &inventory))
             throw cqs::native::ModelError(cqs::native::ModelErrorCode::AccessDenied);
         cqs::native::rowProtection(settingsFile_, inventory).validateTags(snapshot);
+    });
+    signedTab_.setKeyProvider([this](const cqs::native::SignedTabConfiguration &configuration) {
+        if (closing_ || !isEnabled() || configuration.setupRoot.isEmpty())
+            throw cqs::native::ModelError(cqs::native::ModelErrorCode::AccessDenied);
+        const Password credential{password({}, 1, tr("Unlock signed synchronization"))};
+        if (credential.bytes.empty()) throw cqs::native::ModelError(cqs::native::ModelErrorCode::AccessDenied);
+        return std::async(std::launch::async, [&] {
+            return cqs::trust::SignedSetup::unlockCheckpoint(path(configuration.setupRoot), credential.bytes,
+                                                            configuration.expected);
+        }).get();
     });
     connect(&signedTab_, &cqs::native::SignedTabStorage::error, this, &SecureSyncPlugin::error);
 #endif
@@ -1197,7 +1208,7 @@ std::optional<cqs::native::SignedReplicaRequest> SecureSyncPlugin::prepareSigned
     const auto encoded = settings.value(SignedTabSetting).toByteArray();
     const auto current = decodeSignedTab(settingsFile_, encoded);
     if (!current || encoded != signedTabSetting_ || current->checkpointDirectory != directory ||
-        current->keyFile != keyFile || current->expected.profileBinding !=
+        current->keyFile != keyFile || current->setupRoot != source.setupRoot || current->expected.profileBinding !=
             signedTabBinding(QFileInfo(settingsFile_).canonicalFilePath(), directory, journalBinding)) return {};
     const auto pin = signedReplicaSourcePin(current->expected.profileBinding, source);
     if (pin.isEmpty() || settings.status() != QSettings::NoError) return {};
@@ -1297,7 +1308,7 @@ QWidget *SecureSyncPlugin::createSettingsWidget(QWidget *parent) {
     widget->addSignedJoinAction();
     widget->setSignedBackgroundStatus(signedBackgroundStatus_, signedBackground_.armed());
     connect(widget, &cqs::native::SettingsWidget::stopSignedBackgroundRequested, this, [this] { signedBackground_.stop(); });
-    connect(widget, &cqs::native::SettingsWidget::signedJoinRequested, this, [this, widget] {
+    const auto openSigned = [this, widget](bool guided) {
         if (signedJoinOpen_ || closing_ || runtimeBusy_ || !isEnabled() || widget->profile() != profile_) return;
         const QPointer<cqs::native::SettingsWidget> panel(widget);
         const auto settings = settingsFile_;
@@ -1320,19 +1331,30 @@ QWidget *SecureSyncPlugin::createSettingsWidget(QWidget *parent) {
         signedBackground_.stop();
         signedJoinOpen_ = true;
         const auto reset = qScopeGuard([owner] { if (owner) owner->signedJoinOpen_ = false; });
-        cqs::native::openSignedJoinSetup(widget, settings, profile, stillCurrent,
-            [&](const cqs::native::SignedTabConfiguration &configuration, const std::string &journalBinding,
-                const cqs::native::SignedReplicaSource &source) {
-                return stillCurrent() && activateSignedTab(configuration, journalBinding, source);
-            }, [&](const QString &directory, const QString &keyFile, const std::string &journalBinding,
-                   const cqs::native::SignedReplicaSource &source) -> std::optional<cqs::native::SignedReplicaRequest> {
-                if (!stillCurrent()) return {};
-                return prepareSignedReplica(directory, keyFile, journalBinding, source);
-            }, [&](const QString &directory, const QString &keyFile, const std::string &journalBinding,
-                   const cqs::native::SignedReplicaSource &source, cqs::native::SignedReplicaTask task) {
-                return stillCurrent() && armSignedReplica(directory, keyFile, journalBinding, source, std::move(task));
-            });
-    });
+        try {
+            const auto opener = guided ? cqs::native::openGuidedSignedJoinSetup : cqs::native::openSignedJoinSetup;
+            opener(widget, settings, profile, stillCurrent,
+                [&](const cqs::native::SignedTabConfiguration &configuration, const std::string &journalBinding,
+                    const cqs::native::SignedReplicaSource &source) {
+                    return stillCurrent() && activateSignedTab(configuration, journalBinding, source);
+                }, [&](const QString &directory, const QString &keyFile, const std::string &journalBinding,
+                       const cqs::native::SignedReplicaSource &source) -> std::optional<cqs::native::SignedReplicaRequest> {
+                    if (!stillCurrent()) return {};
+                    return prepareSignedReplica(directory, keyFile, journalBinding, source);
+                }, [&](const QString &directory, const QString &keyFile, const std::string &journalBinding,
+                       const cqs::native::SignedReplicaSource &source, cqs::native::SignedReplicaTask task) {
+                    return stillCurrent() && armSignedReplica(directory, keyFile, journalBinding, source, std::move(task));
+                });
+            if (!owner) return;
+            QSettings saved(settings, QSettings::IniFormat);
+            saved.beginGroup("Plugins/securesync");
+            if (saved.value(cqs::native::SignedTabSetting).toByteArray() != signedTabSetting_) loadSettings(saved);
+        } catch (...) {
+            if (panel) panel->setStatus(tr("Signed setup was refused or its durable outcome needs review. Reopen the same private profile to recover."));
+        }
+    };
+    connect(widget, &cqs::native::SettingsWidget::signedJoinRequested, this, [openSigned] { openSigned(true); });
+    connect(widget, &cqs::native::SettingsWidget::signedAdvancedRequested, this, [openSigned] { openSigned(false); });
 #endif
     connect(widget, &cqs::native::SettingsWidget::inspectRequested, this,
             [this, widget](const cqs::native::Profile &p) {

@@ -6,6 +6,9 @@
 #include "signed_join_checkpoint.h"
 #include "signed_join_wizard.h"
 #include "signed_tab_activation.h"
+#include "signed_setup.h"
+#include "signed_setup_wizard.h"
+#include "signed_generation_wizard.h"
 #include "storage.h"
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -18,6 +21,7 @@
 #include <QPointer>
 #include <QScopeGuard>
 #include <QStringList>
+#include <QSettings>
 #include <algorithm>
 #include <iterator>
 
@@ -85,18 +89,23 @@ struct Key {
 };
 
 struct ReplicaBackend {
-    std::unique_ptr<trust::Identity> identity;
+    std::shared_ptr<trust::Identity> identity;
+    std::shared_ptr<const trust::SyncKey> founderKey;
+    std::unique_ptr<trust::SyncKey> checkpointCredential;
     state::FileStore journalStore;
     trust::TrustJournal journal;
     storage::Directory transport;
     trust::SignedJoinCheckpoint checkpoint;
 
-    ReplicaBackend(std::unique_ptr<trust::Identity> localIdentity, const trust::Genesis &genesis,
+    ReplicaBackend(std::shared_ptr<trust::Identity> localIdentity, std::shared_ptr<const trust::SyncKey> provisionedKey,
+        const trust::Genesis &genesis,
         const trust::Member &local, const std::string &journalBinding, const std::string &binding,
         const QString &journalPath, const QString &transportPath, const QString &checkpointPath,
         const Key &journalCredential, const Key &checkpointCredential)
-        : identity(std::move(localIdentity)), journalStore(path(journalPath), journalBinding, journalCredential.bytes),
-          journal(journalStore, genesis, local), transport(path(transportPath)),
+        : identity(std::move(localIdentity)), founderKey(std::move(provisionedKey)),
+          checkpointCredential(trust::SyncKey::import(checkpointCredential.bytes)),
+          journalStore(path(journalPath), journalBinding, journalCredential.bytes),
+          journal(journalStore, genesis, local, founderKey.get()), transport(path(transportPath)),
           checkpoint(path(checkpointPath), checkpointCredential.bytes, binding) {}
 };
 
@@ -186,12 +195,12 @@ void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Pro
         crypto::wipe(identityCredential.bytes);
         const auto journalBinding = trust::TrustJournal::binding(genesis, local);
         const auto binding = signedTabBinding(settings, checkpointPath, journalBinding);
-        auto backend = std::make_shared<ReplicaBackend>(std::move(identity), genesis, local, journalBinding, binding,
+        std::shared_ptr<const trust::SyncKey> groupKey = publisherKey.isEmpty() ? nullptr : trust::SyncKey::import(publisherCredential.bytes);
+        crypto::wipe(publisherCredential.bytes);
+        auto backend = std::make_shared<ReplicaBackend>(std::move(identity), groupKey, genesis, local, journalBinding, binding,
             journalPath, transportPath, checkpointPath, journalCredential, checkpointCredential);
         crypto::wipe(journalCredential.bytes);
         crypto::wipe(checkpointCredential.bytes);
-        const auto groupKey = publisherKey.isEmpty() ? nullptr : trust::SyncKey::import(publisherCredential.bytes);
-        crypto::wipe(publisherCredential.bytes);
         const SignedReplicaSource source{transportPath, journalPath};
         const auto stagingPath = path(staging);
         if (owner && stillCurrent()) runSignedJoinWizard(owner, backend->journal, *backend->identity, backend->transport,
@@ -205,10 +214,111 @@ void openSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Pro
                         return synchronizeSignedReplica(backend->journal, *backend->identity, backend->transport,
                             backend->checkpoint, request, stagingPath, canProceed);
                     });
+            }, [&] {
+                const auto request = prepareReplica(checkpointPath, checkpointKey, journalBinding, source);
+                if (!request) refuse();
+                const Key credential{backend->checkpointCredential->exportPrivate()};
+                return runSignedGenerationWizard(owner, backend->journal, *backend->identity, backend->transport,
+                    backend->checkpoint, credential.bytes, settings, journalBinding, source, *request, stagingPath, stillCurrent,
+                    [legacy, settings](const QString &destination) {
+                        for (const auto &value : {legacy.stateDirectory, legacy.vaultDirectory, legacy.keyFile, legacy.transport, settings}) {
+                            if (value.isEmpty()) continue;
+                            std::error_code error;
+                            const auto canonical = std::filesystem::weakly_canonical(path(value), error);
+                            if (error) return false;
+#ifdef Q_OS_WIN
+                            const auto blocked = QString::fromStdWString(canonical.wstring());
+#else
+                            const auto encoded = canonical.u8string();
+                            const auto blocked = QString::fromUtf8(encoded.data(), qsizetype(encoded.size()));
+#endif
+                            if (overlaps(destination, blocked)) return false;
+                        }
+                        return true;
+                    });
             });
     } catch (const std::exception &) {
         if (owner) QMessageBox::warning(owner, QString::fromLatin1(Caption),
             QStringLiteral("Signed Join setup was refused. Check the trusted pins, private paths and credential files."));
     }
+}
+
+void openGuidedSignedJoinSetup(QWidget *parent, const QString &settingsFile, const Profile &legacy,
+                         const std::function<bool()> &stillCurrent, const ActivateSignedTab &activate,
+                         const PrepareSignedReplica &prepareReplica, const ArmSignedReplica &armReplica) {
+    const auto text = [](const std::filesystem::path &value) {
+#ifdef Q_OS_WIN
+        return QString::fromStdWString(value.wstring());
+#else
+        const auto encoded = value.u8string();
+        return QString::fromUtf8(encoded.data(), qsizetype(encoded.size()));
+#endif
+    };
+    QStringList excluded{checkedPath(settingsFile, false)};
+    for (const auto &legacyPath : {legacy.stateDirectory, legacy.vaultDirectory, legacy.keyFile, legacy.transport}) {
+        if (legacyPath.isEmpty()) continue;
+        std::error_code error;
+        const auto canonical = std::filesystem::weakly_canonical(path(legacyPath), error);
+        if (error || !canonical.is_absolute()) refuse();
+        excluded.push_back(text(canonical));
+    }
+    const auto validatePrivate = [excluded, text](const std::filesystem::path &value) {
+        std::error_code error;
+        const auto canonical = std::filesystem::weakly_canonical(value, error);
+        if (error || !canonical.is_absolute()) return false;
+        const auto candidate = text(canonical);
+        return std::none_of(excluded.begin(), excluded.end(), [&](const auto &blocked) {
+            return overlaps(candidate, blocked);
+        });
+    };
+    const trust::SignedSetup::PathValidator validateSetup = [validatePrivate](const auto &root, const auto &transport) {
+        return validatePrivate(root) && validatePrivate(transport);
+    };
+    auto created = openSignedSetupWizard(parent, stillCurrent, validateSetup);
+    if (!created || !stillCurrent()) return;
+    std::shared_ptr<trust::SignedSetup> setup(std::move(created));
+    const auto root = text(setup->paths().root);
+    const auto journalPath = text(setup->paths().journal);
+    auto checkpointPath = text(setup->paths().checkpoint);
+    const auto transportPath = text(setup->paths().transport);
+    const auto settings = checkedPath(settingsFile, false);
+    QSettings activeSettings(settings, QSettings::IniFormat);
+    const auto active = decodeSignedTab(settings, activeSettings.value("Plugins/securesync/active_signed_tab").toByteArray());
+    if (active && active->setupRoot == root) checkpointPath = active->checkpointDirectory;
+    for (const auto &legacyPath : {legacy.stateDirectory, legacy.vaultDirectory, legacy.keyFile, legacy.transport})
+        if (!legacyPath.isEmpty() && overlaps(root, QDir::cleanPath(QDir::fromNativeSeparators(legacyPath)))) refuse();
+    if (overlaps(root, settings) || overlaps(transportPath, settings)) refuse();
+    const auto journalBinding = trust::TrustJournal::binding(setup->genesis(), setup->member());
+    const auto binding = signedTabBinding(settings, checkpointPath, journalBinding);
+    Key journalCredential{setup->journalCredential()};
+    Key checkpointCredential{setup->checkpointCredential()};
+    auto identity = std::shared_ptr<trust::Identity>(setup, &setup->identity());
+    auto founderKey = setup->founderKey()
+        ? std::shared_ptr<const trust::SyncKey>(setup, setup->founderKey()) : std::shared_ptr<const trust::SyncKey>{};
+    auto backend = std::make_shared<ReplicaBackend>(std::move(identity), std::move(founderKey), setup->genesis(),
+        setup->member(), journalBinding, binding, journalPath, transportPath, checkpointPath, journalCredential, checkpointCredential);
+    crypto::wipe(journalCredential.bytes);
+    crypto::wipe(checkpointCredential.bytes);
+    const SignedReplicaSource source{transportPath, journalPath, root};
+    const auto staging = setup->paths().staging;
+    runSignedJoinWizard(parent, backend->journal, *backend->identity, backend->transport, backend->checkpoint,
+        binding, backend->founderKey.get(), staging, stillCurrent, [&](const trust::JoinActivation &expected) {
+            return activate({checkpointPath, {}, expected, root}, journalBinding, source);
+        }, transportPath, [&] {
+            return prepareReplica(checkpointPath, {}, journalBinding, source);
+        }, [&] {
+            return armReplica(checkpointPath, {}, journalBinding, source,
+                [backend, staging](const SignedReplicaRequest &request, const std::function<bool()> &canProceed) {
+                    return synchronizeSignedReplica(backend->journal, *backend->identity, backend->transport,
+                        backend->checkpoint, request, staging, canProceed);
+                });
+        }, [&] {
+            const auto request = prepareReplica(checkpointPath, {}, journalBinding, source);
+            if (!request) refuse();
+            const Key credential{backend->checkpointCredential->exportPrivate()};
+            return runSignedGenerationWizard(parent, backend->journal, *backend->identity, backend->transport,
+                backend->checkpoint, credential.bytes, settings, journalBinding, source, *request, staging, stillCurrent,
+                    [validatePrivate](const QString &destination) { return validatePrivate(path(destination)); });
+        });
 }
 } // namespace cqs::native

@@ -57,6 +57,16 @@ public:
     SignedJoinCheckpoint &operator=(const SignedJoinCheckpoint &) = delete;
     void apply(const JoinActivation &verified, const events::Event &tip,
                const transaction::Snapshot &snapshot);
+    // A reviewed generation transition creates a separate checkpoint and
+    // retains the old local view as an encrypted backup in the same commit.
+    // Call only inside the revalidated journal activation callback.
+    void applySuccessor(const JoinActivation &verified, const events::Event &tip,
+        const transaction::Snapshot &snapshot, const transaction::Snapshot &previousLocal,
+        const Token &transitionReceipt);
+    // Serialize the complete successor and retained source before publishing
+    // a new-generation Seed. A zero provisional wire digest is size-checked.
+    void checkSuccessorCapacity(const JoinActivation &provisional, const transaction::Snapshot &snapshot,
+        const transaction::Snapshot &previousLocal) const;
     // Read the immutable snapshot confirmed by the original signed Join.
     transaction::Snapshot read(const JoinActivation &expected);
     // Open the editable local snapshot and hold the exclusive session lease.

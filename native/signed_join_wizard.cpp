@@ -242,7 +242,7 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
                          const std::filesystem::path &privateStaging, const std::function<bool()> &stillCurrent,
                          const std::function<bool(const JoinActivation &)> &activate,
                          const QString &replicaSource, const std::function<std::optional<SignedReplicaRequest>()> &prepareReplica,
-                         const std::function<bool()> &startBackground) {
+                         const std::function<bool()> &startBackground, const std::function<bool()> &activateNextGeneration) {
     // The preferences widget can be deleted by the host while a modal dialog
     // runs. The wizard is stack-owned so that its worker can always be joined.
     QDialog wizard;
@@ -643,6 +643,14 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
             return;
         }
         wizard.accept();
+    });
+    if (activateNextGeneration) addAction(wizard, *applicantActions, QObject::tr("Activate accepted key generation"), [&] {
+        checkCurrent();
+        if (activateNextGeneration()) {
+            QMessageBox::information(&wizard, QObject::tr("Secure Sync"),
+                QObject::tr("The new encrypted checkpoint is active. Reopen signed_sync. The previous checkpoint was retained."));
+            wizard.accept();
+        }
     });
     applicantActions->addStretch();
     memberActions->addStretch();

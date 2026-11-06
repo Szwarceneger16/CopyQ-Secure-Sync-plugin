@@ -95,7 +95,7 @@ int main(int argc,char **argv) {
         bool setupOpened = false;
         QTimer::singleShot(0, [&] {
             auto *setup = qobject_cast<QDialog *>(QApplication::activeModalWidget());
-            CHECK(setup && setup->objectName() == QStringLiteral("cqsSignedJoinSetup"));
+            CHECK(setup && setup->objectName() == QStringLiteral("cqsSignedSetup"));
             setupOpened = true;
             setup->reject();
         });
