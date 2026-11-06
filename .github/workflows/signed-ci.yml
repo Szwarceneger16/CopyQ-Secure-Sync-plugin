@@ -1,0 +1,254 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Signed device qualification
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: signed-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  sources:
+    name: Require complete signed sources and validate test gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.signed.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate accepted gate semantics
+        run: python3 -m unittest discover -s ci -p 'test_*.py' -v
+      - name: Classify signed implementation
+        id: signed
+        shell: bash
+        run: |
+          set -euo pipefail
+          enabled=$(python3 ci/signed-sources.py .)
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          if [[ "$enabled" == false ]]; then
+            echo 'The signed implementation is absent on this branch. No signed qualification is claimed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+  linux:
+    name: Signed Linux / native suites and official CopyQ processes
+    needs: sources
+    if: needs.sources.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - name: Build pinned signed SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/signed-linux/reports
+          docker build --pull --tag cqs-native-ci:local --file ci/Containerfile ci > out/signed-linux/reports/sdk.log 2>&1
+          docker build --tag cqs-signed-ci:local --file ci/Containerfile.signed ci > out/signed-linux/reports/signed-sdk.log 2>&1
+          docker image inspect cqs-signed-ci:local > out/signed-linux/reports/sdk-image.json
+      - name: Execute signed native suites offline and unprivileged
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 6g --cpus 2 \
+            --ulimit nofile=4096:4096 --ulimit memlock=67108864:67108864 --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g --env CQS_SIGNED_CI=1 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/.ci-deps/copyq,dst=/copyq,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/out/signed-linux,dst=/out" \
+            cqs-signed-ci:local bash /source/ci/build-linux.sh /copyq /out
+      - name: Execute two isolated official CopyQ processes
+        run: bash ci/run-signed-linux-process.sh out/signed-linux
+      - name: Upload signed Linux diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-linux-reports
+          path: |
+            out/signed-linux/reports/
+            out/signed-linux/build/Testing/Temporary/*.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload experimental signed Linux module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-linux-module-experimental
+          path: |
+            out/signed-linux/stage/copyq/plugins/libsecuresync.so
+            out/signed-linux/stage/libsodium-LICENSE
+            LICENSE
+          if-no-files-found: error
+          retention-days: 7
+  windows:
+    name: Signed Windows / real NTFS and official CopyQ processes
+    needs: sources
+    if: needs.sources.outputs.enabled == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: madler/zlib
+          ref: 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf # v1.3.1
+          path: .ci-deps/zlib
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KDE/qca
+          ref: df5171e3c4baf346581f15af5a040e61b166a332 # v2.3.10
+          path: .ci-deps/qca
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: openssl/openssl
+          ref: 45e844fa2a14ec92d146bd8f5778ac130b6625fb # openssl-3.5.9, host encryption tests
+          path: .ci-deps/openssl
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jedisct1/libsodium
+          ref: 77e1ce5d6dee871c49ef211222ba18ef0c486bda # 1.0.22-RELEASE
+          path: .ci-deps/sodium
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Build and execute all required signed suites
+        shell: pwsh
+        run: |
+          ./ci/build-windows.ps1 -CopyQSource "$env:GITHUB_WORKSPACE/.ci-deps/copyq" -ZlibSource "$env:GITHUB_WORKSPACE/.ci-deps/zlib" -QcaSource "$env:GITHUB_WORKSPACE/.ci-deps/qca" -OpenSSLSource "$env:GITHUB_WORKSPACE/.ci-deps/openssl" -SodiumSource "$env:GITHUB_WORKSPACE/.ci-deps/sodium" -Signed -Out "$env:GITHUB_WORKSPACE/out/signed-windows"
+      - name: Execute two isolated official CopyQ processes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "$env:GITHUB_WORKSPACE/out/copyq-signed.zip"
+          Invoke-WebRequest 'https://github.com/hluk/CopyQ/releases/download/v17.0.0/copyq-17.0.0.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '1601e47339d4eda19b6f4890a00cbbe7fd00a7e5d5c3b613b9b2c8d3eeb04d19') { throw 'Official CopyQ checksum mismatch' }
+          Expand-Archive $archive "$env:GITHUB_WORKSPACE/out/signed-official-copyq"
+          $executables = @(Get-ChildItem "$env:GITHUB_WORKSPACE/out/signed-official-copyq" -Filter copyq.exe -Recurse)
+          if ($executables.Count -ne 1) { throw 'Expected one official CopyQ executable' }
+          $env:PATH = "$env:GITHUB_WORKSPACE/out/signed-windows/Qt/6.10.3/msvc2022_64/bin;$env:GITHUB_WORKSPACE/.ci-deps/sodium/bin/x64/Release/v143/dynamic;$env:PATH"
+          python tests/run-copyq-signed-two-device.py --copyq $executables[0].FullName --plugin out/signed-windows/stage/copyq/plugins/securesync.dll --fixture-tool out/signed-windows/build/cqs-signed-two-device-test.exe --out out/signed-windows/reports/two-device
+          if ($LASTEXITCODE -ne 0) { throw 'Signed two-device CopyQ acceptance failed' }
+          python ci/check-signed-process.py out/signed-windows/reports/two-device/result.json
+          if ($LASTEXITCODE -ne 0) { throw 'Signed two-device report gate failed' }
+      - name: Upload signed Windows diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-windows-reports
+          path: |
+            out/signed-windows/reports/
+            out/signed-windows/build/Testing/Temporary/*.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload experimental signed Windows module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-windows-module-experimental
+          path: |
+            out/signed-windows/stage/copyq/plugins/securesync.dll
+            out/signed-windows/stage/copyq/plugins/libsodium.dll
+            out/signed-windows/stage/libsodium-LICENSE
+            LICENSE
+          if-no-files-found: error
+          retention-days: 7
+  flatpak:
+    name: Signed Flatpak / matching SDK and installed CopyQ processes
+    needs: sources
+    if: needs.sources.outputs.enabled == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hluk/CopyQ
+          ref: d0c179f75c04974bfe801289ea6e58a1a49535fc # v17.0.0
+          path: .ci-deps/copyq
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jedisct1/libsodium
+          ref: 77e1ce5d6dee871c49ef211222ba18ef0c486bda # 1.0.22-RELEASE
+          path: .ci-deps/sodium
+          persist-credentials: false
+      - name: Install isolated test dependencies
+        run: sudo apt-get update && sudo apt-get install -y flatpak xvfb dbus-x11 ripgrep
+      - name: Execute required signed suites and installed CopyQ processes
+        run: bash ci/test-signed-flatpak.sh
+      - name: Upload signed Flatpak diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-flatpak-reports
+          path: |
+            out/signed-flatpak/reports/
+            out/signed-flatpak/build/Testing/Temporary/*.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload experimental signed Flatpak module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-flatpak-module-experimental
+          path: |
+            out/signed-flatpak/stage/copyq/plugins/libsecuresync.so
+            out/signed-flatpak/stage/libsodium-LICENSE
+            LICENSE
+          if-no-files-found: error
+          retention-days: 7
+  signed-ci:
+    name: Signed qualification gate
+    needs: [sources, linux, windows, flatpak]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all applicable signed platforms
+        env:
+          SOURCES_RESULT: ${{ needs.sources.result }}
+          SIGNED_ENABLED: ${{ needs.sources.outputs.enabled }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          FLATPAK_RESULT: ${{ needs.flatpak.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$SOURCES_RESULT" = success
+          case "$SIGNED_ENABLED" in
+            true)
+              test "$LINUX_RESULT" = success
+              test "$WINDOWS_RESULT" = success
+              test "$FLATPAK_RESULT" = success
+              ;;
+            false)
+              test "$LINUX_RESULT" = skipped
+              test "$WINDOWS_RESULT" = skipped
+              test "$FLATPAK_RESULT" = skipped
+              echo 'Signed implementation absent. This run does not qualify signed features.' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *) exit 1 ;;
+          esac
