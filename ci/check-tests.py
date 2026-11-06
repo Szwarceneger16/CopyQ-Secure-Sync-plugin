@@ -13,9 +13,10 @@ COMMON = {"native-history-transition", "native-unified-state", "password-state",
 SIGNED = {"device-trust", "device_identity", "device_identity_vault", "device_trust_journal",
           "device_key_envelope", "device_key_delivery", "device_key_receipt", "device_key_lifecycle",
           "device_control_transport", "device_signed_event", "device_signed_history",
-          "device_archive_migration", "device_join", "signed_join_checkpoint",
+          "device_archive_migration", "device_join", "signed_join_checkpoint", "signed-setup",
           "native-signed-tab-storage", "native-signed-tab-activation",
-          "native-signed-replica-background", "native-signed-two-device"}
+          "native-signed-replica-background", "native-signed-setup",
+          "native-signed-generation", "native-signed-two-device"}
 
 
 def expected(platform, signed=False):

@@ -27,7 +27,9 @@ review together with their build behavior.
 Each signed job checks the actual CMake cache, the complete required CTest
 inventory, and the JUnit results. Missing, duplicate, disabled, failed or skipped
 required tests fail qualification. The required signed inventory includes the
-two-profile fixture, signed history and checkpoint tests, native activation and
+two-profile fixture, signed history and checkpoint tests, core provisioning
+(`signed-setup`), the native setup and generation wizards
+(`native-signed-setup` and `native-signed-generation`), native activation and
 background scheduler tests, together with the platform storage tests.
 
 Linux tests run offline and unprivileged in the pinned SDK container. Its signed

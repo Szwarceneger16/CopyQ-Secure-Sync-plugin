@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from check_tests_loader import gate
 
 
@@ -56,6 +57,22 @@ class SignedQualificationTests(unittest.TestCase):
         self.assertNotIn("native-host-persistence", gate.expected("flatpak", signed=True))
         self.assertIn("storage-windows", gate.expected("windows", signed=True))
         self.assertIn("storage", gate.expected("flatpak", signed=True))
+
+    def test_each_platform_rejects_missing_setup_and_generation_evidence(self):
+        new_tests = {"signed-setup", "native-signed-setup", "native-signed-generation"}
+        for platform in ("linux", "windows", "flatpak"):
+            required = gate.expected(platform, signed=True)
+            self.assertTrue(new_tests <= required)
+            for missing in new_tests:
+                names = sorted(required - {missing})
+                inventory = {"tests": [{"name": name, "command": ["fixture-test"]} for name in names]}
+                result = ET.Element("testsuite")
+                for name in names:
+                    ET.SubElement(result, "testcase", name=name, status="passed")
+                with self.subTest(platform=platform, missing=missing, gate="inventory"), self.assertRaises(ValueError):
+                    gate.check_inventory(inventory, required)
+                with self.subTest(platform=platform, missing=missing, gate="result"), self.assertRaises(ValueError):
+                    gate.check_result(result, required, "")
 
     def test_process_report_requires_all_scenarios(self):
         passed = {"status": "passed", "checks": sorted(process.REQUIRED)}
