@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,20 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def source_metadata(source):
+    unknown = {"source_commit": "unavailable", "source_dirty": True}
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=5)
+        if commit.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit.stdout.strip()):
+            return unknown
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=source, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return unknown
+    return {"source_commit": commit.stdout.strip(), "source_dirty": dirty.returncode != 0 or bool(dirty.stdout)}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--copyq", type=Path, required=True)
@@ -34,10 +49,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     report = {"status": "failed", "checks": [], "boundary": "CopyQ public editing and production detached coordinator"}
     source = Path(__file__).resolve().parents[1]
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True)
-    report["source_commit"] = commit.stdout.strip() if commit.returncode == 0 else "unavailable"
-    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=source, capture_output=True, text=True)
-    report["source_dirty"] = dirty.returncode != 0 or bool(dirty.stdout.strip())
+    report.update(source_metadata(source))
     spec = importlib.util.spec_from_file_location("cqs_gui_process", source / "tests/run-copyq-gui-platform.py")
     helpers = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helpers)

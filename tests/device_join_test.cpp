@@ -37,6 +37,7 @@
 #include <QInputDialog>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QPlainTextEdit>
 #include <QTimer>
 #endif
 
@@ -784,6 +785,78 @@ void clickNativeWizardAction(const QString &name, const std::function<void(QMess
     timer.start(2);
     (*button)->click();
     if (wizard->isVisible()) wizard->reject();
+}
+
+QString exerciseNativeKeyAction(TrustJournal &journal, const Identity &identity, const Transport &transport,
+                               const SyncKey *publishKey, const QString &action, const QString &input,
+                               bool succeeds, bool confirms = false)
+{
+    static unsigned destinations = 0;
+    SignedJoinCheckpoint checkpoint(privateCheckpoint(transport, "native-key-action-" + std::to_string(++destinations)),
+                                    Bytes(32, 0x65), Binding);
+    bool entered = false, confirmed = false, refused = false;
+    QString publicValue;
+    QTimer::singleShot(0, [&] {
+        auto *wizard = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        CHECK(wizard);
+        const auto buttons = wizard->findChildren<QPushButton *>();
+        const auto button = std::find_if(buttons.begin(), buttons.end(), [&](const auto *candidate) {
+            return candidate->text() == action;
+        });
+        CHECK(button != buttons.end());
+        QTimer respond;
+        QObject::connect(&respond, &QTimer::timeout, [&] {
+            auto *active = QApplication::activeModalWidget();
+            if (auto *question = qobject_cast<QInputDialog *>(active)) {
+                CHECK(!entered);
+                entered = true;
+                question->setTextValue(input);
+                question->accept();
+            } else if (auto *message = qobject_cast<QMessageBox *>(active)) {
+                CHECK(entered);
+                if (auto *yes = message->button(QMessageBox::Yes)) {
+                    CHECK(confirms && !confirmed && succeeds);
+                    CHECK(message->text().startsWith(QStringLiteral("Publish the current group key")));
+                    confirmed = true;
+                    yes->click();
+                } else {
+                    CHECK(!succeeds && !refused && message->icon() == QMessageBox::Warning);
+                    refused = true;
+                    message->accept();
+                }
+            } else if (auto *dialog = qobject_cast<QDialog *>(active)) {
+                if (dialog == wizard) return;
+                auto *value = dialog->findChild<QPlainTextEdit *>();
+                CHECK(succeeds && entered && !refused && publicValue.isEmpty() && value);
+                CHECK(confirmed == confirms);
+                publicValue = value->toPlainText();
+                dialog->reject();
+            }
+        });
+        respond.start(2);
+        (*button)->click();
+        wizard->reject();
+    });
+    cqs::native::runSignedJoinWizard(nullptr, journal, identity, transport.directory(), checkpoint,
+        Binding, publishKey, transport.staging());
+    CHECK(entered && refused == !succeeds && (!publicValue.isEmpty()) == succeeds && confirmed == confirms);
+    return publicValue;
+}
+
+void exerciseNativeKeyInstall(TrustJournal &journal, const Identity &identity, const Transport &transport,
+                              const SyncKey *publishKey, const std::string &address, bool succeeds)
+{
+    const auto value = exerciseNativeKeyAction(journal, identity, transport, publishKey,
+        QStringLiteral("4. Install sealed key"), QString::fromStdString(address), succeeds);
+    if (succeeds) {
+        const auto encoded = value.toLatin1();
+        const auto receipt = QByteArray::fromHex(encoded);
+        CHECK(!receipt.isEmpty() && receipt.toHex() == encoded);
+        const Bytes wire(receipt.begin(), receipt.end());
+        const auto context = KeyReceiptCodec::inspect(wire);
+        CHECK(context.recipient == identity.member());
+        KeyReceiptCodec::verify(wire, context);
+    }
 }
 
 void exerciseNativeBackgroundConsent(ReplicaPair &pair, bool accept)
@@ -2417,6 +2490,113 @@ int main(int argc, char **argv)
         CHECK(pair.packets().size() == 1);
     });
 #ifdef CQS_TEST_NATIVE_SIGNED_JOIN
+    test("the native founder installs and redistributes a rotated key without a fabricated Join", [] {
+        ReplicaPair pair;
+        auto &fixture = pair.fixture;
+        fixture.journals[0] = std::make_unique<TrustJournal>(fixture.store(0), fixture.genesis,
+            fixture.member(0), fixture.key.get());
+        CHECK(fixture.journal(0).isPinnedFounder(*fixture.identities[0]));
+        CHECK(!fixture.journal(0).isPinnedFounder(*fixture.identities[1]));
+        CHECK(!fixture.journal(1).isPinnedFounder(*fixture.identities[0]));
+        RotatedGeneration rotated(pair);
+        privateDirectory(pair.transport.root / "control");
+        CHECK(!fixture.journal(0).inspect().verifiedJoin && !fixture.journal(0).inspect().installedKey);
+        fixture.journal(1).prepareDelivery(fixture.member(0).id, *fixture.identities[1], *rotated.key, Now);
+        const auto address = fixture.journal(1).publishDelivery(fixture.member(0).id,
+            pair.transport.directory(), Now, pair.transport.staging());
+        const auto newTip = rotated.seedCurrent(pair, textSnapshot("new generation for surviving founder"));
+        exerciseNativeKeyInstall(fixture.journal(0), *fixture.identities[0], pair.transport, fixture.key.get(), address, true);
+        const auto installedStatus = fixture.journal(0).inspect();
+        CHECK(!installedStatus.verifiedJoin && installedStatus.installedKey && installedStatus.state.keyGeneration == 1);
+        CHECK(fixture.journal(0).loadInstalledKey(*fixture.identities[0], installedStatus.watermark)->commitment(
+            fixture.genesis.group, 1) == rotated.key->commitment(fixture.genesis.group, 1));
+        const auto activation = fixture.journal(0).preflightJoinActivation(*fixture.identities[0], pair.transport.directory(),
+            "rotated-founder-profile", installedStatus.watermark);
+        CHECK(activation.generation == 1 && activation.member == fixture.member(0).id && activation.tipId == newTip);
+        const auto delivered = exerciseNativeKeyAction(fixture.journal(0), *fixture.identities[0], pair.transport,
+            fixture.key.get(), QStringLiteral("4. Publish sealed key for a member"),
+            QString::fromStdString(hex(fixture.member(1).id)), true, true);
+        CHECK(delivered.size() == 64);
+        const auto received = fixture.journal(1).receiveDelivery(pair.transport.directory().readControl(delivered.toStdString()),
+            *fixture.identities[1], fixture.journal(0).inspect().watermark);
+        CHECK(received->commitment(fixture.genesis.group, 1) == rotated.key->commitment(fixture.genesis.group, 1));
+        CHECK(!fixture.journal(0).inspect().verifiedJoin);
+    });
+    test("the native key installer rejects an observed member without verified enrollment even with a supplied key", [] {
+        Fixture fixture;
+        const auto proposed = fixture.proposal({fixture.member(1), token(20)});
+        const auto admitted = fixture.certificate(proposed, {0});
+        CHECK(fixture.journal(0).observe(admitted, Now) == ObserveResult::Applied);
+        CHECK(fixture.journal(1).observe(admitted, Now) == ObserveResult::Applied);
+        CHECK(!fixture.journal(1).inspect().verifiedJoin);
+        Transport transport(fixture.journal(0).inspect().state);
+        privateDirectory(transport.root / "control");
+        fixture.journal(0).prepareDelivery(fixture.member(1).id, *fixture.identities[0], *fixture.key, Now);
+        const auto address = fixture.journal(0).publishDelivery(fixture.member(1).id,
+            transport.directory(), Now, transport.staging());
+        const auto before = st::serialize(fixture.store(1).record);
+        exerciseNativeKeyInstall(fixture.journal(1), *fixture.identities[1], transport, fixture.key.get(), address, false);
+        CHECK(st::serialize(fixture.store(1).record) == before && !fixture.journal(1).inspect().installedKey);
+    });
+    test("the native founder installer rejects another identity and an envelope for another recipient", [] {
+        ReplicaPair pair;
+        auto &fixture = pair.fixture;
+        RotatedGeneration rotated(pair);
+        privateDirectory(pair.transport.root / "control");
+        const auto address = fixture.journal(0).publishDelivery(fixture.member(1).id,
+            pair.transport.directory(), Now, pair.transport.staging());
+        const auto before = st::serialize(fixture.store(0).record);
+        exerciseNativeKeyInstall(fixture.journal(0), *fixture.identities[1], pair.transport, fixture.key.get(), address, false);
+        CHECK(st::serialize(fixture.store(0).record) == before);
+        exerciseNativeKeyInstall(fixture.journal(0), *fixture.identities[0], pair.transport, fixture.key.get(), address, false);
+        CHECK(st::serialize(fixture.store(0).record) == before && !fixture.journal(0).inspect().installedKey);
+    });
+    test("the native founder installer rejects a founder removed from current membership", [] {
+        ReplicaPair pair;
+        auto &fixture = pair.fixture;
+        privateDirectory(pair.transport.root / "control");
+        fixture.journal(1).prepareCatchUp(fixture.member(0).id, *fixture.identities[1], *fixture.key, Now);
+        const auto address = fixture.journal(1).publishDelivery(fixture.member(0).id,
+            pair.transport.directory(), Now, pair.transport.staging());
+        const auto key = SyncKey::generate();
+        const auto proposal = fixture.journal(1).propose(Operation::Remove, fixture.member(0), token(91), token(92),
+            Now, Expires, key->commitment(fixture.genesis.group, 1));
+        Certificate removal{proposal, {}};
+        for (const auto signer : {1u, 2u})
+            removal.approvals.push_back(fixture.journal(signer).approve(proposal, *fixture.identities[signer],
+                verificationDigest(proposal, fixture.member(signer)), Now));
+        for (const auto member : {0u, 1u, 2u}) CHECK(fixture.journal(member).observe(removal, Now) == ObserveResult::Applied);
+        CHECK(fixture.journal(0).isPinnedFounder(*fixture.identities[0]));
+        const auto before = st::serialize(fixture.store(0).record);
+        exerciseNativeKeyInstall(fixture.journal(0), *fixture.identities[0], pair.transport, fixture.key.get(), address, false);
+        CHECK(st::serialize(fixture.store(0).record) == before && !fixture.journal(0).inspect().installedKey);
+    });
+    test("the native founder installer refuses forked membership without storing a key", [] {
+        ReplicaPair pair;
+        auto &fixture = pair.fixture;
+        privateDirectory(pair.transport.root / "control");
+        fixture.journal(1).prepareCatchUp(fixture.member(0).id, *fixture.identities[1], *fixture.key, Now);
+        const auto address = fixture.journal(1).publishDelivery(fixture.member(0).id,
+            pair.transport.directory(), Now, pair.transport.staging());
+        const auto key = SyncKey::generate();
+        const auto first = fixture.journal(0).propose(Operation::Remove, fixture.member(2), token(93), token(94),
+            Now, Expires, key->commitment(fixture.genesis.group, 1));
+        const auto otherKey = SyncKey::generate();
+        const auto second = fixture.journal(0).propose(Operation::Remove, fixture.member(2), token(95), token(96),
+            Now, Expires, otherKey->commitment(fixture.genesis.group, 1));
+        for (const auto &proposal : {first, second}) {
+            Certificate certificate{proposal, {}};
+            for (const auto signer : {0u, 1u})
+                certificate.approvals.push_back({fixture.member(signer).id,
+                    fixture.identities[signer]->sign(approvalBytes(proposal, fixture.member(signer)))});
+            const auto observed = fixture.journal(0).observe(certificate, Now);
+            CHECK(observed == (proposal.nonce == first.nonce ? ObserveResult::Applied : ObserveResult::ForkDetected));
+        }
+        CHECK(fixture.journal(0).inspect().forked);
+        const auto before = st::serialize(fixture.store(0).record);
+        exerciseNativeKeyInstall(fixture.journal(0), *fixture.identities[0], pair.transport, fixture.key.get(), address, false);
+        CHECK(st::serialize(fixture.store(0).record) == before && !fixture.journal(0).inspect().installedKey);
+    });
     test("the native wizard confirms the exact signed conflict choice and archives the previous local copy", [] {
         exerciseNativeConflictWizard();
     });

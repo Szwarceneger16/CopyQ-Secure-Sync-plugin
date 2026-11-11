@@ -300,7 +300,11 @@ void openGuidedSignedJoinSetup(QWidget *parent, const QString &settingsFile, con
     crypto::wipe(journalCredential.bytes);
     crypto::wipe(checkpointCredential.bytes);
     const SignedReplicaSource source{transportPath, journalPath, root};
+#ifdef Q_OS_WIN
     const auto staging = setup->paths().staging;
+#else
+    const std::filesystem::path staging;
+#endif
     runSignedJoinWizard(parent, backend->journal, *backend->identity, backend->transport, backend->checkpoint,
         binding, backend->founderKey.get(), staging, stillCurrent, [&](const trust::JoinActivation &expected) {
             return activate({checkpointPath, {}, expected, root}, journalBinding, source);

@@ -332,8 +332,9 @@ if(CQS_BUILD_NATIVE_PLUGIN)
       target_link_libraries(cqs-signed-replica-background-test PRIVATE cqs-device-control Qt6::Core)
       add_test(NAME native-signed-replica-background COMMAND cqs-signed-replica-background-test)
       set_tests_properties(native-signed-replica-background PROPERTIES TIMEOUT 30)
-      add_executable(cqs-native-signed-setup-test tests/native_signed_setup_test.cpp native/signed_setup_wizard.cpp)
-      target_link_libraries(cqs-native-signed-setup-test PRIVATE cqs-device-control Qt6::Widgets)
+      add_executable(cqs-native-signed-setup-test tests/native_signed_setup_test.cpp native/signed_setup_wizard.cpp
+        native/signed_join_entry.cpp native/signed_join_wizard.cpp native/signed_generation_wizard.cpp native/signed_tab_activation.cpp)
+      target_link_libraries(cqs-native-signed-setup-test PRIVATE cqs-model-clipboard cqs-device-control cqs-device-join-dialog Qt6::Widgets)
       add_test(NAME native-signed-setup COMMAND cqs-native-signed-setup-test)
       set_tests_properties(native-signed-setup PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
       add_executable(cqs-native-signed-generation-test tests/native_signed_generation_test.cpp

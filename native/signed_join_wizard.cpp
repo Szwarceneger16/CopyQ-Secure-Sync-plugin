@@ -379,8 +379,9 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
         const auto address = run([&] {
             transport.checkPublicationStaging(privateStaging);
-            const auto installed = publishKey ? std::unique_ptr<SyncKey>{} : journal.loadInstalledKey(identity, now());
-            const auto &key = publishKey ? *publishKey : *installed;
+            const auto installed = !publishKey || journal.inspect().installedKey
+                ? journal.loadInstalledKey(identity, now()) : std::unique_ptr<SyncKey>{};
+            const auto &key = installed ? *installed : *publishKey;
             (void)journal.prepareDelivery(recipient, identity, key, now());
             return journal.publishDelivery(recipient, transport, now(), privateStaging);
         });
@@ -392,7 +393,10 @@ void runSignedJoinWizard(QWidget *parent, TrustJournal &journal, const Identity 
         if (!value) return;
         const auto address = hex(parseToken(*value)).toStdString();
         const auto receipt = run([&] {
-            if (!journal.inspect().verifiedJoin) throw JournalError(JournalCode::Enrollment);
+            const auto status = journal.inspect();
+            if ((!status.verifiedJoin && !journal.isPinnedFounder(identity)) || status.forked ||
+                std::find(status.state.members.begin(), status.state.members.end(), identity.member()) == status.state.members.end())
+                throw JournalError(JournalCode::Enrollment);
             return journal.installDelivery(transport.readControl(address), identity, now());
         });
         showPublicValue(wizard, QObject::tr("The sealed key is stored. Send this public storage receipt to the sender."),

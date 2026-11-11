@@ -135,6 +135,9 @@ public:
     static void initialize(state::FileStore &store, const Genesis &genesis,
                            const Member &local, std::uint64_t trustedNow);
     JournalStatus inspect();
+    // Immutable setup pins identify the founder independently of Join enrollment.
+    // Current membership and delivery authority still require backend validation.
+    bool isPinnedFounder(const Identity &identity) const noexcept;
     Proposal propose(Operation operation, const Member &subject, const Token &request,
                      const Token &nonce, std::uint64_t created, std::uint64_t expires,
                      const Token &rotatedKeyCommitment = Token{});

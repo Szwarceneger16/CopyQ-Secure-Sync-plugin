@@ -686,6 +686,9 @@ void TrustJournal::save(const transaction::Record &expected, transaction::Record
     seenGeneration_ = replacement.generation;
     std::copy(hash.begin(), hash.end(), seenRecord_.begin());
 }
+bool TrustJournal::isPinnedFounder(const Identity &identity) const noexcept {
+    return local_ == genesis_.founder && identity.member() == genesis_.founder;
+}
 JournalStatus TrustJournal::inspect() {
     const auto lease = lock(); const auto record = load();
     const auto log = decode(record, binding_, pin(genesis_, local_));
