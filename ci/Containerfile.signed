@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# This named parent is built immediately beforehand from ci/Containerfile.
+FROM cqs-native-ci:local
+RUN git init /opt/sodium-source \
+    && git -C /opt/sodium-source fetch --depth 1 https://github.com/jedisct1/libsodium.git 77e1ce5d6dee871c49ef211222ba18ef0c486bda \
+    && git -C /opt/sodium-source checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/sodium-source rev-parse HEAD)" = 77e1ce5d6dee871c49ef211222ba18ef0c486bda \
+    && cd /opt/sodium-source \
+    && ./configure --prefix=/opt/sodium --disable-shared --enable-static --with-pic \
+    && make -j2 \
+    && make check \
+    && make install \
+    && cp LICENSE /opt/sodium/LICENSE \
+    && rm -rf /opt/sodium-source
