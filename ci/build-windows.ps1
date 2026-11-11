@@ -4,7 +4,9 @@ param([Parameter(Mandatory)][string]$CopyQSource,
       [Parameter(Mandatory)][string]$ZlibSource,
       [Parameter(Mandatory)][string]$QcaSource,
       [Parameter(Mandatory)][string]$OpenSSLSource,
-      [Parameter(Mandatory)][string]$Out)
+      [Parameter(Mandatory)][string]$Out,
+      [switch]$Signed,
+      [string]$SodiumSource)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 function Invoke-Checked {
@@ -78,15 +80,39 @@ try {
     Invoke-Checked cmake @('-S', $ZlibSource, '-B', "$Out/zlib-build", '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', "-DCMAKE_INSTALL_PREFIX=$Out/zlib", '-DZLIB_BUILD_EXAMPLES=OFF')
     Invoke-Checked cmake @('--build', "$Out/zlib-build", '--parallel', '2')
     Invoke-Checked cmake @('--install', "$Out/zlib-build")
-    Invoke-Checked cmake @('-S', $Source, '-B', "$Out/build", '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_TESTING=ON', '-DCQS_BUILD_NATIVE_PLUGIN=ON', '-DCQS_BUILD_UI_TEST_PLUGIN=ON', '-DCQS_BUILD_STANDALONE_LAB=ON', '-DCQS_TEST_LEGACY_HOST_BRIDGE=ON', "-DCOPYQ_SOURCE_DIR=$CopyQSource", "-DCMAKE_PREFIX_PATH=$qt;$Out/qca", "-DZLIB_ROOT=$Out/zlib", '-DZLIB_USE_STATIC_LIBS=ON', "-DCMAKE_INSTALL_PREFIX=$Out/stage")
+    $configuration = @('-S', $Source, '-B', "$Out/build", '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_TESTING=ON', '-DCQS_BUILD_NATIVE_PLUGIN=ON', '-DCQS_BUILD_UI_TEST_PLUGIN=ON', '-DCQS_BUILD_STANDALONE_LAB=ON', '-DCQS_TEST_LEGACY_HOST_BRIDGE=ON', "-DCOPYQ_SOURCE_DIR=$CopyQSource", "-DCMAKE_PREFIX_PATH=$qt;$Out/qca", "-DZLIB_ROOT=$Out/zlib", '-DZLIB_USE_STATIC_LIBS=ON', "-DCMAKE_INSTALL_PREFIX=$Out/stage")
+    $signedGate = @()
+    if ($Signed) {
+        if (-not $SodiumSource) { throw 'Signed qualification requires the pinned libsodium source' }
+        $SodiumSource = (Resolve-Path -LiteralPath $SodiumSource).Path
+        $signedLock = Get-Content -Raw "$PSScriptRoot/signed-toolchain.json" | ConvertFrom-Json
+        $actual = (& git -C $SodiumSource rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $actual -ne $signedLock.libsodium_commit) { throw 'libsodium commit mismatch' }
+        # The upstream dynamic configuration uses /MD, matching Qt/MSVC.
+        # Its DLL is a test dependency included only in the experimental artifact.
+        Invoke-Checked msbuild @("$SodiumSource/builds/msvc/vs2022/libsodium.sln", '/m:2', '/t:Build', '/p:Configuration=DynRelease', '/p:Platform=x64', '/p:PlatformToolset=v143')
+        $sodiumOutput = "$SodiumSource/bin/x64/Release/v143/dynamic"
+        foreach ($name in @('libsodium.lib', 'libsodium.dll')) {
+            if (-not (Test-Path "$sodiumOutput/$name")) { throw "Missing libsodium output $name" }
+        }
+        $env:PATH = "$sodiumOutput;$env:PATH"
+        $configuration += @('-DCQS_TEST_DEVICE_CRYPTO=ON', '-DCQS_BUILD_SIGNED_JOIN=ON', "-DCQS_SODIUM_INCLUDE_DIR=$SodiumSource/src/libsodium/include", "-DCQS_SODIUM_LIBRARY=$sodiumOutput/libsodium.lib")
+        $signedGate = @('--signed')
+    }
+    Invoke-Checked cmake $configuration
     Invoke-Checked cmake @('--build', "$Out/build", '--parallel', '2')
-    Invoke-Checked python @("$PSScriptRoot/check-tests.py", "$Out/build", 'windows', '--inventory-only')
+    Invoke-Checked python (@("$PSScriptRoot/check-tests.py", "$Out/build", 'windows', '--inventory-only') + $signedGate)
     Invoke-Checked ctest @('--test-dir', "$Out/build", '-C', 'Release', '--parallel', '2', '--output-on-failure', '--output-junit', "$Out/reports/ctest.xml")
-    Invoke-Checked python @("$PSScriptRoot/check-tests.py", "$Out/build", 'windows', '--junit', "$Out/reports/ctest.xml")
+    Invoke-Checked python (@("$PSScriptRoot/check-tests.py", "$Out/build", 'windows', '--junit', "$Out/reports/ctest.xml") + $signedGate)
     Invoke-Checked cmake @('--install', "$Out/build")
     Invoke-Checked "$Out/build/cqs-loader-test.exe" @("$Out/stage/copyq/plugins/securesync.dll")
     Invoke-Checked dumpbin @('/DEPENDENTS', "$Out/stage/copyq/plugins/securesync.dll")
-    Invoke-Checked python @("$PSScriptRoot/package.py", '--platform', 'windows-x86_64', '--source', $Source, '--copyq', $CopyQSource, '--zlib', $ZlibSource, '--out', $Out)
+    if ($Signed) {
+        Copy-Item "$sodiumOutput/libsodium.dll" "$Out/stage/copyq/plugins/libsodium.dll"
+        Copy-Item "$SodiumSource/LICENSE" "$Out/stage/libsodium-LICENSE"
+    } else {
+        Invoke-Checked python @("$PSScriptRoot/package.py", '--platform', 'windows-x86_64', '--source', $Source, '--copyq', $CopyQSource, '--zlib', $ZlibSource, '--out', $Out)
+    }
 } finally {
     Stop-Transcript
 }
