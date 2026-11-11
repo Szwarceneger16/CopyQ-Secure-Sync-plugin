@@ -28,7 +28,7 @@ preserving post-crash edits, durable history witnesses and safe capacity limits.
 The [native settings panel](docs/NATIVE-SETTINGS.md) integrates device/recovery
 actions, live status with local-save evidence and explicitly copied redacted diagnostics.
 
-## Guided setup design (not implemented)
+## Guided setup design and laboratory
 
 The [stage-1 device trust design](docs/DEVICE-TRUST-DESIGN.md) specifies future
 peer-verified pairing, two-device approval after one-time bootstrap, equal device
@@ -37,6 +37,45 @@ preserves existing CopyQ encryption and normal advanced settings. The
 [acceptance matrix](docs/DEVICE-TRUST-ACCEPTANCE.md) records implementation gates
 and planned tests; it is not evidence that these features already work. Current
 RC installation and manual key transfer remain unchanged.
+
+The [stage-2 policy laboratory](docs/DEVICE-TRUST-MODEL.md) implements isolated,
+bounded membership validation and adversarial tests. Its
+[pairing protocol design](docs/DEVICE-TRUST-PROTOCOL.md) records concrete security
+decisions and remaining integration gates.
+
+The [opt-in control-plane laboratory](docs/DEVICE-TRUST-COORDINATOR.md) exercises
+Ed25519 approvals, a local identity vault and signed key envelopes. A recipient
+can store its sealed package durably, reopen the current key after restart and
+sign a storage receipt. An explicit catch-up operation can deliver a fresh
+package to an earlier active member at a later accepted head. The laboratory
+can publish exact envelopes and receipts to a provisioned `control/` directory
+through the native file transport. Signed clipboard packets use separate
+generation directories and author-specific encryption keys. The private
+journal bounds encryption attempts, retains exact packets for publication
+retry, and detects missing or substituted packets from earlier verified scans.
+The [archive migration laboratory](docs/DEVICE-TRUST-COORDINATOR.md#explicit-legacy-archive-migration)
+can seed a fresh signed group from the verified legacy tip while preserving
+the encrypted legacy state and history in place.
+The [Join laboratory](docs/DEVICE-TRUST-COORDINATOR.md#authenticated-join-and-activation-preflight)
+adds trusted terminal prompts for full peer comparison and an activation
+preflight over the installed key package and signed history. The
+[experimental native Signed Join](docs/DEVICE-TRUST-COORDINATOR.md#experimental-native-signed-join)
+adds a Preferences workflow for provisioned devices. With
+`CQS_BUILD_SIGNED_JOIN=ON`, a separate confirmation after the verified checkpoint
+write can enable an editable local `signed_sync` tab in CopyQ 17. The workflow
+requires Encrypt Tabs and a compatible plugin configuration. The tab keeps
+local edits in its private encrypted checkpoint. With the tab unloaded, the
+wizard's explicit [Synchronize signed_sync](docs/DEVICE-TRUST-COORDINATOR.md#manual-signed-tab-synchronization)
+action can download verified history into a clean checkpoint or publish local
+edits as an encrypted signed packet. The wizard also offers
+[explicit conflict resolution and encrypted backups](docs/DEVICE-TRUST-COORDINATOR.md#review-and-resolve-signed-conflicts),
+[session-only background synchronization](docs/DEVICE-TRUST-COORDINATOR.md#signed-background-synchronization)
+while the tab is unloaded, and
+[local recovery of a pending publication after key rotation](docs/DEVICE-TRUST-COORDINATOR.md#recover-pending-publication-after-key-rotation).
+Legacy tabs and synchronization remain separate.
+Build these tests with `CQS_TEST_DEVICE_CRYPTO=ON` and libsodium 1.0.22 or newer.
+Guided provisioning, founder activation, cross-generation activation and
+platform qualification remain outside this experiment.
 
 ## Build and test pipeline
 
